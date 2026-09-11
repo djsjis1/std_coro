@@ -1,0 +1,148 @@
+name: CMake
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.PLATFORM.OS }}
+
+    env:
+      CC: ${{ matrix.PLATFORM.CC }}
+      CXX: ${{ matrix.PLATFORM.CXX }}
+
+    strategy:
+      matrix:
+        PLATFORM:
+
+          - {
+              OS: ubuntu-22.04,
+              CC: gcc-10,
+              CXX: g++-10
+            }
+          - {
+              OS: ubuntu-22.04,
+              CC: gcc-11,
+              CXX: g++-11
+            }
+          - {
+              OS: ubuntu-22.04,
+              CC: gcc-12,
+              CXX: g++-12
+            }
+
+          - {
+              OS: ubuntu-24.04,
+              CC: gcc-13,
+              CXX: g++-13
+            }
+          - {
+              OS: ubuntu-24.04,
+              CC: gcc-14,
+              CXX: g++-14
+            }
+          - {
+              OS: ubuntu-24.04,
+              CC: gcc-15,
+              CXX: g++-15,
+              INSTALL: true
+            }
+
+          - {
+              OS: ubuntu-22.04,
+              CC: clang-13,
+              CXX: clang++-13
+            }
+          - {
+              OS: ubuntu-22.04,
+              CC: clang-14,
+              CXX: clang++-14
+            }
+          - {
+              OS: ubuntu-22.04,
+              CC: clang-15,
+              CXX: clang++-15,
+              VERSION: '15'
+            }
+
+          - {
+              OS: ubuntu-24.04,
+              CC: clang-16,
+              CXX: clang++-16
+            }
+          - {
+              OS: ubuntu-24.04,
+              CC: clang-17,
+              CXX: clang++-17
+            }
+          - {
+              OS: ubuntu-24.04,
+              CC: clang-18,
+              CXX: clang++-18
+            }
+
+          - {
+              OS: macos-15-intel,
+              CC: clang,
+              CXX: clang++
+            }
+          - {
+              OS: macos-26-intel,
+              CC: clang,
+              CXX: clang++
+            }
+
+          - {
+              OS: macos-14,
+              CC: clang,
+              CXX: clang++
+            }
+          - {
+              OS: macos-15,
+              CC: clang,
+              CXX: clang++
+            }
+          - {
+              OS: macos-26,
+              CC: clang,
+              CXX: clang++
+            }
+
+        BUILD_CONFIG: [ Release, Debug ]
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install GCC on ubuntu
+      if: |
+        startsWith(matrix.PLATFORM.OS, 'ubuntu-') &&
+        startsWith(matrix.PLATFORM.CC, 'gcc-') &&
+        matrix.PLATFORM.INSTALL
+      run: |
+        sudo add-apt-repository ppa:ubuntu-toolchain-r/test
+        sudo apt-get update
+        sudo apt-get install ${{ matrix.PLATFORM.CC }} ${{ matrix.PLATFORM.CXX }}
+
+    - name: Install Clang on ubuntu
+      if: |
+        startsWith(matrix.PLATFORM.OS, 'ubuntu-') &&
+        startsWith(matrix.PLATFORM.CC, 'clang-') &&
+        matrix.PLATFORM.VERSION
+      uses: egor-tensin/setup-clang@v2
+      with:
+          version: ${{ matrix.PLATFORM.VERSION }}
+
+    - name: Configure
+      run: cmake -B ./build -DHFSM2_BUILD_TESTS=ON -DHFSM2_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=${{ matrix.BUILD_CONFIG }}
+      working-directory: ${{ github.workspace }}
+
+    - name: Build
+      run: cmake --build ./build --config ${{ matrix.BUILD_CONFIG }}
+      working-directory: ${{ github.workspace }}

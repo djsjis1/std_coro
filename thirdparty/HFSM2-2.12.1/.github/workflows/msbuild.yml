@@ -1,0 +1,50 @@
+name: MSBuild
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.PLATFORM.OS }}
+
+    env:
+      SOLUTION_FILE_PATH: ${{ matrix.PLATFORM.SOLUTION_FILE_PATH }}
+      PROJECT_FILE_NAME: ${{ matrix.PLATFORM.PROJECT_FILE_NAME }}
+
+    strategy:
+      matrix:
+        PLATFORM:
+          - {
+              OS: windows-2022,
+              SOLUTION_FILE_PATH: projects\premake\hfsm2-vs-2022.sln,
+              PROJECT_FILE_NAME: test-17
+            }
+          - {
+              OS: windows-11-arm,
+              SOLUTION_FILE_PATH: projects\premake\hfsm2-vs-2022.sln,
+              PROJECT_FILE_NAME: test-17
+            }
+
+        BUILD_CONFIG: [ Release, Debug ]
+        BUILD_PLATFORM: [ Win32, x64 ]
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@main
+
+    - name: Build
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: msbuild /m /p:Configuration=${{matrix.BUILD_CONFIG}} /p:Platform=${{matrix.BUILD_PLATFORM}} ${{env.SOLUTION_FILE_PATH}}
+
+    - name: Test
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: "binaries/${{env.PROJECT_FILE_NAME}}-${{matrix.BUILD_CONFIG}}-${{matrix.BUILD_PLATFORM}}.exe"

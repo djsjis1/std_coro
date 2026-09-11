@@ -1,0 +1,23 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vscode/
+.zcode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Plans
+.zcode/plans/

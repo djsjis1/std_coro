@@ -1,0 +1,324 @@
+workspace "hfsm2"
+	configurations {
+		"Debug",
+		"Release"
+	}
+	conformancemode "On"
+	debugdir "."
+	defines {
+		"UNICODE",
+		"_UNICODE",
+	}
+	enablepch "Off"
+	fatalwarnings "All"
+	filename "hfsm2-all"
+	includedirs {
+		"development",
+		"include",
+		"external",
+	}
+	language "C++"
+	location "projects/premake"
+	objdir "$(BUILD_ROOT)/$(SolutionName)-$(PlatformArchitecture)/$(ProjectName)-$(Configuration)/"
+	platforms {
+		"x86",
+		"x64",
+	}
+
+	system "windows"
+	systemversion "latest"
+
+	targetdir "binaries/"
+	targetname "$(ProjectName)-$(Configuration)-$(Platform)"
+	warnings "High"
+
+	filter "toolset:msc-v140 or msc-v141"
+		-- v140/v141 need an explicit SDK version ('latest' resolves to '10.0' which they reject)
+		-- v140 is also incompatible with SDK 10.0.26100+, so find the newest compatible one
+		local sdkVersions = {}
+		for _, d in ipairs(os.matchdirs("C:/Program Files (x86)/Windows Kits/10/Include/10.0.*")) do
+			-- skip the UCRT-only redistributable shim VS drops at 10.0.10240.0
+			-- (a real SDK has um/, the shim has only ucrt/)
+			if os.isdir(d .. "/um") then
+				table.insert(sdkVersions, path.getname(d))
+			end
+		end
+		table.sort(sdkVersions)
+	filter "toolset:msc-v140"
+		for i = #sdkVersions, 1, -1 do
+			if sdkVersions[i] < "10.0.26100.0" then
+				systemversion(sdkVersions[i])
+				break
+			end
+		end
+	filter "toolset:msc-v141"
+		if #sdkVersions > 0 then
+			systemversion(sdkVersions[#sdkVersions])
+		end
+
+	filter { "toolset:msc-v140", "configurations:debug" }
+		-- v140 debug builds ICE with Premake's default Edit and Continue settings.
+		editandcontinue "Off"
+		minimalrebuild "Off"
+
+	filter "configurations:debug"
+		defines "_DEBUG"
+		symbols "On"
+	filter "configurations:release"
+		defines "NDEBUG"
+		intrinsics "On"
+		linktimeoptimization "On"
+		optimize "Speed"
+
+	filter "platforms:32"
+		architecture "x86"
+	filter "platforms:64"
+		architecture "x86_64"
+
+	filter "toolset:msc-v141 or msc-v142 or msc-v143"
+		buildoptions "/permissive-"
+
+	filter "toolset:msc-ClangCL"
+		buildoptions "-Wpedantic"
+		linkoptions "/INCREMENTAL:NO"
+
+-- advanced_event_handling
+
+project "advanced_event_handling-14"
+	cppdialect "C++11"
+	files "examples/advanced_event_handling/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "advanced_event_handling-15"
+	cppdialect "C++14"
+	files "examples/advanced_event_handling/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "advanced_event_handling-16"
+	cppdialect "C++17"
+	files "examples/advanced_event_handling/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "advanced_event_handling-17"
+	cppdialect "C++20"
+	files "examples/advanced_event_handling/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "advanced_event_handling-clang"
+	cppdialect "C++20"
+	files "examples/advanced_event_handling/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- basic_audio_player
+
+project "basic_audio_player-14"
+	cppdialect "C++11"
+	files "examples/basic_audio_player/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "basic_audio_player-15"
+	cppdialect "C++14"
+	files "examples/basic_audio_player/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "basic_audio_player-16"
+	cppdialect "C++17"
+	files "examples/basic_audio_player/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "basic_audio_player-17"
+	cppdialect "C++20"
+	files "examples/basic_audio_player/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "basic_audio_player-clang"
+	cppdialect "C++20"
+	files "examples/basic_audio_player/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- basic_traffic_light
+
+project "basic_traffic_light-14"
+	cppdialect "C++11"
+	files "examples/basic_traffic_light/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "basic_traffic_light-15"
+	cppdialect "C++14"
+	files "examples/basic_traffic_light/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "basic_traffic_light-16"
+	cppdialect "C++17"
+	files "examples/basic_traffic_light/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "basic_traffic_light-17"
+	cppdialect "C++20"
+	files "examples/basic_traffic_light/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "basic_traffic_light-clang"
+	cppdialect "C++20"
+	files "examples/basic_traffic_light/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- calculator
+
+project "calculator-14"
+	cppdialect "C++11"
+	files "examples/calculator/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "calculator-15"
+	cppdialect "C++14"
+	files "examples/calculator/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "calculator-16"
+	cppdialect "C++17"
+	files "examples/calculator/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "calculator-17"
+	cppdialect "C++20"
+	files "examples/calculator/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "calculator-clang"
+	cppdialect "C++20"
+	files "examples/calculator/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- debug_logger_interface
+
+project "debug_logger_interface-14"
+	cppdialect "C++11"
+	files "examples/debug_logger_interface/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "debug_logger_interface-15"
+	cppdialect "C++14"
+	files "examples/debug_logger_interface/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "debug_logger_interface-16"
+	cppdialect "C++17"
+	files "examples/debug_logger_interface/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "debug_logger_interface-17"
+	cppdialect "C++20"
+	files "examples/debug_logger_interface/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "debug_logger_interface-clang"
+	cppdialect "C++20"
+	files "examples/debug_logger_interface/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- temp
+
+project "temp-14"
+	cppdialect "C++11"
+	files "examples/temp/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "temp-15"
+	cppdialect "C++14"
+	files "examples/temp/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "temp-16"
+	cppdialect "C++17"
+	files "examples/temp/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "temp-17"
+	cppdialect "C++20"
+	files "examples/temp/**.*"
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "temp-clang"
+	cppdialect "C++20"
+	files "examples/temp/**.*"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
+
+-- test
+
+project "test-14"
+	cppdialect "C++11"
+	files {
+		"development/**.*",
+		"test/**.*",
+	}
+	kind "ConsoleApp"
+	toolset "msc-v140"
+
+project "test-15"
+	cppdialect "C++14"
+	files {
+		"development/**.*",
+		"test/**.*",
+	}
+	kind "ConsoleApp"
+	toolset "msc-v141"
+
+project "test-16"
+	cppdialect "C++17"
+	files {
+		"development/**.*",
+		"test/**.*",
+	}
+	kind "ConsoleApp"
+	toolset "msc-v142"
+
+project "test-17"
+	cppdialect "C++20"
+	files {
+		"development/**.*",
+		"test/**.*",
+	}
+	kind "ConsoleApp"
+	toolset "msc-v143"
+
+project "test-clang"
+	cppdialect "C++20"
+	files {
+		"development/**.*",
+		"test/**.*",
+	}
+	-- clang-cl 19.1.5 currently exhausts memory on this template stress test.
+	removefiles "test/reported/stress_size.cpp"
+	kind "ConsoleApp"
+	toolset "msc-ClangCL"
