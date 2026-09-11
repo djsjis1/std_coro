@@ -2,11 +2,14 @@
 # coro — 企业级 CI 流水线
 # ============================================================================
 #
-#  阶段 1 (并行):  lint (格式检查)
-#  阶段 2 (并行):  全平台构建 + 测试 +  sanitizer
-#  阶段 3 (串行):  覆盖率汇总 (依赖阶段 2 的 Linux 结果)
-#
-#  矩阵: 3 OS × 多编译器 × {Debug, Release} + 3 种 sanitizer
+#  全部并行:
+#    - lint: 格式检查 → 失败时自动格式化并回推
+#    - Linux: GCC 13 + Clang 15 × {Debug, Release}
+#    - macOS: Apple Clang × {Debug, Release}
+#    - Windows: MSVC × {Debug, Release}
+#    - Sanitizer: ASan+UBSan (GCC), TSan (Clang)
+#    - 静态分析: cppcheck
+#    - 代码覆盖率: gcov + lcov
 # ============================================================================
 
 name: CI
@@ -22,38 +25,52 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CMAKE_VERSION: "3.20"
-
 jobs:
   # ============================================================
-  # 阶段 1: 代码格式检查 (快速失败, 不浪费构建资源)
+  # 代码格式检查 + 自动修复回推
   # ============================================================
   lint:
     name: Lint (clang-format)
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
 
-      - name: Check formatting (core library)
+      - name: Check formatting
+        id: check
         run: |
-          find coro/include router -name '*.hpp' -o -name '*.h' | \
-          xargs clang-format --dry-run --Werror
+          find coro/include router examples tests Web/src main.cpp \
+            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | \
+          xargs clang-format --dry-run --Werror 2>format_errors.txt || true
+          if [ -s format_errors.txt ]; then
+            echo "has_errors=true" >> $GITHUB_OUTPUT
+            cat format_errors.txt
+          else
+            echo "has_errors=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Check formatting (examples & tests)
+      - name: Auto-fix formatting and push
+        if: steps.check.outputs.has_errors == 'true' && github.event_name == 'push'
         run: |
-          find examples tests Web/src main.cpp -name '*.cpp' -o -name '*.hpp' -o -name '*.h' | \
-          xargs clang-format --dry-run --Werror
+          find coro/include router examples tests Web/src main.cpp \
+            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | \
+          xargs clang-format -i
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "style: auto-format code [skip ci]" || true
+          git push
 
   # ============================================================
-  # 阶段 2a: Linux — GCC 13 + Clang 15, Debug + Release
+  # Linux — GCC 13 + Clang 15, Debug + Release
   # ============================================================
   build-linux:
     name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
-    needs: lint
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -101,11 +118,10 @@ jobs:
         run: ./build/coro_stress
 
   # ============================================================
-  # 阶段 2b: macOS — Apple Clang, Debug + Release
+  # macOS — Apple Clang, Debug + Release
   # ============================================================
   build-macos:
     name: macOS (${{ matrix.build_type }})
-    needs: lint
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -138,11 +154,10 @@ jobs:
         run: ./build/coro_stress
 
   # ============================================================
-  # 阶段 2c: Windows — MSVC, Debug + Release
+  # Windows — MSVC, Debug + Release
   # ============================================================
   build-windows:
     name: Windows (${{ matrix.build_type }})
-    needs: lint
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -166,11 +181,10 @@ jobs:
         run: build\Release\coro_stress.exe
 
   # ============================================================
-  # 阶段 2d: Sanitizer 构建 (Linux, 捕获内存/线程/未定义行为错误)
+  # Sanitizer 构建 (Linux)
   # ============================================================
   sanitizer:
     name: Sanitizer (${{ matrix.name }})
-    needs: lint
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -205,7 +219,7 @@ jobs:
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
 
-      - name: Build (tests only, skip examples/web)
+      - name: Build (tests only)
         run: cmake --build build --target coro_tests -j$(nproc)
 
       - name: Run tests with sanitizer
@@ -213,11 +227,10 @@ jobs:
         run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
 
   # ============================================================
-  # 阶段 2e: 静态分析 (cppcheck)
+  # 静态分析 (cppcheck)
   # ============================================================
   static-analysis:
     name: Static Analysis (cppcheck)
-    needs: lint
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -241,11 +254,10 @@ jobs:
           path: cppcheck.log
 
   # ============================================================
-  # 阶段 2f: 代码覆盖率 (GCC + gcov, Debug)
+  # 代码覆盖率 (GCC + gcov + lcov)
   # ============================================================
   coverage:
     name: Coverage (GCC + gcov)
-    needs: lint
     runs-on: ubuntu-22.04
     env:
       CXX: g++-13
@@ -286,7 +298,7 @@ jobs:
           path: coverage_report/
           retention-days: 30
 
-      - name: Coverage summary (PR comment)
+      - name: Coverage summary
         if: github.event_name == 'pull_request'
         run: |
           echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
