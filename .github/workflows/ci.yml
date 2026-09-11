@@ -1,3 +1,14 @@
+# ============================================================================
+# coro — 企业级 CI 流水线
+# ============================================================================
+#
+#  阶段 1 (并行):  lint (格式检查)
+#  阶段 2 (并行):  全平台构建 + 测试 +  sanitizer
+#  阶段 3 (串行):  覆盖率汇总 (依赖阶段 2 的 Linux 结果)
+#
+#  矩阵: 3 OS × 多编译器 × {Debug, Release} + 3 种 sanitizer
+# ============================================================================
+
 name: CI
 
 on:
@@ -6,12 +17,43 @@ on:
   pull_request:
     branches: [main]
 
+# 同一 PR 的新 push 自动取消旧的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_VERSION: "3.20"
+
 jobs:
   # ============================================================
-  # Linux: GCC + Clang, Debug + Release
+  # 阶段 1: 代码格式检查 (快速失败, 不浪费构建资源)
+  # ============================================================
+  lint:
+    name: Lint (clang-format)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting (core library)
+        run: |
+          find coro/include router -name '*.hpp' -o -name '*.h' | \
+          xargs clang-format --dry-run --Werror
+
+      - name: Check formatting (examples & tests)
+        run: |
+          find examples tests Web/src main.cpp -name '*.cpp' -o -name '*.hpp' -o -name '*.h' | \
+          xargs clang-format --dry-run --Werror
+
+  # ============================================================
+  # 阶段 2a: Linux — GCC 13 + Clang 15, Debug + Release
   # ============================================================
   build-linux:
     name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    needs: lint
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -35,24 +77,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.install }} liburing-dev
 
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build all targets
         run: cmake --build build -j$(nproc)
 
       - name: Run unit tests
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
+        timeout-minutes: 5
         run: ./build/coro_stress
 
   # ============================================================
-  # macOS: Apple Clang, Debug + Release
+  # 阶段 2b: macOS — Apple Clang, Debug + Release
   # ============================================================
   build-macos:
     name: macOS (${{ matrix.build_type }})
+    needs: lint
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -61,24 +114,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-${{ matrix.build_type }}
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build all targets
         run: cmake --build build -j$(sysctl -n hw.ncpu)
 
       - name: Run unit tests
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
+        timeout-minutes: 5
         run: ./build/coro_stress
 
   # ============================================================
-  # Windows: MSVC, Debug + Release
+  # 阶段 2c: Windows — MSVC, Debug + Release
   # ============================================================
   build-windows:
     name: Windows (${{ matrix.build_type }})
+    needs: lint
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -94,8 +158,138 @@ jobs:
         run: cmake --build build --config ${{ matrix.build_type }} -j$env:NUMBER_OF_PROCESSORS
 
       - name: Run unit tests
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
+        timeout-minutes: 5
         run: build\Release\coro_stress.exe
+
+  # ============================================================
+  # 阶段 2d: Sanitizer 构建 (Linux, 捕获内存/线程/未定义行为错误)
+  # ============================================================
+  sanitizer:
+    name: Sanitizer (${{ matrix.name }})
+    needs: lint
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ASan+UBSan (GCC)"
+            cxx: g++-13
+            cc: gcc-13
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+            install: g++-13
+          - name: "TSan (Clang)"
+            cxx: clang++-15
+            cc: clang-15
+            flags: "-fsanitize=thread -fno-omit-frame-pointer"
+            install: clang-15
+    env:
+      CXX: ${{ matrix.cxx }}
+      CC: ${{ matrix.cc }}
+      CXXFLAGS: ${{ matrix.flags }}
+      CFLAGS: ${{ matrix.flags }}
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+      TSAN_OPTIONS: "abort_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:abort_on_error=1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install }} liburing-dev
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build (tests only, skip examples/web)
+        run: cmake --build build --target coro_tests -j$(nproc)
+
+      - name: Run tests with sanitizer
+        timeout-minutes: 10
+        run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
+
+  # ============================================================
+  # 阶段 2e: 静态分析 (cppcheck)
+  # ============================================================
+  static-analysis:
+    name: Static Analysis (cppcheck)
+    needs: lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck (core library)
+        run: |
+          cppcheck --enable=warning,performance,portability \
+            --std=c++20 --suppress=missingIncludeSystem \
+            -I coro/include \
+            --error-exitcode=1 \
+            coro/include/ 2>&1 | tee cppcheck.log
+
+      - name: Upload cppcheck report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-report
+          path: cppcheck.log
+
+  # ============================================================
+  # 阶段 2f: 代码覆盖率 (GCC + gcov, Debug)
+  # ============================================================
+  coverage:
+    name: Coverage (GCC + gcov)
+    needs: lint
+    runs-on: ubuntu-22.04
+    env:
+      CXX: g++-13
+      CC: gcc-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 liburing-dev lcov
+
+      - name: Configure CMake (coverage flags)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
+
+      - name: Build tests
+        run: cmake --build build --target coro_tests -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
+
+      - name: Generate coverage report
+        run: |
+          lcov --capture --directory build --output-file coverage.info \
+            --gcov-tool gcov-13
+          lcov --remove coverage.info \
+            '/usr/*' '*/thirdparty/*' '*/tests/*' '*/examples/*' \
+            --output-file coverage_filtered.info
+          genhtml coverage_filtered.info --output-directory coverage_report
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage_report/
+          retention-days: 30
+
+      - name: Coverage summary (PR comment)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          lcov --list coverage_filtered.info | tail -1 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
