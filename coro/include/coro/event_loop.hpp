@@ -141,15 +141,11 @@ namespace coro {
         /// IO 层 (net/fs/pipe/process) 每次操作都用它 —— 替代旧的
         /// dynamic_cast(event_source_ptr()) 每操作一次 RTTI 行走。
         /// 用户安装了非 IOCP 事件源时为 nullptr (调用方需判空)。
-        net::IocpEventSource* iocp() const noexcept {
-            return iocp_source_;
-        }
+        net::IocpEventSource* iocp() const noexcept { return iocp_source_; }
 #endif
 #ifdef __linux__
         /// 当前 loop 的 io_uring 事件源 (构造时缓存, 类型化), 语义同 iocp()
-        net::UringEventSource* uring() const noexcept {
-            return uring_source_;
-        }
+        net::UringEventSource* uring() const noexcept { return uring_source_; }
 #endif
 
         /// 跨线程投递一个普通函数到本事件循环执行 (Scheduler 分发用)。
@@ -211,14 +207,10 @@ namespace coro {
             (void)h;
 #endif
         }
-        bool has_active_coroutines() const {
-            return active_coroutines_ > 0;
-        }
+        bool has_active_coroutines() const { return active_coroutines_ > 0; }
 
         /// 活跃任务数 (已启动且未完成)
-        size_t active_task_count() const {
-            return active_coroutines_.load();
-        }
+        size_t active_task_count() const { return active_coroutines_.load(); }
 
         /// 活跃任务帧地址快照 (对标 asyncio.all_tasks, 供调试)。
         /// 仅在编译时定义了 CORO_TASK_REGISTRY 时有内容, 否则为空。
@@ -232,9 +224,7 @@ namespace coro {
         }
 
         /// 当前正在执行 (刚被 resume) 的协程句柄; 非协程上下文为空
-        static std::coroutine_handle<> current_task() {
-            return detail::t_current_task;
-        }
+        static std::coroutine_handle<> current_task() { return detail::t_current_task; }
 
       private:
         // 构造时: 按平台选择默认事件源 (像 Python 一样零配置)

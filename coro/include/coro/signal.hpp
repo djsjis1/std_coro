@@ -391,9 +391,7 @@ namespace coro {
 #endif
             }
 
-            int await_resume() {
-                return sig;
-            }
+            int await_resume() { return sig; }
 
             /// 等待者帧被销毁 (cancel 注入路径): 从等待列表摘除自己
             void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
