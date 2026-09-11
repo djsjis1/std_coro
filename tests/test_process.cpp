@@ -1,4 +1,5 @@
 // test_process.cpp — 子进程: stdout 捕获 / 退出码 / 终止
+#ifdef _WIN32
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -111,3 +112,4 @@ TEST(ProcessTest, ConcurrentProcesses) {
     test_util::run_task([&] { return concurrent_case(&all_match); });
     EXPECT_TRUE(all_match);
 }
+#endif // _WIN32

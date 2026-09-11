@@ -1,4 +1,5 @@
 // test_fs.cpp — 异步文件 IO: open / read_at / write_at / stat / fsync / 便捷函数
+#if defined(_WIN32) || defined(__linux__)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -226,3 +227,4 @@ TEST(FsTest, WriteTruncatesExisting) {
     EXPECT_EQ(final_content, "short"); // 第二次写 ("w") 截断了旧内容
     std::remove(path.c_str());
 }
+#endif // _WIN32 || __linux__

@@ -1,4 +1,5 @@
 // test_signal.cpp — 信号事件: wait / 多等待者 / handle / 超时取消
+#if defined(_WIN32) || defined(__linux__)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -8,6 +9,11 @@
 
 #include <atomic>
 #include <csignal>
+
+// 跨平台测试信号: Windows 有 SIGBREAK, Linux 用 SIGHUP 替代
+#ifndef _WIN32
+#define SIGBREAK SIGHUP
+#endif
 #include <mutex>
 
 using namespace std::chrono_literals;
@@ -130,3 +136,4 @@ TEST(SignalTest, CancelledWaitIsClean) {
     EXPECT_TRUE(timed_out);
     EXPECT_TRUE(cancel_clean);
 }
+#endif // _WIN32 || __linux__

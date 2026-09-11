@@ -461,8 +461,10 @@ int main(int argc, char **argv)
         // 工厂 lambda 捕获 s (普通函数非协程, 安全): 返回关停协程
         coro::signal::handler sig = coro::signal::handle(
             SIGINT, [&s] { return shutdown_task(s); });
+#ifdef _WIN32
         coro::signal::handler sig2 = coro::signal::handle(
             SIGBREAK, [&s] { return shutdown_task(s); });
+#endif
         co_await std::move(srv);
         s.wait_all(); }(server));
     return 0;

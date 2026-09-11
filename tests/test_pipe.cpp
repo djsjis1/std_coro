@@ -1,4 +1,5 @@
 // test_pipe.cpp — 异步管道: 回环 / 背压 / 对端关闭唤醒
+#if defined(_WIN32) || defined(__linux__)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -152,3 +153,4 @@ TEST(PipeTest, ProducerConsumerOrdering) {
     EXPECT_EQ(received, 200);
     EXPECT_TRUE(in_order);
 }
+#endif // _WIN32 || __linux__

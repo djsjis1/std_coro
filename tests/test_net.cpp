@@ -1,4 +1,5 @@
-// test_net.cpp — TCP 回环: accept / connect / read / write (IOCP)
+// test_net.cpp — TCP 回环: accept / connect / read / write (IOCP / io_uring)
+#if defined(_WIN32) || defined(__linux__)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -166,3 +167,4 @@ TEST(NetTest, WaitForTimeoutCancelsPendingIo) {
     EXPECT_TRUE(connected);
     EXPECT_TRUE(read_cancelled); // 挂起中的读被超时取消 (CancelIoEx 联动), 无泄漏无挂死
 }
+#endif // _WIN32 || __linux__

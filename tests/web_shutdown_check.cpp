@@ -31,7 +31,9 @@ int main() {
     coro::run([](web_server& s, std::atomic<bool>& ok) -> coro::Task<> {
         auto srv = coro::spawn(s.serve());
         auto h1 = coro::signal::handle(SIGINT, [&s] { return shutdown_task(&s); });
+#ifdef _WIN32
         auto h2 = coro::signal::handle(SIGBREAK, [&s] { return shutdown_task(&s); });
+#endif
         co_await std::move(srv);
         s.wait_all();
         ok = true;

@@ -42,7 +42,12 @@ coro::Task<> client() {
     auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8888);
     if (!conn.valid()) {
         std::cout << "  [client] connect FAILED (errno=" << errno << ", "
-                  << (errno == WSAECONNREFUSED ? "refused" : "other") << ")" << std::endl;
+#ifdef _WIN32
+                  << (errno == WSAECONNREFUSED ? "refused" : "other")
+#else
+                  << (errno == ECONNREFUSED ? "refused" : "other")
+#endif
+                  << ")" << std::endl;
         co_return;
     }
     std::cout << "  [client] connected!" << std::endl;

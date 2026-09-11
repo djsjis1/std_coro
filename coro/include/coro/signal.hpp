@@ -63,8 +63,13 @@ namespace coro {
         namespace detail_signal {
 
             // 支持的信号集合 (两平台共用; 越界信号被拒绝)
+#ifdef _WIN32
             inline constexpr int supported[] = {SIGINT, SIGTERM, SIGBREAK, SIGHUP};
             inline constexpr size_t NSLOT = 4;
+#else
+            inline constexpr int supported[] = {SIGINT, SIGTERM, SIGHUP};
+            inline constexpr size_t NSLOT = 3;
+#endif
 
             inline size_t slot_of(int sig) {
                 for (size_t i = 0; i < NSLOT; ++i)
@@ -232,7 +237,7 @@ namespace coro {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
-                    std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == waiter; });
+                    std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
                     maybe_stop_reader();
                 }
 

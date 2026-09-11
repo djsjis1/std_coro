@@ -5,7 +5,7 @@
 #  全部并行:
 #    - lint: 格式检查 → 失败时自动格式化并回推
 #    - Linux: GCC 13 + Clang 15 × {Debug, Release}
-#    - macOS: Apple Clang × {Debug, Release}
+#    - macOS: (暂时禁用, 待 kqueue 事件源实现)
 #    - Windows: MSVC × {Debug, Release}
 #    - Sanitizer: ASan+UBSan (GCC), TSan (Clang)
 #    - 静态分析: cppcheck
@@ -119,39 +119,35 @@ jobs:
 
   # ============================================================
   # macOS — Apple Clang, Debug + Release
+  # (暂时禁用: macOS 缺少 IOCP/io_uring, 待 kqueue 事件源实现后启用)
   # ============================================================
-  build-macos:
-    name: macOS (${{ matrix.build_type }})
-    runs-on: macos-14
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: [Debug, Release]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: macos-${{ matrix.build_type }}
-
-      - name: Configure CMake
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-      - name: Build all targets
-        run: cmake --build build -j$(sysctl -n hw.ncpu)
-
-      - name: Run unit tests
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
-
-      - name: Run stress test (Release only)
-        if: matrix.build_type == 'Release'
-        timeout-minutes: 5
-        run: ./build/coro_stress
+  # build-macos:
+  #   name: macOS (${{ matrix.build_type }})
+  #   runs-on: macos-14
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       build_type: [Debug, Release]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: ccache
+  #       uses: hendrikmuhs/ccache-action@v1.2
+  #       with:
+  #         key: macos-${{ matrix.build_type }}
+  #     - name: Configure CMake
+  #       run: |
+  #         cmake -B build \
+  #           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+  #           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  #           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  #     - name: Build all targets
+  #       run: cmake --build build -j$(sysctl -n hw.ncpu)
+  #     - name: Run unit tests
+  #       run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+  #     - name: Run stress test (Release only)
+  #       if: matrix.build_type == 'Release'
+  #       timeout-minutes: 5
+  #       run: ./build/coro_stress
 
   # ============================================================
   # Windows — MSVC, Debug + Release

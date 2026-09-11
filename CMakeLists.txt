@@ -21,6 +21,32 @@ if(MSVC)
 endif()
 
 # ============================================================================
+# 平台检测: IO 模块可用性 (与 coro.hpp 分层架构一致)
+# ============================================================================
+set(CORO_HAS_NET  OFF)
+set(CORO_HAS_FS   OFF)
+set(CORO_HAS_PIPE OFF)
+set(CORO_HAS_SIGNAL OFF)
+set(CORO_HAS_FSWATCH OFF)
+set(CORO_HAS_PROCESS OFF)
+
+if(WIN32)
+    set(CORO_HAS_NET ON)
+    set(CORO_HAS_FS ON)
+    set(CORO_HAS_PIPE ON)
+    set(CORO_HAS_SIGNAL ON)
+    set(CORO_HAS_FSWATCH ON)
+    set(CORO_HAS_PROCESS ON)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CORO_HAS_NET ON)
+    set(CORO_HAS_FS ON)
+    set(CORO_HAS_PIPE ON)
+    set(CORO_HAS_SIGNAL ON)
+    set(CORO_HAS_FSWATCH ON)
+    # process: GCC 12 coroutine ICE (structured bindings + co_await), 待 GCC 13+ 后启用
+endif()
+
+# ============================================================================
 # 示例
 # ============================================================================
 add_executable(example_basic examples/basic.cpp)
@@ -35,31 +61,42 @@ target_link_libraries(example_future PRIVATE coro::coro)
 add_executable(example_full_test examples/full_test.cpp)
 target_link_libraries(example_full_test PRIVATE coro::coro)
 
-add_executable(example_echo examples/echo_server.cpp)
-target_link_libraries(example_echo PRIVATE coro::coro)
-
-add_executable(example_file_io examples/file_io.cpp)
-target_link_libraries(example_file_io PRIVATE coro::coro)
-
-# 常驻模式优雅关停验证 (signal::handle → stop → wait_all)
-add_executable(example_dir_watch examples/dir_watch.cpp)
-target_link_libraries(example_dir_watch PRIVATE coro::coro)
-
-add_executable(example_process examples/process_demo.cpp)
-target_link_libraries(example_process PRIVATE coro::coro)
-
-add_executable(web_shutdown_check
-    tests/web_shutdown_check.cpp
-    Web/src/http_types.cpp
-    Web/src/web_server.cpp)
-target_link_libraries(web_shutdown_check PRIVATE coro::coro http::http router::router)
-target_include_directories(web_shutdown_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Web/src)
-if(MSVC)
-    target_compile_options(web_shutdown_check PRIVATE /utf-8)
+if(CORO_HAS_NET)
+    add_executable(example_echo examples/echo_server.cpp)
+    target_link_libraries(example_echo PRIVATE coro::coro)
 endif()
- 
+
+if(CORO_HAS_FS)
+    add_executable(example_file_io examples/file_io.cpp)
+    target_link_libraries(example_file_io PRIVATE coro::coro)
+endif()
+
+if(CORO_HAS_FSWATCH)
+    add_executable(example_dir_watch examples/dir_watch.cpp)
+    target_link_libraries(example_dir_watch PRIVATE coro::coro)
+endif()
+
+if(CORO_HAS_PROCESS)
+    add_executable(example_process examples/process_demo.cpp)
+    target_link_libraries(example_process PRIVATE coro::coro)
+endif()
+
+if(CORO_HAS_NET AND CORO_HAS_SIGNAL)
+    add_executable(web_shutdown_check
+        tests/web_shutdown_check.cpp
+        Web/src/http_types.cpp
+        Web/src/web_server.cpp)
+    target_link_libraries(web_shutdown_check PRIVATE coro::coro http::http router::router)
+    target_include_directories(web_shutdown_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Web/src)
+    if(MSVC)
+        target_compile_options(web_shutdown_check PRIVATE /utf-8)
+    endif()
+endif()
+
 # Web 服务器示例 (coro 网络层 + llhttp 协议解析, 独立子项目)
-add_subdirectory(Web)
+if(CORO_HAS_NET)
+    add_subdirectory(Web)
+endif()
 
 # 协程练习场 (main.cpp 用于练习写协程代码)
 add_executable(coro_practice main.cpp)

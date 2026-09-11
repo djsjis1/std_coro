@@ -1,4 +1,5 @@
 // test_fs_watch.cpp — 目录监视: 创建/修改/重命名/删除 事件
+#if defined(_WIN32) || defined(__linux__)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -94,3 +95,4 @@ TEST(FsWatchTest, CreateModifyRenameRemoveEvents) {
     // 删除 b.txt
     EXPECT_TRUE(has(coro::fs::watch_event_type::removed, "b.txt")) << "未见 b.txt 的删除事件";
 }
+#endif // _WIN32 || __linux__
