@@ -4,7 +4,7 @@
 #
 #  全部并行:
 #    - lint: 格式检查 → 失败时自动格式化并回推
-#    - Linux: GCC 13 + Clang 15 × {Debug, Release}
+#    - Linux: GCC 14 + Clang 15 × {Debug, Release}
 #    - macOS: (暂时禁用, 待 kqueue 事件源实现)
 #    - Windows: MSVC × {Debug, Release}
 #    - Sanitizer: ASan+UBSan (GCC), TSan (Clang)
@@ -31,7 +31,7 @@ jobs:
   # ============================================================
   lint:
     name: Lint (clang-format)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -71,14 +71,14 @@ jobs:
   # ============================================================
   build-linux:
     name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - compiler: g++-13
-            cc: gcc-13
-            install: g++-13
+          - compiler: g++-14
+            cc: gcc-14
+            install: g++-14
           - compiler: clang++-15
             cc: clang-15
             install: clang-15
@@ -181,16 +181,16 @@ jobs:
   # ============================================================
   sanitizer:
     name: Sanitizer (${{ matrix.name }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: "ASan+UBSan (GCC)"
-            cxx: g++-13
-            cc: gcc-13
+            cxx: g++-14
+            cc: gcc-14
             flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
-            install: g++-13
+            install: g++-14
           - name: "TSan (Clang)"
             cxx: clang++-15
             cc: clang-15
@@ -227,7 +227,7 @@ jobs:
   # ============================================================
   static-analysis:
     name: Static Analysis (cppcheck)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -254,17 +254,17 @@ jobs:
   # ============================================================
   coverage:
     name: Coverage (GCC + gcov)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
-      CXX: g++-13
-      CC: gcc-13
+      CXX: g++-14
+      CC: gcc-14
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 liburing-dev lcov
+          sudo apt-get install -y g++-14 liburing-dev lcov
 
       - name: Configure CMake (coverage flags)
         run: |
@@ -281,7 +281,7 @@ jobs:
       - name: Generate coverage report
         run: |
           lcov --capture --directory build --output-file coverage.info \
-            --gcov-tool gcov-13
+            --gcov-tool gcov-14
           lcov --remove coverage.info \
             '/usr/*' '*/thirdparty/*' '*/tests/*' '*/examples/*' \
             --output-file coverage_filtered.info
