@@ -27,6 +27,21 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build -C Debug --output-on-failure
 
+  build-macos:
+    name: macOS (Apple Clang)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        run: ctest --test-dir build -C Debug --output-on-failure
+
   build-windows:
     name: Windows (MSVC)
     runs-on: windows-2022
