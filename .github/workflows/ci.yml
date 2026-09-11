@@ -7,52 +7,95 @@ on:
     branches: [main]
 
 jobs:
+  # ============================================================
+  # Linux: GCC + Clang, Debug + Release
+  # ============================================================
   build-linux:
-    name: Linux (GCC 13)
+    name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: g++-13
+            cc: gcc-13
+            install: g++-13
+          - compiler: clang++-15
+            cc: clang-15
+            install: clang-15
+        build_type: [Debug, Release]
+    env:
+      CXX: ${{ matrix.compiler }}
+      CC: ${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 liburing-dev
+          sudo apt-get install -y ${{ matrix.install }} liburing-dev
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-      - name: Build
+      - name: Build all targets
         run: cmake --build build -j$(nproc)
 
-      - name: Run tests
-        run: ctest --test-dir build -C Debug --output-on-failure
+      - name: Run unit tests
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
 
+      - name: Run stress test (Release only)
+        if: matrix.build_type == 'Release'
+        run: ./build/coro_stress
+
+  # ============================================================
+  # macOS: Apple Clang, Debug + Release
+  # ============================================================
   build-macos:
-    name: macOS (Apple Clang)
+    name: macOS (${{ matrix.build_type }})
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-      - name: Build
+      - name: Build all targets
         run: cmake --build build -j$(sysctl -n hw.ncpu)
 
-      - name: Run tests
-        run: ctest --test-dir build -C Debug --output-on-failure
+      - name: Run unit tests
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
 
+      - name: Run stress test (Release only)
+        if: matrix.build_type == 'Release'
+        run: ./build/coro_stress
+
+  # ============================================================
+  # Windows: MSVC, Debug + Release
+  # ============================================================
   build-windows:
-    name: Windows (MSVC)
+    name: Windows (${{ matrix.build_type }})
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-      - name: Build
-        run: cmake --build build --config Debug -j$env:NUMBER_OF_PROCESSORS
+      - name: Build all targets
+        run: cmake --build build --config ${{ matrix.build_type }} -j$env:NUMBER_OF_PROCESSORS
 
-      - name: Run tests
-        run: ctest --test-dir build -C Debug --output-on-failure
+      - name: Run unit tests
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 60
+
+      - name: Run stress test (Release only)
+        if: matrix.build_type == 'Release'
+        run: build\Release\coro_stress.exe
