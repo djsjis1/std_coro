@@ -32,18 +32,15 @@
 // 注意: 本文件在 Windows 上不可编译, 需要 Linux 环境验证。
 // ============================================================================
 
-namespace coro
-{
-    namespace detail
-    {
+namespace coro {
+    namespace detail {
 
 #ifdef __linux__
 
         // ---- 每个异步 I/O 操作的状态 ----
         // user_data 字段保存此指针, CQE 到达时通过它找回协程。
         // 所有 io_uring 异步操作 (socket / 文件 / 管道 / inotify / poll) 共享。
-        struct uring_op
-        {
+        struct uring_op {
             std::coroutine_handle<> continuation{}; // 完成时要恢复的协程
             int result = 0;                         // 完成结果 (字节数, 负值=错误)
             int error = 0;                          // 错误码 (0=成功)
@@ -53,27 +50,19 @@ namespace coro
 
     } // namespace detail
 
-    namespace net
-    {
+    namespace net {
 
 #ifdef __linux__
 
-        class UringEventSource : public EventSource
-        {
-        public:
+        class UringEventSource : public EventSource {
+          public:
             // 完成队列深度 256: 同时挂起的异步操作上限 (可按需调大)
-            UringEventSource()
-            {
-                io_uring_queue_init(256, &ring_, 0);
-            }
+            UringEventSource() { io_uring_queue_init(256, &ring_, 0); }
 
-            ~UringEventSource() override
-            {
-                io_uring_queue_exit(&ring_);
-            }
+            ~UringEventSource() override { io_uring_queue_exit(&ring_); }
 
             /// 获取底层 ring (网络层提交 SQE 用)
-            io_uring *handle() { return &ring_; }
+            io_uring* handle() { return &ring_; }
 
             /// 标记一个异步操作开始 (提交 SQE 后调用)
             void op_start() { ++pending_ops_; }
@@ -81,14 +70,12 @@ namespace coro
             /// 是否还有挂起的 I/O 操作 (事件循环据此决定是否退出)
             bool has_pending() const override { return pending_ops_ > 0; }
 
-            int wait_for(std::chrono::milliseconds timeout) override
-            {
+            int wait_for(std::chrono::milliseconds timeout) override {
                 // 先非阻塞地消费所有已就绪的 CQE
                 int completed = 0;
-                io_uring_cqe *cqe = nullptr;
+                io_uring_cqe* cqe = nullptr;
                 unsigned head = 0;
-                while (io_uring_peek_batch_cqe(&ring_, &cqe, 1) > 0)
-                {
+                while (io_uring_peek_batch_cqe(&ring_, &cqe, 1) > 0) {
                     process_cqe(cqe);
                     io_uring_cqe_seen(&ring_, cqe);
                     ++completed;
@@ -98,7 +85,7 @@ namespace coro
                     return 1;
 
                 // 没有就绪的 CQE, 带超时等待 (定时器到点 / 新 CQE / 被唤醒)
-                struct __kernel_timespec ts{};
+                struct __kernel_timespec ts {};
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 
@@ -113,23 +100,20 @@ namespace coro
                 return 1;
             }
 
-            void wake() override
-            {
+            void wake() override {
                 // 提交一个 NOP 操作: 产生一个假 CQE 唤醒等待者
                 // (等价 IOCP 的 PostQueuedCompletionStatus / Python 的 self-pipe)
-                io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
-                if (sqe)
-                {
+                io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (sqe) {
                     io_uring_prep_nop(sqe);
                     io_uring_sqe_set_data(sqe, nullptr); // nullptr = 唤醒标记
                     io_uring_submit(&ring_);
                 }
             }
 
-        private:
-            void process_cqe(io_uring_cqe *cqe)
-            {
-                auto *op = static_cast<detail::uring_op *>(io_uring_cqe_get_data(cqe));
+          private:
+            void process_cqe(io_uring_cqe* cqe) {
+                auto* op = static_cast<detail::uring_op*>(io_uring_cqe_get_data(cqe));
                 if (!op)
                     return; // 唤醒包, 无事可做
 

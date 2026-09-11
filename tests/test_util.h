@@ -13,14 +13,11 @@
 // MSVC Debug 注意: 主协程一律用命名函数 (参数进帧), 不用 lambda 协程。
 // ============================================================================
 
-namespace test_util
-{
+namespace test_util {
 
     // 启动一个惰性 Task 并驱动事件循环直到完成。
     // factory 返回 Task (通常是非协程 lambda, 内部调用命名协程函数)。
-    template <typename F>
-    void run_task(F &&factory)
-    {
+    template <typename F> void run_task(F&& factory) {
         using task_t = std::invoke_result_t<F>;
         task_t t = factory();
         t.start();

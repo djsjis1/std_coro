@@ -9,14 +9,12 @@
 
 using namespace std::chrono_literals;
 
-namespace
-{
+namespace {
 
     // ── 命名协程函数 ──
 
     // 两个协程等待同一个 Future, 必须都被唤醒 (回归: 旧实现单 continuation 覆盖)
-    coro::Task<int> future_waiter(coro::Future<int> *f, int id, int *out1, int *out2)
-    {
+    coro::Task<int> future_waiter(coro::Future<int>* f, int id, int* out1, int* out2) {
         int v = co_await *f;
         if (id == 1)
             *out1 = v;
@@ -25,8 +23,7 @@ namespace
         co_return v;
     }
 
-    coro::Task<> multi_waiter_scenario(int *o1, int *o2)
-    {
+    coro::Task<> multi_waiter_scenario(int* o1, int* o2) {
         coro::Promise<int> p;
         auto f = p.get_future();
 
@@ -40,8 +37,7 @@ namespace
     }
 
     // 提前 set_value: await 立即返回 (快速路径)
-    coro::Task<> ready_future(int *out)
-    {
+    coro::Task<> ready_future(int* out) {
         coro::Promise<int> p;
         auto f = p.get_future();
         p.set_value(7);
@@ -49,48 +45,39 @@ namespace
     }
 
     // set_exception: await_resume 重新抛出
-    coro::Task<> exception_future(bool *caught)
-    {
+    coro::Task<> exception_future(bool* caught) {
         coro::Promise<int> p;
         auto f = p.get_future();
         p.set_exception(std::make_exception_ptr(std::runtime_error("f boom")));
-        try
-        {
+        try {
             (void)co_await f;
-        }
-        catch (const std::runtime_error &)
-        {
+        } catch (const std::runtime_error&) {
             *caught = true;
         }
     }
 
     // 跨线程 set_value: 工作线程完成 Promise, 事件循环被唤醒
-    coro::Task<> cross_thread_scenario(int *out)
-    {
+    coro::Task<> cross_thread_scenario(int* out) {
         coro::Promise<int> p;
         auto f = p.get_future();
 
-        std::thread worker([p = std::move(p)]() mutable
-                           {
+        std::thread worker([p = std::move(p)]() mutable {
             std::this_thread::sleep_for(20ms);
-            p.set_value(99); });
+            p.set_value(99);
+        });
 
         *out = co_await f; // 挂起直到工作线程 set_value
         worker.join();
     }
 
     // 重复 set 抛 logic_error
-    coro::Task<> double_set_scenario(bool *threw)
-    {
+    coro::Task<> double_set_scenario(bool* threw) {
         coro::Promise<int> p;
         auto f = p.get_future();
         p.set_value(1);
-        try
-        {
+        try {
             p.set_value(2);
-        }
-        catch (const std::logic_error &)
-        {
+        } catch (const std::logic_error&) {
             *threw = true;
         }
         (void)co_await f;
@@ -98,43 +85,33 @@ namespace
 
 } // namespace
 
-TEST(FutureTest, MultipleWaitersAllWoken)
-{
+TEST(FutureTest, MultipleWaitersAllWoken) {
     int o1 = 0, o2 = 0;
-    test_util::run_task([&]
-                        { return multi_waiter_scenario(&o1, &o2); });
+    test_util::run_task([&] { return multi_waiter_scenario(&o1, &o2); });
     EXPECT_EQ(o1, 42);
     EXPECT_EQ(o2, 42);
 }
 
-TEST(FutureTest, PresetValueSkipsSuspension)
-{
+TEST(FutureTest, PresetValueSkipsSuspension) {
     int out = 0;
-    test_util::run_task([&]
-                        { return ready_future(&out); });
+    test_util::run_task([&] { return ready_future(&out); });
     EXPECT_EQ(out, 7);
 }
 
-TEST(FutureTest, ExceptionPropagates)
-{
+TEST(FutureTest, ExceptionPropagates) {
     bool caught = false;
-    test_util::run_task([&]
-                        { return exception_future(&caught); });
+    test_util::run_task([&] { return exception_future(&caught); });
     EXPECT_TRUE(caught);
 }
 
-TEST(FutureTest, CrossThreadSetValue)
-{
+TEST(FutureTest, CrossThreadSetValue) {
     int out = 0;
-    test_util::run_task([&]
-                        { return cross_thread_scenario(&out); });
+    test_util::run_task([&] { return cross_thread_scenario(&out); });
     EXPECT_EQ(out, 99);
 }
 
-TEST(FutureTest, DoubleSetThrows)
-{
+TEST(FutureTest, DoubleSetThrows) {
     bool threw = false;
-    test_util::run_task([&]
-                        { return double_set_scenario(&threw); });
+    test_util::run_task([&] { return double_set_scenario(&threw); });
     EXPECT_TRUE(threw);
 }

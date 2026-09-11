@@ -35,17 +35,16 @@
 // 两级负载均衡分发; 连接协程挂起(读/写/sleep)不占 CPU。
 // ============================================================================
 
-class web_server
-{
-public:
+class web_server {
+  public:
     /// workers: 连接处理线程数; 0 = 硬件并发数
     explicit web_server(size_t workers = 0);
 
     /// 绑定并监听; 失败返回 false
-    bool listen(const char *ip, unsigned short port);
+    bool listen(const char* ip, unsigned short port);
 
     /// 路由表(注册 handler / 静态目录)
-    router &routes() { return router_; }
+    router& routes() { return router_; }
 
     /// 消息体上限(默认 8MB), 超出时 llhttp 中止解析 → 400
     void set_max_body(size_t bytes) { max_body_ = bytes; }
@@ -65,14 +64,14 @@ public:
 
     size_t worker_count() const { return scheduler_.worker_count(); }
 
-private:
+  private:
     /// 单连接处理: 增量解析请求并逐个响应, 直到连接关闭或 keep-alive 结束。
     /// 注意: 在 worker 线程上运行 (Scheduler 分发)。
     coro::Task<> handle_connection(coro::net::TcpStream conn);
 
     /// 路由分发 + 异常兑底(handler 抛异常 → 500)。
     /// req 为非 const 引用: 动态路由捕获的参数由 router 写入 req.params
-    coro::Task<http_response> dispatch(http_request &req);
+    coro::Task<http_response> dispatch(http_request& req);
 
     coro::Scheduler scheduler_; // worker 池 (构造即启动, 析构自动 join)
     coro::net::TcpListener listener_;

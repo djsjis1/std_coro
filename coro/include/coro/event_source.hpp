@@ -24,12 +24,10 @@
 // 通过 EventLoop::set_event_source() 安装。
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
-    class EventSource
-    {
-    public:
+    class EventSource {
+      public:
         virtual ~EventSource() = default;
 
         // ---- 完成回调 (由 EventLoop 安装事件源时注入) ----
@@ -38,27 +36,25 @@ namespace coro
         // 旧实现是 detail::scheduler() 全局函数指针, 每个线程构造自己的
         // EventLoop 时都会覆写它 —— 多线程同时构造 loop 是数据竞争。
         // 现改为事件源成员: 事件源本身就是每 loop 一个, 天然无竞争。
-        using completion_fn = void (*)(void *, std::coroutine_handle<>);
+        using completion_fn = void (*)(void*, std::coroutine_handle<>);
 
-        void set_completion_handler(void *ctx, completion_fn fn) noexcept
-        {
+        void set_completion_handler(void* ctx, completion_fn fn) noexcept {
             complete_ctx_ = ctx;
             complete_fn_ = fn;
         }
 
-    protected:
+      protected:
         /// 完成一个 I/O 操作: 把协程交还给事件循环 (未安装回调时忽略)
-        void on_complete(std::coroutine_handle<> h)
-        {
+        void on_complete(std::coroutine_handle<> h) {
             if (complete_fn_)
                 complete_fn_(complete_ctx_, h);
         }
 
-    private:
-        void *complete_ctx_ = nullptr;
+      private:
+        void* complete_ctx_ = nullptr;
         completion_fn complete_fn_ = nullptr;
 
-    public:
+      public:
         // ---- 核心等待 ----
 
         /// 阻塞等待, 最多 timeout 毫秒。
@@ -89,21 +85,17 @@ namespace coro
     //           Linux 上是 futex, macOS 上是 pthread_cond, 全部原生支持。
     // ============================================================================
 
-    class CVEventSource : public EventSource
-    {
-    public:
-        int wait_for(std::chrono::milliseconds timeout) override
-        {
+    class CVEventSource : public EventSource {
+      public:
+        int wait_for(std::chrono::milliseconds timeout) override {
             std::unique_lock lock(mutex_);
             // 谓词过滤虚假唤醒: 只有 woken_ 为 true 才提前返回
-            cv_.wait_for(lock, timeout, [&]
-                         { return woken_; });
+            cv_.wait_for(lock, timeout, [&] { return woken_; });
             woken_ = false; // 消费唤醒标记
             return 0;
         }
 
-        void wake() override
-        {
+        void wake() override {
             {
                 std::lock_guard lock(mutex_);
                 woken_ = true;
@@ -111,7 +103,7 @@ namespace coro
             cv_.notify_one(); // 没有等待者时是 no-op
         }
 
-    private:
+      private:
         std::mutex mutex_;
         std::condition_variable cv_;
         bool woken_ = false;

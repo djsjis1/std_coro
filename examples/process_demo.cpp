@@ -10,28 +10,21 @@
 #include <string>
 
 // ── 1. 捕获输出 ──
-coro::Task<> run_and_capture()
-{
-    auto [code, out] = co_await coro::process::run_capture(
-        {"cmd", "/c", "echo hello from subprocess"});
+coro::Task<> run_and_capture() {
+    auto [code, out] = co_await coro::process::run_capture({"cmd", "/c", "echo hello from subprocess"});
     std::printf("[1] exit=%d stdout=%.*s", code, (int)out.size(), out.c_str());
 }
 
 // ── 2. 退出码 ──
-coro::Task<int> exit_code(int v)
-{
-    auto p = co_await coro::process::spawn({"cmd", "/c", "exit " + std::to_string(v)},
-                                           {.capture_stdout = true});
+coro::Task<int> exit_code(int v) {
+    auto p = co_await coro::process::spawn({"cmd", "/c", "exit " + std::to_string(v)}, {.capture_stdout = true});
     co_return co_await p.wait();
 }
 
 // ── 3. stdin 交互: 管道写入 + 读取回显 ──
-coro::Task<> stdin_roundtrip()
-{
-    auto p = co_await coro::process::spawn(
-        {"cmd", "/c", "findstr x"}, {.capture_stdin = true, .capture_stdout = true});
-    if (!p.valid())
-    {
+coro::Task<> stdin_roundtrip() {
+    auto p = co_await coro::process::spawn({"cmd", "/c", "findstr x"}, {.capture_stdin = true, .capture_stdout = true});
+    if (!p.valid()) {
         std::printf("[3] spawn failed: %d\n", coro::io::last_error());
         co_return;
     }
@@ -42,8 +35,7 @@ coro::Task<> stdin_roundtrip()
 
     std::string out;
     char buf[256];
-    while (true)
-    {
+    while (true) {
         int n = co_await p.stdout_pipe()->read(buf, sizeof(buf));
         if (n <= 0)
             break;
@@ -53,8 +45,7 @@ coro::Task<> stdin_roundtrip()
     std::printf("[3] exit=%d matched=%.*s", code, (int)out.size(), out.c_str());
 }
 
-coro::Task<> main_task()
-{
+coro::Task<> main_task() {
     co_await run_and_capture();
 
     auto [a, b] = co_await coro::gather(exit_code(3), exit_code(5));
@@ -64,8 +55,7 @@ coro::Task<> main_task()
     std::printf("done.\n");
 }
 
-int main()
-{
+int main() {
     coro::run(main_task());
     return 0;
 }

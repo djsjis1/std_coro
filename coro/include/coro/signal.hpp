@@ -57,21 +57,16 @@
 // (或自行阻塞), 否则其他线程可能收到默认处置。
 // ============================================================================
 
-namespace coro
-{
-    namespace signal
-    {
+namespace coro {
+    namespace signal {
 
-        namespace detail_signal
-        {
+        namespace detail_signal {
 
             // 支持的信号集合 (两平台共用; 越界信号被拒绝)
-            inline constexpr int supported[] = {
-                SIGINT, SIGTERM, SIGBREAK, SIGHUP};
+            inline constexpr int supported[] = {SIGINT, SIGTERM, SIGBREAK, SIGHUP};
             inline constexpr size_t NSLOT = 4;
 
-            inline size_t slot_of(int sig)
-            {
+            inline size_t slot_of(int sig) {
                 for (size_t i = 0; i < NSLOT; ++i)
                     if (supported[i] == sig)
                         return i;
@@ -83,25 +78,21 @@ namespace coro
             // ==================================================================
             // Windows 信号管理器 (进程级单例; 控制台线程 / raise 线程投递)
             // ==================================================================
-            struct waiter_entry
-            {
-                void *awaiter;                 // wait_awaiter 指针 (帧内, 稳定)
+            struct waiter_entry {
+                void* awaiter;                  // wait_awaiter 指针 (帧内, 稳定)
                 std::coroutine_handle<> handle; // 等待协程
-                EventLoop *loop;                // 等待者所在的 loop (唤醒路由)
+                EventLoop* loop;                // 等待者所在的 loop (唤醒路由)
             };
 
-            class manager
-            {
-            public:
-                static manager &get()
-                {
+            class manager {
+              public:
+                static manager& get() {
                     static manager m;
                     return m;
                 }
 
                 /// 注册等待者 (首个等待者安装底层处理器)
-                void add(int sig, void *awaiter, std::coroutine_handle<> h, EventLoop *loop)
-                {
+                void add(int sig, void* awaiter, std::coroutine_handle<> h, EventLoop* loop) {
                     std::lock_guard lock(mtx_);
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
@@ -111,21 +102,17 @@ namespace coro
                 }
 
                 /// 摘除等待者 (正常恢复或帧销毁路径)
-                void remove(int sig, void *awaiter)
-                {
+                void remove(int sig, void* awaiter) {
                     std::lock_guard lock(mtx_);
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
-                    std::erase_if(waiters_[slot],
-                                  [awaiter](const waiter_entry &w)
-                                  { return w.awaiter == awaiter; });
+                    std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
                 }
 
                 /// 投递信号: 唤醒该信号的全部当前等待者
                 /// 可从控制台处理器线程或 raise() 线程调用。
-                void deliver(int sig)
-                {
+                void deliver(int sig) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
@@ -134,8 +121,7 @@ namespace coro
                         std::lock_guard lock(mtx_);
                         wake.swap(waiters_[slot]);
                     }
-                    for (auto &w : wake)
-                    {
+                    for (auto& w : wake) {
                         if (w.loop)
                             w.loop->schedule(w.handle);
                         else
@@ -143,9 +129,8 @@ namespace coro
                     }
                 }
 
-            private:
-                void install_locked()
-                {
+              private:
+                void install_locked() {
                     if (installed_)
                         return;
                     installed_ = true;
@@ -160,33 +145,30 @@ namespace coro
                     std::signal(SIGTERM, &manager::c_handler);
                 }
 
-                static BOOL WINAPI console_handler(DWORD type)
-                {
+                static BOOL WINAPI console_handler(DWORD type) {
                     int sig = 0;
-                    switch (type)
-                    {
-                    case CTRL_C_EVENT:
-                        sig = SIGINT;
-                        break;
-                    case CTRL_BREAK_EVENT:
-                        sig = SIGBREAK;
-                        break;
-                    case CTRL_CLOSE_EVENT:
-                        sig = SIGHUP;
-                        break;
-                    case CTRL_LOGOFF_EVENT:
-                    case CTRL_SHUTDOWN_EVENT:
-                        sig = SIGTERM;
-                        break;
-                    default:
-                        return FALSE;
+                    switch (type) {
+                        case CTRL_C_EVENT:
+                            sig = SIGINT;
+                            break;
+                        case CTRL_BREAK_EVENT:
+                            sig = SIGBREAK;
+                            break;
+                        case CTRL_CLOSE_EVENT:
+                            sig = SIGHUP;
+                            break;
+                        case CTRL_LOGOFF_EVENT:
+                        case CTRL_SHUTDOWN_EVENT:
+                            sig = SIGTERM;
+                            break;
+                        default:
+                            return FALSE;
                     }
                     get().deliver(sig);
                     return TRUE; // 已消费: 阻止默认终止行为 (优雅关停的前提)
                 }
 
-                static void c_handler(int sig)
-                {
+                static void c_handler(int sig) {
                     // MSVC CRT 经 raise() 投递后会把处理器复位为 SIG_DFL
                     // (实证: 第二次 raise 直接走默认动作 exit(3)), 每次重装。
                     // (真实控制台事件走 SetConsoleCtrlHandler 路径, 不受影响)
@@ -209,17 +191,14 @@ namespace coro
 
             struct reader_state; // 前向声明 (定义在下方)
 
-            struct waiter_entry
-            {
-                void *awaiter;
+            struct waiter_entry {
+                void* awaiter;
                 std::coroutine_handle<> handle;
             };
 
-            class manager
-            {
-            public:
-                static manager &get()
-                {
+            class manager {
+              public:
+                static manager& get() {
                     static thread_local manager m; // 每 loop (线程) 一个
                     return m;
                 }
@@ -227,8 +206,7 @@ namespace coro
                 int sfd() const { return sfd_; }
 
                 /// 注册等待者; 必要时阻塞信号 + 创建/更新 signalfd + 启动读者
-                void add(int sig, void *awaiter, std::coroutine_handle<> h)
-                {
+                void add(int sig, void* awaiter, std::coroutine_handle<> h) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
@@ -250,22 +228,18 @@ namespace coro
                     ensure_reader();
                 }
 
-                void remove(int sig, void *awaiter)
-                {
+                void remove(int sig, void* awaiter) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
-                    std::erase_if(waiters_[slot],
-                                  [awaiter](const waiter_entry &w)
-                                  { return w.awaiter == waiter; });
+                    std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == waiter; });
                     maybe_stop_reader();
                 }
 
                 /// 投递 (读者协程在 loop 线程调用): 唤醒该信号的一个等待者。
                 /// 无等待者余留时停掉读者 (挂起的 signalfd 读被取消,
                 /// 事件循环不会被常驻读者拖住无法退出)。
-                void deliver(int sig)
-                {
+                void deliver(int sig) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT || waiters_[slot].empty())
                         return;
@@ -276,9 +250,8 @@ namespace coro
                     maybe_stop_reader();
                 }
 
-                bool has_waiters() const
-                {
-                    for (auto &v : waiters_)
+                bool has_waiters() const {
+                    for (auto& v : waiters_)
                         if (!v.empty())
                             return true;
                     return false;
@@ -287,7 +260,7 @@ namespace coro
                 // 读者协程的自持有状态 (避免 reader_task_ 未初始化先被引用)
                 std::shared_ptr<reader_state> rstate;
 
-            private:
+              private:
                 void ensure_reader();
                 void maybe_stop_reader();
 
@@ -298,42 +271,35 @@ namespace coro
             };
 
             // signalfd 的一次 io_uring 读 (结构同 pipe/fs 的读)
-            struct sfd_read_awaiter
-            {
+            struct sfd_read_awaiter {
                 int fd;
-                void *buf;
+                void* buf;
                 size_t len;
                 detail::uring_op op;
 
                 bool await_ready() const noexcept { return false; }
 
-                static void cancel_op(void *self)
-                {
-                    auto *aw = static_cast<sfd_read_awaiter *>(self);
-                    if (auto *u = EventLoop::get().uring())
-                    {
-                        io_uring_sqe *sqe = io_uring_get_sqe(u->handle());
-                        if (sqe)
-                        {
+                static void cancel_op(void* self) {
+                    auto* aw = static_cast<sfd_read_awaiter*>(self);
+                    if (auto* u = EventLoop::get().uring()) {
+                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
+                        if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
                             io_uring_submit(u->handle());
                         }
                     }
                 }
 
-                void await_suspend(std::coroutine_handle<> h)
-                {
+                void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto *u = EventLoop::get().uring();
-                    if (!u)
-                    {
+                    auto* u = EventLoop::get().uring();
+                    if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
-                    io_uring_sqe *sqe = io_uring_get_sqe(u->handle());
-                    if (!sqe)
-                    {
+                    io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
+                    if (!sqe) {
                         op.result = -ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
@@ -346,35 +312,28 @@ namespace coro
             };
 
             // 读者协程状态: 自持有 (rstate 由帧和 manager 共享)
-            struct reader_state
-            {
+            struct reader_state {
                 int sfd = -1;
                 Task<> self; // 读者协程自身 (停止时 cancel)
             };
 
             // 读者循环: 持续读 signalfd, 每条 signalfd_siginfo 分发一个等待者。
             // 无等待者时被 cancel → CancelledError → 收尾退出 (不阻止 loop 退出)
-            inline Task<> reader_loop(std::shared_ptr<reader_state> st)
-            {
-                try
-                {
-                    while (true)
-                    {
+            inline Task<> reader_loop(std::shared_ptr<reader_state> st) {
+                try {
+                    while (true) {
                         signalfd_siginfo si;
                         int n = co_await sfd_read_awaiter{st->sfd, &si, sizeof(si), {}};
                         if (n != (int)sizeof(si))
                             break; // fd 关闭或错误: 退出读者
                         manager::get().deliver((int)si.ssi_signo);
                     }
-                }
-                catch (const CancelledError &)
-                {
+                } catch (const CancelledError&) {
                     // 正常停止路径 (最后一个等待者离开时被 cancel)
                 }
             }
 
-            inline void manager::ensure_reader()
-            {
+            inline void manager::ensure_reader() {
                 if (reader_started_)
                     return;
                 reader_started_ = true;
@@ -384,8 +343,7 @@ namespace coro
                 rstate->self.start(); // 常驻: 挂起在 signalfd 读上
             }
 
-            inline void manager::maybe_stop_reader()
-            {
+            inline void manager::maybe_stop_reader() {
                 if (!reader_started_ || has_waiters())
                     return;
                 // 无等待者: 取消读者 (挂起的 uring 读被 ASYNC_CANCEL,
@@ -411,19 +369,16 @@ namespace coro
         //   - 不支持的信号 (不在 {SIGINT, SIGTERM, SIGBREAK, SIGHUP}):
         //     立即抛 std::invalid_argument
         // ==================================================================
-        struct wait_awaiter
-        {
+        struct wait_awaiter {
             int sig;
 
-            bool await_ready() const
-            {
+            bool await_ready() const {
                 if (detail_signal::slot_of(sig) == detail_signal::NSLOT)
                     throw std::invalid_argument("coro::signal::wait: unsupported signal");
                 return false;
             }
 
-            void await_suspend(std::coroutine_handle<> h)
-            {
+            void await_suspend(std::coroutine_handle<> h) {
 #ifdef _WIN32
                 detail_signal::manager::get().add(sig, this, h, &EventLoop::get());
 #else
@@ -431,11 +386,12 @@ namespace coro
 #endif
             }
 
-            int await_resume() { return sig; }
+            int await_resume() {
+                return sig;
+            }
 
             /// 等待者帧被销毁 (cancel 注入路径): 从等待列表摘除自己
-            void on_waiter_destroyed(std::coroutine_handle<>) noexcept
-            {
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
 #ifdef _WIN32
                 detail_signal::manager::get().remove(sig, this);
 #else
@@ -444,7 +400,9 @@ namespace coro
             }
         };
 
-        inline wait_awaiter wait(int sig) { return wait_awaiter{sig}; }
+        inline wait_awaiter wait(int sig) {
+            return wait_awaiter{sig};
+        }
 
         // ==================================================================
         // handle — 持续处理信号 (对标 asyncio add_signal_handler)
@@ -456,28 +414,21 @@ namespace coro
         //   - 常驻设施: 内部循环协程自持有, 生命周期到事件循环结束
         //   - factory 抛出的异常由 detached 任务报告机制兜底
         // ==================================================================
-        namespace detail_signal
-        {
-            struct handle_state
-            {
+        namespace detail_signal {
+            struct handle_state {
                 int sig;
                 std::function<Task<>()> factory;
                 Task<> self; // 常驻循环协程 (由 handler 注册对象持有)
             };
 
-            inline Task<> handle_loop(std::shared_ptr<handle_state> st)
-            {
-                try
-                {
-                    while (true)
-                    {
+            inline Task<> handle_loop(std::shared_ptr<handle_state> st) {
+                try {
+                    while (true) {
                         co_await wait(st->sig);
                         auto t = st->factory();
                         co_await std::move(t); // 串行执行, 避免处理重入
                     }
-                }
-                catch (const CancelledError &)
-                {
+                } catch (const CancelledError&) {
                     // handler 注销 (stop/析构): 常驻循环被取消, 正常收尾
                 }
             }
@@ -485,21 +436,18 @@ namespace coro
 
         /// 持续处理器注册对象 (RAII): 持有期间信号到达就执行 factory;
         /// 析构 (或调用 stop()) 时注销常驻循环, 不再阻止事件循环退出。
-        class handler
-        {
-        public:
+        class handler {
+          public:
             handler() = default;
-            explicit handler(std::shared_ptr<detail_signal::handle_state> st)
-                : st_(std::move(st)) {}
+            explicit handler(std::shared_ptr<detail_signal::handle_state> st) : st_(std::move(st)) {}
 
-            handler(handler &&) noexcept = default;
-            handler &operator=(handler &&) noexcept = default;
-            handler(const handler &) = delete;
-            handler &operator=(const handler &) = delete;
+            handler(handler&&) noexcept = default;
+            handler& operator=(handler&&) noexcept = default;
+            handler(const handler&) = delete;
+            handler& operator=(const handler&) = delete;
 
             /// 手动注销 (幂等)
-            void stop()
-            {
+            void stop() {
                 if (st_ && st_->self.handle() != nullptr)
                     st_->self.cancel(); // 挂起在 wait 上的循环协程被取消收尾
                 st_.reset();
@@ -507,12 +455,11 @@ namespace coro
 
             ~handler() { stop(); }
 
-        private:
+          private:
             std::shared_ptr<detail_signal::handle_state> st_;
         };
 
-        inline handler handle(int sig, std::function<Task<>()> factory)
-        {
+        inline handler handle(int sig, std::function<Task<>()> factory) {
             auto st = std::make_shared<detail_signal::handle_state>();
             st->sig = sig;
             st->factory = std::move(factory);

@@ -64,25 +64,22 @@
 //   - ready_queue_: 由 queue_mutex_ 保护 (跨线程调度)
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
     class EventLoop;
 
-    namespace detail
-    {
+    namespace detail {
         // 当前正在执行的协程句柄 (事件循环 resume 前后设置/清除)。
         // thread_local: 每个线程独立; 对标 asyncio.current_task()。
         inline thread_local std::coroutine_handle<> t_current_task;
 
         // 当前线程绑定的 EventLoop (每线程一个, 对标 asyncio 的
         // "一个线程一个事件循环"模型)。
-        inline thread_local EventLoop *t_current_loop = nullptr;
-    }
+        inline thread_local EventLoop* t_current_loop = nullptr;
+    } // namespace detail
 
-    class EventLoop
-    {
-    public:
+    class EventLoop {
+      public:
         // ---- 访问: 当前线程的事件循环 (不存在则惰性创建) ----
         //
         // 模型对标 Python asyncio: 每个线程有自己独立的事件循环,
@@ -93,10 +90,8 @@ namespace coro
         //   - 同一线程内的协程共享一个 loop (单线程语义不变)
         //   - 不同线程各自 run() 时互不干扰 (并行)
         //   - 跨线程唤醒 (Future.set_value) 由 owner_loop 精确路由
-        static EventLoop &get()
-        {
-            if (!detail::t_current_loop)
-            {
+        static EventLoop& get() {
+            if (!detail::t_current_loop) {
                 // 函数内 thread_local static: 首次访问时构造 (本线程的实例)
                 static thread_local EventLoop instance;
                 detail::t_current_loop = &instance;
@@ -105,10 +100,7 @@ namespace coro
         }
 
         /// 显式绑定当前线程到指定 loop (run() 内部自动调用; 进阶用法)
-        static void bind(EventLoop *loop) noexcept
-        {
-            detail::t_current_loop = loop;
-        }
+        static void bind(EventLoop* loop) noexcept { detail::t_current_loop = loop; }
 
         // ---- 核心 API ----
 
@@ -126,8 +118,7 @@ namespace coro
 
         /// 请求停止（当前迭代完成后退出, 线程安全）
         /// 事件循环正在等待时调用, 会立即唤醒它退出
-        void stop()
-        {
+        void stop() {
             running_ = false;
             wake();
         }
@@ -137,33 +128,35 @@ namespace coro
         void wake() { event_source_->wake(); }
 
         /// 替换等待原语 (做网络库时用平台实现替换默认 CVEventSource)
-        void set_event_source(std::shared_ptr<EventSource> src)
-        {
+        void set_event_source(std::shared_ptr<EventSource> src) {
             event_source_ = std::move(src);
             install_event_source();
         }
 
         /// 获取当前等待原语 (网络层需要它关联 socket 到 IOCP)
-        EventSource *event_source_ptr() const { return event_source_.get(); }
+        EventSource* event_source_ptr() const { return event_source_.get(); }
 
 #ifdef _WIN32
         /// 当前 loop 的 IOCP 事件源 (构造时缓存, 类型化)。
         /// IO 层 (net/fs/pipe/process) 每次操作都用它 —— 替代旧的
         /// dynamic_cast(event_source_ptr()) 每操作一次 RTTI 行走。
         /// 用户安装了非 IOCP 事件源时为 nullptr (调用方需判空)。
-        net::IocpEventSource *iocp() const noexcept { return iocp_source_; }
+        net::IocpEventSource* iocp() const noexcept {
+            return iocp_source_;
+        }
 #endif
 #ifdef __linux__
         /// 当前 loop 的 io_uring 事件源 (构造时缓存, 类型化), 语义同 iocp()
-        net::UringEventSource *uring() const noexcept { return uring_source_; }
+        net::UringEventSource* uring() const noexcept {
+            return uring_source_;
+        }
 #endif
 
         /// 跨线程投递一个普通函数到本事件循环执行 (Scheduler 分发用)。
         /// 在事件循环线程以非协程方式执行 —— 供"在正确线程创建协程帧"的场景:
         /// 无栈协程的帧在调用工厂函数的线程分配, 完成时也在该线程销毁,
         /// 跨线程创建/销毁帧会触发 Debug CRT 堆断言。
-        void dispatch(std::function<void()> fn)
-        {
+        void dispatch(std::function<void()> fn) {
             {
                 std::lock_guard lock(queue_mutex_);
                 fn_queue_.push(std::move(fn));
@@ -187,8 +180,7 @@ namespace coro
         ///       不做线程安全保护。
         /// token: 可选的共享取消标志, 协程被 cancel 后由 await_resume 置 true,
         ///        到期的僵尸条目将被 process_timers 跳过。
-        void schedule_timer(std::coroutine_handle<> h,
-                            std::chrono::steady_clock::time_point deadline,
+        void schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
                             std::shared_ptr<std::atomic<bool>> token = nullptr);
 
         // ---- 活跃协程计数与任务注册表 (由 Task 的启动/完成路径维护) ----
@@ -201,8 +193,7 @@ namespace coro
         // 记录所有已启动且尚未完成的协程帧地址。
         // 性能: 注册表在热路径上每协程生命周期多花 2 次锁 + 2 次 hash
         // 操作, 默认编译关闭; 需要调试/监控时定义 CORO_TASK_REGISTRY。
-        void on_coroutine_started(std::coroutine_handle<> h)
-        {
+        void on_coroutine_started(std::coroutine_handle<> h) {
             ++active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             std::lock_guard lock(queue_mutex_);
@@ -211,8 +202,7 @@ namespace coro
             (void)h;
 #endif
         }
-        void on_coroutine_finished(std::coroutine_handle<> h)
-        {
+        void on_coroutine_finished(std::coroutine_handle<> h) {
             --active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             std::lock_guard lock(queue_mutex_);
@@ -221,15 +211,18 @@ namespace coro
             (void)h;
 #endif
         }
-        bool has_active_coroutines() const { return active_coroutines_ > 0; }
+        bool has_active_coroutines() const {
+            return active_coroutines_ > 0;
+        }
 
         /// 活跃任务数 (已启动且未完成)
-        size_t active_task_count() const { return active_coroutines_.load(); }
+        size_t active_task_count() const {
+            return active_coroutines_.load();
+        }
 
         /// 活跃任务帧地址快照 (对标 asyncio.all_tasks, 供调试)。
         /// 仅在编译时定义了 CORO_TASK_REGISTRY 时有内容, 否则为空。
-        std::vector<void *> all_tasks() const
-        {
+        std::vector<void*> all_tasks() const {
 #ifdef CORO_TASK_REGISTRY
             std::lock_guard lock(queue_mutex_);
             return {all_tasks_.begin(), all_tasks_.end()};
@@ -239,15 +232,13 @@ namespace coro
         }
 
         /// 当前正在执行 (刚被 resume) 的协程句柄; 非协程上下文为空
-        static std::coroutine_handle<> current_task()
-        {
+        static std::coroutine_handle<> current_task() {
             return detail::t_current_task;
         }
 
-    private:
+      private:
         // 构造时: 按平台选择默认事件源 (像 Python 一样零配置)
-        EventLoop()
-        {
+        EventLoop() {
 #ifdef _WIN32
             // Windows: 默认 IOCP (等价 Python ProactorEventLoop)
             event_source_ = std::make_shared<net::IocpEventSource>();
@@ -262,18 +253,17 @@ namespace coro
         }
 
         // 安装/重装事件源: 注册完成回调 + 缓存类型化指针
-        void install_event_source()
-        {
+        void install_event_source() {
             // 完成回调: I/O 完成包 → 协程交还给「拥有本事件源的 loop」。
             // 替代旧的全局 detail::scheduler() 函数指针 —— 那个会被每个
             // 线程构造 loop 时覆写, 多线程同时构造是数据竞争。
-            event_source_->set_completion_handler(this, [](void *ctx, std::coroutine_handle<> h)
-                                                  { static_cast<EventLoop *>(ctx)->schedule(h); });
+            event_source_->set_completion_handler(
+                this, [](void* ctx, std::coroutine_handle<> h) { static_cast<EventLoop*>(ctx)->schedule(h); });
             // 类型化缓存 (每 loop 一次 dynamic_cast, 取代 IO 层每操作一次)
 #ifdef _WIN32
-            iocp_source_ = dynamic_cast<net::IocpEventSource *>(event_source_.get());
+            iocp_source_ = dynamic_cast<net::IocpEventSource*>(event_source_.get());
 #elif defined(__linux__)
-            uring_source_ = dynamic_cast<net::UringEventSource *>(event_source_.get());
+            uring_source_ = dynamic_cast<net::UringEventSource*>(event_source_.get());
 #endif
         }
 
@@ -290,14 +280,12 @@ namespace coro
         //     2. sleep_awaiter 析构 (协程帧销毁路径, 含取消注入的异常展开;
         //        此时 await_resume 根本不会执行, 必须靠析构置位)
         //   process_timers 跳过已标记条目。
-        struct TimerEntry
-        {
+        struct TimerEntry {
             std::chrono::steady_clock::time_point deadline;
             std::coroutine_handle<> handle;
             std::shared_ptr<std::atomic<bool>> token; // 已取消/已消费标记 (堆上共享)
 
-            bool operator<(const TimerEntry &other) const
-            {
+            bool operator<(const TimerEntry& other) const {
                 return deadline > other.deadline; // min-heap: 早的优先
             }
         };
@@ -309,25 +297,21 @@ namespace coro
         // 一次堆分配; vector 摊销为每上百次 push 一次, 且配合「成员 batch
         // + swap」后, 容量在 batch 与 ready_queue_ 之间往复保留,
         // 稳态零分配。
-        struct HandleQueue
-        {
+        struct HandleQueue {
             std::vector<std::coroutine_handle<>> items;
             size_t head = 0;
 
             void push(std::coroutine_handle<> h) { items.push_back(h); }
             bool empty() const { return head >= items.size(); }
             std::coroutine_handle<> front() const { return items[head]; }
-            void pop()
-            {
+            void pop() {
                 ++head;
-                if (head == items.size())
-                {
+                if (head == items.size()) {
                     items.clear(); // 整队列耗尽: 一次回收 (保留容量)
                     head = 0;
                 }
             }
-            void swap(HandleQueue &other) noexcept
-            {
+            void swap(HandleQueue& other) noexcept {
                 items.swap(other.items);
                 std::swap(head, other.head);
             }
@@ -335,9 +319,9 @@ namespace coro
 
         // ---- 成员变量 ----
 
-        HandleQueue ready_queue_;                        // 就绪协程 FIFO
-        HandleQueue batch_;                              // 本轮批量消费缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_;                 // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
+        HandleQueue ready_queue_;        // 就绪协程 FIFO
+        HandleQueue batch_;              // 本轮批量消费缓冲 (容量跨迭代复用)
+        mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 
         // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
         // 为什么需要: 同一句柄可能被多个来源同时调度, 例如
@@ -345,7 +329,7 @@ namespace coro
         //   2) 同一时刻 W 被 cancel → suspended_ 仍为 true → cancel 也调度 W
         // 若双入队, W 第一次 resume 后帧销毁, 第二次 pop 到它时 done() 是 UB。
         // schedule 时查重, 出队 (批量 swap) 时移除。
-        std::unordered_set<const void *> scheduled_set_;
+        std::unordered_set<const void*> scheduled_set_;
 
         // 跨线程投递的普通函数队列 (dispatch 用), queue_mutex_ 保护
         std::queue<std::function<void()>> fn_queue_;
@@ -363,7 +347,7 @@ namespace coro
         // 活跃任务帧地址注册表 (all_tasks 快照用), queue_mutex_ 保护。
         // 默认编译关闭 (见 on_coroutine_started), 避免热路径锁开销。
 #ifdef CORO_TASK_REGISTRY
-        std::unordered_set<void *> all_tasks_;
+        std::unordered_set<void*> all_tasks_;
 #endif
 
         // 事件循环线程标记: 用于区分"同线程调度"和"跨线程调度"。
@@ -385,10 +369,10 @@ namespace coro
 
 #ifdef _WIN32
         // IOCP 事件源类型化缓存 (install_event_source 维护; 零开销访问)
-        net::IocpEventSource *iocp_source_ = nullptr;
+        net::IocpEventSource* iocp_source_ = nullptr;
 #endif
 #ifdef __linux__
-        net::UringEventSource *uring_source_ = nullptr;
+        net::UringEventSource* uring_source_ = nullptr;
 #endif
 
         // 将到期的定时器从堆中移入就绪队列 (仅事件循环线程)。
@@ -413,17 +397,14 @@ namespace coro
     /// 时投递唤醒包。循环醒着时这里只是一次原子读, 零系统调用 ——
     /// 消灭旧实现「每个跨线程 schedule 一个 PostQueuedCompletionStatus,
     /// 循环忙碌时积压成假唤醒风暴」的问题。
-    inline void EventLoop::cross_thread_wake_if_asleep()
-    {
+    inline void EventLoop::cross_thread_wake_if_asleep() {
         static thread_local const std::thread::id this_thread_id = std::this_thread::get_id();
         if (this_thread_id != loop_thread_id_ && running_ && !awake_.exchange(true))
             event_source_->wake();
     }
 
-    inline void EventLoop::schedule(std::coroutine_handle<> h)
-    {
-        if (h)
-        {
+    inline void EventLoop::schedule(std::coroutine_handle<> h) {
+        if (h) {
             {
                 std::lock_guard lock(queue_mutex_);
                 // 幂等: 已在队列中的句柄不再重复入队 (防 double-resume → UB)
@@ -438,27 +419,21 @@ namespace coro
         }
     }
 
-    inline void EventLoop::schedule_timer(std::coroutine_handle<> h,
-                                          std::chrono::steady_clock::time_point deadline,
-                                          std::shared_ptr<std::atomic<bool>> token)
-    {
-        if (h)
-        {
+    inline void EventLoop::schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
+                                          std::shared_ptr<std::atomic<bool>> token) {
+        if (h) {
             timer_heap_.push({deadline, h, std::move(token)});
         }
     }
 
-    inline std::chrono::steady_clock::time_point EventLoop::process_timers()
-    {
+    inline std::chrono::steady_clock::time_point EventLoop::process_timers() {
         // 第一步: 惰性清理僵尸条目。
         //   协程帧销毁时 sleep_awaiter 析构会置位 token, 但条目仍留在堆里;
         //   若不及时清理, 事件循环会被这些"已失效的 deadline"拖着空等到期
         //   (has_work 认为还有定时器), 表现为 cancel 后程序迟迟不退出。
-        while (!timer_heap_.empty())
-        {
-            auto &top = timer_heap_.top();
-            if (top.token && *top.token)
-            {
+        while (!timer_heap_.empty()) {
+            auto& top = timer_heap_.top();
+            if (top.token && *top.token) {
                 timer_heap_.pop(); // 已失效: 无论是否到期都丢弃
                 continue;
             }
@@ -474,15 +449,13 @@ namespace coro
         // 否则跨线程 schedule(h) 和定时器到期可能将同一句柄双入队 → double-resume UB
         {
             std::vector<std::coroutine_handle<>> expired;
-            while (!timer_heap_.empty() && timer_heap_.top().deadline <= now)
-            {
+            while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
                 auto entry = timer_heap_.top();
                 timer_heap_.pop();
                 if (entry.handle && !entry.handle.done()) // 跳过已完成/已取消的协程
                     expired.push_back(entry.handle);
             }
-            if (!expired.empty())
-            {
+            if (!expired.empty()) {
                 std::lock_guard lock(queue_mutex_);
                 for (auto eh : expired)
                     if (scheduled_set_.insert(eh.address()).second)
@@ -493,29 +466,24 @@ namespace coro
         return now;
     }
 
-    inline bool EventLoop::has_work()
-    {
+    inline bool EventLoop::has_work() {
         // ready_queue_ 需要加锁 (其他线程可能正在 schedule)
         // timer_heap_ 仅事件循环线程访问, 直接读
         // 挂起的 I/O 操作也是"工作": 有它们事件循环就不能退出
         // 活跃协程 > 0 也是"工作": 它们可能挂起在等待跨线程唤醒 (Future 等)
         std::lock_guard lock(queue_mutex_);
-        return !ready_queue_.empty() || !timer_heap_.empty() ||
-               event_source_->has_pending() || active_coroutines_ > 0;
+        return !ready_queue_.empty() || !timer_heap_.empty() || event_source_->has_pending() || active_coroutines_ > 0;
     }
 
-    inline void EventLoop::run()
-    {
+    inline void EventLoop::run() {
         run_impl(false);
     }
 
-    inline void EventLoop::run_until_stopped()
-    {
+    inline void EventLoop::run_until_stopped() {
         run_impl(true);
     }
 
-    inline void EventLoop::run_impl(bool stay)
-    {
+    inline void EventLoop::run_impl(bool stay) {
         if (running_)
             return; // 禁止嵌套 run()
         running_ = true;
@@ -523,8 +491,7 @@ namespace coro
         bind(this);                                   // 当前线程绑定本 loop:
         loop_thread_id_ = std::this_thread::get_id(); // 事件源回调等内部路径路由正确
 
-        while (running_)
-        {
+        while (running_) {
             // 非驻留模式: 无任何工作时退出 (驻留模式忽略此条件, 等 stop())
             if (!stay && !has_work())
                 break;
@@ -532,21 +499,19 @@ namespace coro
             // 第 0 步: 执行跨线程投递的普通函数 (dispatch)
             // 它们可能创建新协程 → 之后再处理定时器/就绪队列。
             // 原子标志空判跳锁: 空队列时零加锁。
-            if (has_pending_fn_.load(std::memory_order_acquire))
-            {
+            if (has_pending_fn_.load(std::memory_order_acquire)) {
                 // 先复位再排空: 复位之后的新 dispatch 会重新置位 → 下轮处理,
                 // 不会漏 (反之「排空后复位」会覆盖并发置位 → 漏任务)
                 has_pending_fn_.store(false, std::memory_order_release);
                 std::vector<std::function<void()>> fns;
                 {
                     std::lock_guard lock(queue_mutex_);
-                    while (!fn_queue_.empty())
-                    {
+                    while (!fn_queue_.empty()) {
                         fns.push_back(std::move(fn_queue_.front()));
                         fn_queue_.pop();
                     }
                 }
-                for (auto &f : fns)
+                for (auto& f : fns)
                     f();
             }
 
@@ -573,15 +538,11 @@ namespace coro
                     std::lock_guard lock(queue_mutex_);
                     empty = ready_queue_.empty() && fn_queue_.empty();
                 }
-                if (!empty)
-                {
+                if (!empty) {
                     awake_.store(true, std::memory_order_seq_cst);
-                }
-                else if (!timer_heap_.empty())
-                {
+                } else if (!timer_heap_.empty()) {
                     auto next = timer_heap_.top().deadline;
-                    if (next > now)
-                    {
+                    if (next > now) {
                         // 向上取整: 剩余 <1ms 时等待 1ms 而非 0ms。
                         // IOCP/io_uring 的超时都是毫秒粒度, 截断为 0 会让
                         // wait_for 立即返回 → 循环忙转烧满一个核。
@@ -590,9 +551,7 @@ namespace coro
                     }
                     // next <= now: 定时器已到期, 不等待直接进入下一轮
                     awake_.store(true, std::memory_order_seq_cst);
-                }
-                else if (stay || event_source_->has_pending() || has_active_coroutines())
-                {
+                } else if (stay || event_source_->has_pending() || has_active_coroutines()) {
                     // 有挂起的 I/O 操作 (如 IOCP accept/read) 或活跃协程
                     // (可能挂起在等待跨线程唤醒, 如 Future 的 set_value):
                     // 无限等待, I/O 完成/跨线程唤醒时事件源会唤醒我们
@@ -600,9 +559,7 @@ namespace coro
                     // 驻留模式 (stay) 下即使无事也无限等待, 直到 stop()
                     event_source_->wait_for(std::chrono::milliseconds::max());
                     awake_.store(true, std::memory_order_seq_cst);
-                }
-                else
-                {
+                } else {
                     // 队列、堆、I/O 都无事可做, 退出
                     awake_.store(true, std::memory_order_seq_cst);
                     break;
@@ -624,8 +581,7 @@ namespace coro
                 // batch 消费期间 (resume 之前) 句柄仍算"已调度",
                 // 防止 batch 内前面的协程 cancel 后面的协程时重复入队。
             }
-            while (!batch_.empty())
-            {
+            while (!batch_.empty()) {
                 auto h = batch_.front();
                 batch_.pop();
                 {
@@ -635,8 +591,7 @@ namespace coro
                     std::lock_guard lock(queue_mutex_);
                     scheduled_set_.erase(h.address());
                 }
-                if (h && !h.done())
-                {                               // 跳过已完成的协程 (防止 double-resume)
+                if (h && !h.done()) {           // 跳过已完成的协程 (防止 double-resume)
                     detail::t_current_task = h; // 设置当前任务 (对标 current_task)
                     h.resume();
                     detail::t_current_task = nullptr;

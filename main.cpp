@@ -28,10 +28,9 @@
 using namespace coro;
 using namespace std::chrono_literals;
 
-static const char *kFilePath = "coro_demo_output.txt";
+static const char* kFilePath = "coro_demo_output.txt";
 
-coro::Task<> writer(coro::Event &done)
-{
+coro::Task<> writer(coro::Event& done) {
     std::cout << "[writer] 准备写入文件..." << std::endl;
     co_await coro::sleep(500ms);
 
@@ -48,22 +47,19 @@ coro::Task<> writer(coro::Event &done)
     done.set();
 }
 
-coro::Task<> reader(coro::Event &done)
-{
+coro::Task<> reader(coro::Event& done) {
     std::cout << "[reader] 等待 writer 完成..." << std::endl;
     co_await done.wait();
 
     std::cout << "[reader] 收到事件, 开始读取文件..." << std::endl;
     std::string content = co_await coro::fs::read_all(kFilePath);
-    std::cout << "[reader] 文件内容:\n---\n"
-              << content << "---" << std::endl;
+    std::cout << "[reader] 文件内容:\n---\n" << content << "---" << std::endl;
 
     auto st = coro::fs::stat(kFilePath);
     std::cout << "[reader] 文件大小: " << st.size << " 字节" << std::endl;
 }
 
-coro::Task<> main_task()
-{
+coro::Task<> main_task() {
     std::cout << "=== 协程 Event + 文件 IO 示例 ===" << std::endl;
 
     coro::Event file_done;
@@ -77,8 +73,7 @@ coro::Task<> main_task()
     std::cout << "=== 全部完成 ===" << std::endl;
 }
 
-int main()
-{
+int main() {
     coro::run(main_task());
     return 0;
 }

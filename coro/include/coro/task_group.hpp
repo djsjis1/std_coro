@@ -40,19 +40,16 @@
 //   - 一个 TaskGroup 只能 wait() 一次 (之后组进入终态)。
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
     class TaskGroup;
 
-    namespace detail
-    {
+    namespace detail {
 
         // ==================================================================
         // task_group_state — TaskGroup 与所有 monitor 协程的共享状态
         // ==================================================================
-        struct task_group_state
-        {
+        struct task_group_state {
             std::atomic<size_t> remaining{0};                  // 未完成子任务数
             std::coroutine_handle<> waiter;                    // wait() 的调用协程
             std::vector<std::exception_ptr> exceptions;        // 子任务失败集合 (事件循环线程)
@@ -61,32 +58,24 @@ namespace coro
         };
 
         template <typename T>
-        Task<void> task_group_monitor(std::shared_ptr<Task<void>> self,
-                                      std::shared_ptr<Task<T>> task_ptr,
+        Task<void> task_group_monitor(std::shared_ptr<Task<void>> self, std::shared_ptr<Task<T>> task_ptr,
                                       std::shared_ptr<task_group_state> state);
 
         // ==================================================================
         // task_group_wait_awaiter — co_await group.wait() 的 awaiter
         // ==================================================================
-        struct task_group_wait_awaiter
-        {
+        struct task_group_wait_awaiter {
             std::shared_ptr<task_group_state> st;
 
-            bool await_ready() const noexcept
-            {
+            bool await_ready() const noexcept {
                 return st->remaining == 0; // 全部完成 (含空组): 不挂起
             }
 
-            void await_suspend(std::coroutine_handle<> h)
-            {
-                st->waiter = h;
-            }
+            void await_suspend(std::coroutine_handle<> h) { st->waiter = h; }
 
-            void await_resume()
-            {
+            void await_resume() {
                 // 有失败 → 抛聚合异常 (单个异常也打包, 与 Python 一致)
-                if (!st->exceptions.empty())
-                {
+                if (!st->exceptions.empty()) {
                     throw ExceptionGroup(std::move(st->exceptions));
                 }
             }
@@ -94,32 +83,26 @@ namespace coro
 
     } // namespace detail
 
-    class TaskGroup
-    {
-    public:
+    class TaskGroup {
+      public:
         TaskGroup() = default;
 
         /// 析构兜底: 取消所有未完成的子任务 (用户忘记 wait() 时防孤儿)
-        ~TaskGroup()
-        {
-            if (state_->remaining > 0)
-            {
-                for (auto &m : state_->monitors)
-                {
+        ~TaskGroup() {
+            if (state_->remaining > 0) {
+                for (auto& m : state_->monitors) {
                     if (m && !m->is_ready())
                         m->cancel();
                 }
             }
         }
 
-        TaskGroup(const TaskGroup &) = delete;
-        TaskGroup &operator=(const TaskGroup &) = delete;
+        TaskGroup(const TaskGroup&) = delete;
+        TaskGroup& operator=(const TaskGroup&) = delete;
 
         /// 添加并立即启动一个子任务 (对标 tg.create_task)
         /// 任意 Task<T> / Task<> 均可, 返回类型不要求一致
-        template <typename T>
-        void spawn(Task<T> task)
-        {
+        template <typename T> void spawn(Task<T> task) {
             // 原任务移入 shared_ptr (稳定地址, monitor 与它共享所有权)
             auto task_ptr = std::make_shared<Task<T>>(std::move(task));
             // monitor 协程: 包装原任务, 记录异常 / 响应组取消
@@ -132,27 +115,19 @@ namespace coro
 
         /// 等待所有子任务完成 (对标 async with 块退出)。
         /// 返回可 co_await 的对象; 有失败时在 await_resume 抛 ExceptionGroup。
-        auto wait()
-        {
-            return detail::task_group_wait_awaiter{state_};
-        }
+        auto wait() { return detail::task_group_wait_awaiter{state_}; }
 
         /// 尚未完成的子任务数
-        size_t pending_count() const noexcept
-        {
-            return state_->remaining.load();
-        }
+        size_t pending_count() const noexcept { return state_->remaining.load(); }
 
         /// 组是否已进入终态 (所有子任务结束)
         bool done() const noexcept { return state_->remaining == 0; }
 
-    private:
-        std::shared_ptr<detail::task_group_state> state_ =
-            std::make_shared<detail::task_group_state>();
+      private:
+        std::shared_ptr<detail::task_group_state> state_ = std::make_shared<detail::task_group_state>();
     };
 
-    namespace detail
-    {
+    namespace detail {
 
         // ==================================================================
         // task_group_monitor — 单个子任务的监控协程 (命名函数, 参数进帧)
@@ -164,30 +139,21 @@ namespace coro
         //   3. 自己被组取消          → 把取消转发给原任务, 等它结束
         // ==================================================================
         template <typename T>
-        Task<void> task_group_monitor(std::shared_ptr<Task<void>> self,
-                                      std::shared_ptr<Task<T>> task_ptr,
-                                      std::shared_ptr<task_group_state> state)
-        {
+        Task<void> task_group_monitor(std::shared_ptr<Task<void>> self, std::shared_ptr<Task<T>> task_ptr,
+                                      std::shared_ptr<task_group_state> state) {
             bool forward_cancel = false;
-            try
-            {
+            try {
                 (void)co_await *task_ptr; // 左值: 不移动原任务
-            }
-            catch (const CancelledError &)
-            {
+            } catch (const CancelledError&) {
                 // 组取消到达本 monitor。注意: MSVC 不允许在 catch 块内
                 // co_await, 所以只记标志, 转发逻辑移到块外。
                 forward_cancel = true;
-            }
-            catch (...)
-            {
+            } catch (...) {
                 // 原任务真实失败: 记录 + 触发组取消
                 state->exceptions.push_back(std::current_exception());
-                if (!state->cancel_requested)
-                {
+                if (!state->cancel_requested) {
                     state->cancel_requested = true;
-                    for (auto &m : state->monitors)
-                    {
+                    for (auto& m : state->monitors) {
                         // 注意: 必须跳过自己 (m != self)!
                         // 若取消自己 → 自己完成后帧销毁, 随后被 resume 已销毁帧 → UB
                         if (m && m != self && !m->is_ready())
@@ -196,28 +162,21 @@ namespace coro
                 }
             }
 
-            if (forward_cancel)
-            {
+            if (forward_cancel) {
                 // 把取消转发给原任务, 等它结束 (此时不在 catch 块内)
                 task_ptr->cancel();
-                try
-                {
+                try {
                     co_await *task_ptr;
-                }
-                catch (const CancelledError &)
-                {
+                } catch (const CancelledError&) {
                     // 转发取消成功: 任务以取消结束, 不聚合
-                }
-                catch (...)
-                {
+                } catch (...) {
                     // 任务在取消生效前已自行失败: 它的异常仍然聚合
                     // (对标 Python: 已失败任务的异常不会被取消抹掉)
                     state->exceptions.push_back(std::current_exception());
                 }
             }
 
-            if (--state->remaining == 0)
-            {
+            if (--state->remaining == 0) {
                 // 全部结束: 唤醒 wait() 调用者
                 if (state->waiter)
                     EventLoop::get().schedule(state->waiter);

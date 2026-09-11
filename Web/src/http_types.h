@@ -16,8 +16,7 @@
 // ============================================================================
 
 /// 一条已解析完成的 HTTP 请求
-struct http_request
-{
+struct http_request {
     std::string method;                         // 请求方法, 如 GET / POST
     std::string url;                            // 原始请求目标, 如 /greet?name=coro
     std::string version;                        // 协议版本, 如 "1.1"
@@ -39,15 +38,14 @@ struct http_request
     std::string query() const;
 
     /// 按字段名取头部值, 不存在返回空串(大小写不敏感)
-    const std::string &header(const std::string &name) const;
+    const std::string& header(const std::string& name) const;
 
     /// 按名称取动态路由参数, 不存在返回空串。例: req.param("id")
-    const std::string &param(const std::string &name) const;
+    const std::string& param(const std::string& name) const;
 };
 
 /// 服务器响应(由 handler 构造, web_server 序列化后写出)
-struct http_response
-{
+struct http_response {
     using header_list = std::vector<std::pair<std::string, std::string>>;
 
     int status = 200;    // 状态码
@@ -59,17 +57,17 @@ struct http_response
     static http_response text(std::string body, int status = 200);
     static http_response json(std::string body, int status = 200);
     static http_response html(std::string body, int status = 200);
-    static http_response error(int status, const std::string &message);
+    static http_response error(int status, const std::string& message);
 
     /// 读取本地文件作为响应体(同步 IO; Content-Type 按扩展名推断)
-    static http_response file(const std::string &path);
+    static http_response file(const std::string& path);
 
     /// 添加响应头; replace=true 时替换同名字段
-    void header(const std::string &name, const std::string &value, bool replace = false);
+    void header(const std::string& name, const std::string& value, bool replace = false);
 
     /// 序列化为完整 HTTP 报文(强制 Content-Length, keep-alive 需要响应边界)
     std::string build() const;
 };
 
 /// 按文件扩展名推断 MIME 类型 (如 "a.html" → "text/html; charset=utf-8")
-std::string mime_type(const std::string &path);
+std::string mime_type(const std::string& path);

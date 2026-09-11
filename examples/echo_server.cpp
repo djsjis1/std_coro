@@ -24,11 +24,9 @@
 using namespace std::chrono_literals;
 
 // ---- echo 处理器: 读到的数据原样写回 ----
-coro::Task<> echo_handler(coro::net::TcpStream conn)
-{
+coro::Task<> echo_handler(coro::net::TcpStream conn) {
     char buf[1024];
-    while (true)
-    {
+    while (true) {
         int n = co_await conn.read(buf, sizeof(buf));
         if (n <= 0)
             break; // 对端关闭或出错
@@ -39,32 +37,27 @@ coro::Task<> echo_handler(coro::net::TcpStream conn)
 }
 
 // ---- 内置客户端: connect → 发送 → 验证回显 ----
-coro::Task<> client()
-{
+coro::Task<> client() {
     std::cout << "  [client] connecting to 127.0.0.1:8888..." << std::endl;
     auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8888);
-    if (!conn.valid())
-    {
+    if (!conn.valid()) {
         std::cout << "  [client] connect FAILED (errno=" << errno << ", "
                   << (errno == WSAECONNREFUSED ? "refused" : "other") << ")" << std::endl;
         co_return;
     }
     std::cout << "  [client] connected!" << std::endl;
 
-    const char *msg = "hello from coro client";
+    const char* msg = "hello from coro client";
     int sent = co_await conn.write(msg, strlen(msg));
     std::cout << "  [client] sent " << sent << " bytes" << std::endl;
 
     char buf[1024];
     int n = co_await conn.read(buf, sizeof(buf));
-    if (n > 0)
-    {
+    if (n > 0) {
         std::string echo(buf, (size_t)n);
         std::cout << "  [client] echo received: \"" << echo << "\"" << std::endl;
         std::cout << "  [client] " << (echo == msg ? "MATCH ✓" : "MISMATCH ✗") << std::endl;
-    }
-    else
-    {
+    } else {
         std::cout << "  [client] read returned " << n << " (connection issue)" << std::endl;
     }
     conn.close();
@@ -72,14 +65,12 @@ coro::Task<> client()
 }
 
 // ---- 主协程 ----
-coro::Task<> main_task()
-{
+coro::Task<> main_task() {
     std::cout << "=== IOCP Echo Server Test (zero-config) ===" << std::endl;
 
     // 启动服务器 (零配置: EventLoop 默认就是 IOCP)
     coro::net::TcpListener listener;
-    if (!listener.bind_listen("127.0.0.1", 8888))
-    {
+    if (!listener.bind_listen("127.0.0.1", 8888)) {
         std::cout << "bind_listen FAILED (端口被占用?)" << std::endl;
         co_return;
     }
@@ -87,14 +78,12 @@ coro::Task<> main_task()
 
     // 并发: 客户端连接 + 服务器 accept
     auto client_task = std::make_shared<coro::Task<void>>();
-    *client_task = []() -> coro::Task<void>
-    { co_await client(); }();
+    *client_task = []() -> coro::Task<void> { co_await client(); }();
     client_task->start();
 
     std::cout << "[server] waiting for connection..." << std::endl;
     auto conn = co_await listener.accept();
-    if (!conn.valid())
-    {
+    if (!conn.valid()) {
         std::cout << "[server] accept FAILED" << std::endl;
         co_return;
     }
@@ -109,8 +98,7 @@ coro::Task<> main_task()
     std::cout << "=== Echo test done ===" << std::endl;
 }
 
-int main()
-{
+int main() {
     coro::run(main_task());
     return 0;
 }

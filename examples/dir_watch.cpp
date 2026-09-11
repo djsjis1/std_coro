@@ -13,30 +13,26 @@
 
 using namespace std::chrono_literals;
 
-static const char *type_name(coro::fs::watch_event_type t)
-{
-    switch (t)
-    {
-    case coro::fs::watch_event_type::created:
-        return "created ";
-    case coro::fs::watch_event_type::removed:
-        return "removed ";
-    case coro::fs::watch_event_type::modified:
-        return "modified";
-    case coro::fs::watch_event_type::renamed:
-        return "renamed ";
-    case coro::fs::watch_event_type::overflow:
-        return "OVERFLOW";
+static const char* type_name(coro::fs::watch_event_type t) {
+    switch (t) {
+        case coro::fs::watch_event_type::created:
+            return "created ";
+        case coro::fs::watch_event_type::removed:
+            return "removed ";
+        case coro::fs::watch_event_type::modified:
+            return "modified";
+        case coro::fs::watch_event_type::renamed:
+            return "renamed ";
+        case coro::fs::watch_event_type::overflow:
+            return "OVERFLOW";
     }
     return "?";
 }
 
-coro::Task<> main_task()
-{
+coro::Task<> main_task() {
     std::string dir = ".";
     auto w = co_await coro::fs::watch(dir, /*recursive=*/false);
-    if (!w.valid())
-    {
+    if (!w.valid()) {
         std::printf("watch failed, error=%d\n", coro::io::last_error());
         co_return;
     }
@@ -44,12 +40,10 @@ coro::Task<> main_task()
 
     // 自演示: 后台延迟生成事件 (ReadDirectoryChangesW 只报告挂起之后
     // 的变更, 所以写入必须在 next() 挂起之后发生)
-    struct Demo
-    {
-        static coro::Task<> gen()
-        {
+    struct Demo {
+        static coro::Task<> gen() {
             co_await coro::sleep(100ms);
-            co_await coro::fs::write_all("dir_watch_demo.tmp", "demo");  // 创建+写入
+            co_await coro::fs::write_all("dir_watch_demo.tmp", "demo"); // 创建+写入
             co_await coro::sleep(100ms);
             co_await coro::fs::write_all("dir_watch_demo.tmp", "demo2"); // 修改
         }
@@ -58,20 +52,15 @@ coro::Task<> main_task()
 
     // 监听 (用 wait_for + TimeoutError 做超时)
     int count = 0;
-    while (count < 10)
-    {
+    while (count < 10) {
         coro::fs::watch_event ev;
-        try
-        {
+        try {
             ev = co_await coro::wait_for(w.next(), 5s);
-        }
-        catch (const coro::TimeoutError &)
-        {
+        } catch (const coro::TimeoutError&) {
             break; // 5 秒无事件: 退出
         }
         if (ev.type == coro::fs::watch_event_type::renamed)
-            std::printf("  %-8s %s -> %s\n", type_name(ev.type),
-                        ev.old_path.c_str(), ev.path.c_str());
+            std::printf("  %-8s %s -> %s\n", type_name(ev.type), ev.old_path.c_str(), ev.path.c_str());
         else
             std::printf("  %-8s %s\n", type_name(ev.type), ev.path.c_str());
         count++;
@@ -83,8 +72,7 @@ coro::Task<> main_task()
     std::printf("done (%d events)\n", count);
 }
 
-int main()
-{
+int main() {
     coro::run(main_task());
     return 0;
 }

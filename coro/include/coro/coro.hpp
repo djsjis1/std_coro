@@ -40,8 +40,7 @@
 
 #include <type_traits>
 
-namespace coro
-{
+namespace coro {
 
     // ============================================================================
     // Convenience entry point: start a task and drive the event loop to completion
@@ -50,9 +49,7 @@ namespace coro
     // 对标 asyncio.run(main()): 返回主协程的返回值 (void 任务返回 void)。
     //   int result = coro::run(compute());          // 直接拿到结果
     //   coro::run(background());                    // Task<> 版本
-    template <typename T>
-    T run(Task<T> task)
-    {
+    template <typename T> T run(Task<T> task) {
         task.start();
         EventLoop::get().run();
         if constexpr (std::is_void_v<T>)

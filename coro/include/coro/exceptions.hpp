@@ -23,25 +23,18 @@
 //   - CancelledError (组内取消引起) 不聚合进来
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
-    class ExceptionGroup : public std::runtime_error
-    {
-    public:
+    class ExceptionGroup : public std::runtime_error {
+      public:
         explicit ExceptionGroup(std::vector<std::exception_ptr> exceptions)
             : std::runtime_error(std::to_string(exceptions.size()) + " exception(s) in group"),
-              exceptions_(std::move(exceptions))
-        {
-        }
+              exceptions_(std::move(exceptions)) {}
 
         /// 组内聚合的所有异常 (按发生先后排序)
-        const std::vector<std::exception_ptr> &exceptions() const noexcept
-        {
-            return exceptions_;
-        }
+        const std::vector<std::exception_ptr>& exceptions() const noexcept { return exceptions_; }
 
-    private:
+      private:
         std::vector<std::exception_ptr> exceptions_;
     };
 

@@ -33,46 +33,39 @@
 //   - 默认线程池在进程退出时等待所有任务完成 (析构 join)
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
-    namespace detail
-    {
+    namespace detail {
 
         // ==================================================================
         // ThreadPool — 固定大小的简单工作线程池
         // ==================================================================
         //
         // 仅用于 to_thread 的阻塞任务卸载。任务按提交顺序 FIFO 执行。
-        class ThreadPool
-        {
-        public:
-            explicit ThreadPool(size_t n = std::thread::hardware_concurrency())
-            {
+        class ThreadPool {
+          public:
+            explicit ThreadPool(size_t n = std::thread::hardware_concurrency()) {
                 if (n == 0)
                     n = 1;
                 for (size_t i = 0; i < n; ++i)
-                    workers_.emplace_back([this]
-                                          { worker_loop(); });
+                    workers_.emplace_back([this] { worker_loop(); });
             }
 
-            ~ThreadPool()
-            {
+            ~ThreadPool() {
                 {
                     std::lock_guard lk(mtx_);
                     stopping_ = true;
                 }
                 cv_.notify_all();
-                for (auto &w : workers_)
+                for (auto& w : workers_)
                     w.join(); // 等待所有已提交任务完成
             }
 
-            ThreadPool(const ThreadPool &) = delete;
-            ThreadPool &operator=(const ThreadPool &) = delete;
+            ThreadPool(const ThreadPool&) = delete;
+            ThreadPool& operator=(const ThreadPool&) = delete;
 
             /// 提交一个任务 (线程安全)
-            void submit(std::function<void()> task)
-            {
+            void submit(std::function<void()> task) {
                 {
                     std::lock_guard lk(mtx_);
                     tasks_.push(std::move(task));
@@ -82,16 +75,13 @@ namespace coro
 
             size_t worker_count() const noexcept { return workers_.size(); }
 
-        private:
-            void worker_loop()
-            {
-                while (true)
-                {
+          private:
+            void worker_loop() {
+                while (true) {
                     std::function<void()> task;
                     {
                         std::unique_lock lk(mtx_);
-                        cv_.wait(lk, [this]
-                                 { return stopping_ || !tasks_.empty(); });
+                        cv_.wait(lk, [this] { return stopping_ || !tasks_.empty(); });
                         if (stopping_ && tasks_.empty())
                             return;
                         task = std::move(tasks_.front());
@@ -109,8 +99,7 @@ namespace coro
         };
 
         /// 全局默认线程池 (进程退出时析构, 等待任务完成)
-        inline ThreadPool &default_thread_pool()
-        {
+        inline ThreadPool& default_thread_pool() {
             static ThreadPool pool;
             return pool;
         }
@@ -119,9 +108,7 @@ namespace coro
         // to_thread_impl — 命名协程函数 (参数进帧, MSVC Debug 安全):
         // 挂起等待 Future, 工作线程完成后恢复并转发结果
         // ==================================================================
-        template <typename R>
-        Task<R> to_thread_impl(std::shared_ptr<Promise<R>> promise)
-        {
+        template <typename R> Task<R> to_thread_impl(std::shared_ptr<Promise<R>> promise) {
             co_return co_await promise->get_future();
         }
 
@@ -137,34 +124,24 @@ namespace coro
     //
     // 异常: func 抛出的异常在工作线程被捕获, 在 co_await 处重新抛出。
     // ============================================================================
-    template <typename F>
-    Task<std::invoke_result_t<F>> to_thread(F func)
-    {
+    template <typename F> Task<std::invoke_result_t<F>> to_thread(F func) {
         using R = std::invoke_result_t<F>;
 
         auto promise = std::make_shared<Promise<R>>();
 
         // 工作线程任务 (普通 lambda, 非协程): 执行 func → 完成 Promise
-        detail::default_thread_pool().submit(
-            [promise, f = std::move(func)]() mutable
-            {
-                try
-                {
-                    if constexpr (std::is_void_v<R>)
-                    {
-                        f();
-                        promise->set_value();
-                    }
-                    else
-                    {
-                        promise->set_value(f());
-                    }
+        detail::default_thread_pool().submit([promise, f = std::move(func)]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    f();
+                    promise->set_value();
+                } else {
+                    promise->set_value(f());
                 }
-                catch (...)
-                {
-                    promise->set_exception(std::current_exception());
-                }
-            });
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        });
 
         return detail::to_thread_impl<R>(promise);
     }

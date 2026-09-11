@@ -64,11 +64,9 @@
 //
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
-    namespace detail
-    {
+    namespace detail {
 
         // ==================================================================
         // gather_shared_state — 被所有 monitor 和 gather_awaiter 共享
@@ -85,16 +83,13 @@ namespace coro
         //   因为 std::shared_ptr 的引用计数操作本身要求原子性,
         //   这里保持一致以防未来多线程扩展。
         // ==================================================================
-        template <typename... Ts>
-        struct gather_shared_state
-        {
+        template <typename... Ts> struct gather_shared_state {
             std::tuple<Ts...> results;            // 所有 Task 的结果
             std::atomic<size_t> remaining;        // 剩余未完成的 Task 数量
             std::coroutine_handle<> continuation; // 调用方协程句柄
             std::exception_ptr first_exception;   // 第一个异常 (如果有)
 
-            gather_shared_state(size_t n, std::coroutine_handle<> h)
-                : remaining(n), continuation(h) {}
+            gather_shared_state(size_t n, std::coroutine_handle<> h) : remaining(n), continuation(h) {}
         };
 
         // ==================================================================
@@ -115,41 +110,31 @@ namespace coro
         // 返回值: Task<void> — monitor 本身不产生有意义的值
         // ==================================================================
         template <size_t I, typename... Ts>
-        Task<void> gather_monitor(
-            Task<std::tuple_element_t<I, std::tuple<Ts...>>> task,
-            std::shared_ptr<gather_shared_state<Ts...>> state)
-        {
+        Task<void> gather_monitor(Task<std::tuple_element_t<I, std::tuple<Ts...>>> task,
+                                  std::shared_ptr<gather_shared_state<Ts...>> state) {
 
             // 提取第 I 个位置的类型
             using T = std::tuple_element_t<I, std::tuple<Ts...>>;
 
-            try
-            {
-                if constexpr (!std::is_void_v<T>)
-                {
+            try {
+                if constexpr (!std::is_void_v<T>) {
                     // 非 void 类型: co_await 获取结果, 存入共享状态
                     std::get<I>(state->results) = co_await std::move(task);
-                }
-                else
-                {
+                } else {
                     // void 类型: 只需要等待完成, 不需要存储结果
                     co_await std::move(task);
                 }
-            }
-            catch (...)
-            {
+            } catch (...) {
                 // 只保存第一个异常 (后续异常被忽略)
                 // 这与 Python asyncio.gather 的行为一致
-                if (!state->first_exception)
-                {
+                if (!state->first_exception) {
                     state->first_exception = std::current_exception();
                 }
             }
 
             // 原子减 1; 如果是最后一个, 恢复调用方
             // 使用前缀 -- 确保先减后比较
-            if (--state->remaining == 0)
-            {
+            if (--state->remaining == 0) {
                 EventLoop::get().schedule(state->continuation);
             }
         }
@@ -161,9 +146,7 @@ namespace coro
         // 这个对象存活在调用方协程的栈帧中 (通过 co_await 的暂停机制)。
         // 当调用方被挂起时, 此对象的生命周期与挂起状态绑定。
         // ==================================================================
-        template <typename... Ts>
-        struct gather_awaiter
-        {
+        template <typename... Ts> struct gather_awaiter {
             // ---- 数据成员 ----
 
             // 原始 Task 对象 (所有权转移到这里)
@@ -174,25 +157,21 @@ namespace coro
 
             // 辅助 alias: 将 Task<void> 与 Ts... 参数包绑定,
             // 这样 sizeof...(Ts) 个 Task<void> 可以通过参数包展开生成
-            template <typename>
-            using void_task = Task<void>;
+            template <typename> using void_task = Task<void>;
 
             // monitor 协程 (必须保持存活, 否则协程帧会被销毁)
             // void_task<Ts>... 展开为 Task<void>, Task<void>, ... (共 N 个)
             std::tuple<void_task<Ts>...> monitors_;
 
-            explicit gather_awaiter(std::tuple<Task<Ts>...> tasks)
-                : tasks_(std::move(tasks)) {}
+            explicit gather_awaiter(std::tuple<Task<Ts>...> tasks) : tasks_(std::move(tasks)) {}
 
             // ---- Awaitable 接口 ----
 
             bool await_ready() const noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> h)
-            {
+            void await_suspend(std::coroutine_handle<> h) {
                 // 创建共享状态: 计数器初始化为 Task 数量
-                state_ = std::make_shared<gather_shared_state<Ts...>>(
-                    sizeof...(Ts), h);
+                state_ = std::make_shared<gather_shared_state<Ts...>>(sizeof...(Ts), h);
 
                 // 为每个 Task 创建一个 monitor 协程
                 // make_monitors 使用 index_sequence 展开参数包:
@@ -204,32 +183,26 @@ namespace coro
                 // 并发启动所有 monitor
                 // std::apply 将 tuple 展开为 lambda 的参数包
                 // fold expression (m.start(), ...) 逐个调用 start()
-                std::apply([](auto &...m)
-                           { (m.start(), ...); }, monitors_);
+                std::apply([](auto&... m) { (m.start(), ...); }, monitors_);
             }
 
-            std::tuple<Ts...> await_resume()
-            {
+            std::tuple<Ts...> await_resume() {
                 // 如果有异常, 重新抛出
-                if (state_->first_exception)
-                {
+                if (state_->first_exception) {
                     std::rethrow_exception(state_->first_exception);
                 }
                 // 返回所有结果 (每个 monitor 已经将结果写入了 state_->results)
                 return std::move(state_->results);
             }
 
-        private:
+          private:
             /// 使用 index_sequence 展开参数包, 为每个 Task 调用 gather_monitor
-            template <size_t... Is>
-            auto make_monitors(std::index_sequence<Is...>)
-            {
+            template <size_t... Is> auto make_monitors(std::index_sequence<Is...>) {
                 return std::make_tuple(
                     // 显式传递 Ts... 模板参数, 因为 gather_monitor 的
                     // 第一个参数类型 (Task<tuple_element_t<...>>) 中
                     // Ts... 处于不可推导上下文 (non-deduced context)
-                    gather_monitor<Is, Ts...>(
-                        std::move(std::get<Is>(tasks_)), state_)...);
+                    gather_monitor<Is, Ts...>(std::move(std::get<Is>(tasks_)), state_)...);
             }
         };
 
@@ -253,11 +226,8 @@ namespace coro
     //   - 返回类型 auto → 自动推导为 gather_awaiter<Ts...>
     //   - 支持 Task<void> 混合使用 (结果 tuple 中该位置为 void 标记)
     // ============================================================================
-    template <typename... Ts>
-    auto gather(Task<Ts>... tasks)
-    {
-        return detail::gather_awaiter<Ts...>(
-            std::make_tuple(std::move(tasks)...));
+    template <typename... Ts> auto gather(Task<Ts>... tasks) {
+        return detail::gather_awaiter<Ts...>(std::make_tuple(std::move(tasks)...));
     }
 
 } // namespace coro

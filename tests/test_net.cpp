@@ -8,51 +8,40 @@
 
 using namespace std::chrono_literals;
 
-namespace
-{
+namespace {
 
     // ── 命名协程函数 ──
 
     // wait_for 超时取消挂起中的 IO: read 挂起 (对端不发数据) → 超时取消
     // → 底层 IOCP 读被 CancelIoEx 取消 → 协程收到 CancelledError
-    coro::Task<> read_once(coro::net::TcpStream conn)
-    {
+    coro::Task<> read_once(coro::net::TcpStream conn) {
         char buf[64];
         (void)co_await conn.read(buf, sizeof(buf)); // 对端不发数据 → 挂起
     }
 
-    coro::Task<> server_read_once(coro::net::TcpListener *listener,
-                                  bool *accepted, bool *read_cancelled)
-    {
+    coro::Task<> server_read_once(coro::net::TcpListener* listener, bool* accepted, bool* read_cancelled) {
         auto conn = co_await listener->accept();
         if (!conn.valid())
             co_return;
         *accepted = true;
 
-        try
-        {
+        try {
             co_await coro::wait_for(read_once(std::move(conn)), 50ms);
-        }
-        catch (const coro::TimeoutError &)
-        {
+        } catch (const coro::TimeoutError&) {
             *read_cancelled = true; // 超时: 挂起的 read 已被取消 (CancelIoEx)
         }
     }
 
-    coro::Task<> silent_client(bool *connected)
-    {
+    coro::Task<> silent_client(bool* connected) {
         auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 18925);
-        if (conn.valid())
-        {
+        if (conn.valid()) {
             *connected = true;
             co_await coro::sleep(150ms); // 保持连接但不发数据
             conn.close();
         }
     }
 
-    coro::Task<> io_cancel_scenario(bool *accepted, bool *read_cancelled,
-                                    bool *connected)
-    {
+    coro::Task<> io_cancel_scenario(bool* accepted, bool* read_cancelled, bool* connected) {
         coro::net::TcpListener listener;
         if (!listener.bind_listen("127.0.0.1", 18925))
             co_return;
@@ -63,36 +52,30 @@ namespace
     }
 
     // echo 服务器: 接收一个连接, 把数据原样写回
-    coro::Task<> echo_handler(coro::net::TcpStream conn, int *server_received)
-    {
+    coro::Task<> echo_handler(coro::net::TcpStream conn, int* server_received) {
         char buf[256];
         int n = co_await conn.read(buf, sizeof(buf));
-        if (n > 0)
-        {
+        if (n > 0) {
             *server_received = n;
             co_await conn.write(buf, (size_t)n);
         }
     }
 
-    coro::Task<> server_side(coro::net::TcpListener *listener,
-                             int *server_received, bool *accepted)
-    {
+    coro::Task<> server_side(coro::net::TcpListener* listener, int* server_received, bool* accepted) {
         auto conn = co_await listener->accept();
-        if (conn.valid())
-        {
+        if (conn.valid()) {
             *accepted = true;
             co_await echo_handler(std::move(conn), server_received);
         }
     }
 
-    coro::Task<> client_side(std::string *echo, bool *connected, int *sent_out)
-    {
+    coro::Task<> client_side(std::string* echo, bool* connected, int* sent_out) {
         auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 18923);
         if (!conn.valid())
             co_return;
 
         *connected = true;
-        const char *msg = "hello coro test";
+        const char* msg = "hello coro test";
         int sent = co_await conn.write(msg, strlen(msg));
         *sent_out = sent; // 断言放 TEST 里 (协程内不能用 EXPECT 宏)
 
@@ -103,12 +86,10 @@ namespace
         conn.close();
     }
 
-    coro::Task<> echo_scenario(std::string *echo, int *server_received,
-                               bool *accepted, bool *connected, int *sent_out, bool *bind_ok)
-    {
+    coro::Task<> echo_scenario(std::string* echo, int* server_received, bool* accepted, bool* connected, int* sent_out,
+                               bool* bind_ok) {
         coro::net::TcpListener listener;
-        if (!listener.bind_listen("127.0.0.1", 18923))
-        {
+        if (!listener.bind_listen("127.0.0.1", 18923)) {
             *bind_ok = false;
             co_return;
         }
@@ -122,8 +103,7 @@ namespace
     }
 
     // 服务器读端关闭检测: 客户端关闭后 read 返回 0
-    coro::Task<> close_detection(coro::net::TcpListener *listener, int *read_result)
-    {
+    coro::Task<> close_detection(coro::net::TcpListener* listener, int* read_result) {
         auto conn = co_await listener->accept();
         if (!conn.valid())
             co_return;
@@ -133,21 +113,17 @@ namespace
         *read_result = n;
     }
 
-    coro::Task<> closer_client(bool *connected)
-    {
+    coro::Task<> closer_client(bool* connected) {
         auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 18924);
-        if (conn.valid())
-        {
+        if (conn.valid()) {
             *connected = true;
             conn.close(); // 连接后立即关闭
         }
     }
 
-    coro::Task<> close_scenario(int *read_result, bool *connected, bool *bind_ok)
-    {
+    coro::Task<> close_scenario(int* read_result, bool* connected, bool* bind_ok) {
         coro::net::TcpListener listener;
-        if (!listener.bind_listen("127.0.0.1", 18924))
-        {
+        if (!listener.bind_listen("127.0.0.1", 18924)) {
             *bind_ok = false;
             co_return;
         }
@@ -160,13 +136,12 @@ namespace
 
 } // namespace
 
-TEST(NetTest, TcpEchoRoundTrip)
-{
+TEST(NetTest, TcpEchoRoundTrip) {
     std::string echo;
     int server_received = 0, sent_out = 0;
     bool accepted = false, connected = false, bind_ok = false;
-    test_util::run_task([&]
-                        { return echo_scenario(&echo, &server_received, &accepted, &connected, &sent_out, &bind_ok); });
+    test_util::run_task(
+        [&] { return echo_scenario(&echo, &server_received, &accepted, &connected, &sent_out, &bind_ok); });
     ASSERT_TRUE(bind_ok);
     EXPECT_TRUE(accepted);
     EXPECT_TRUE(connected);
@@ -175,22 +150,18 @@ TEST(NetTest, TcpEchoRoundTrip)
     EXPECT_EQ(echo, "hello coro test");
 }
 
-TEST(NetTest, PeerCloseYieldsZero)
-{
+TEST(NetTest, PeerCloseYieldsZero) {
     int read_result = -1;
     bool connected = false, bind_ok = false;
-    test_util::run_task([&]
-                        { return close_scenario(&read_result, &connected, &bind_ok); });
+    test_util::run_task([&] { return close_scenario(&read_result, &connected, &bind_ok); });
     ASSERT_TRUE(bind_ok);
     EXPECT_TRUE(connected);
     EXPECT_EQ(read_result, 0); // read 返回 0 = 对端关闭
 }
 
-TEST(NetTest, WaitForTimeoutCancelsPendingIo)
-{
+TEST(NetTest, WaitForTimeoutCancelsPendingIo) {
     bool accepted = false, read_cancelled = false, connected = false;
-    test_util::run_task([&]
-                        { return io_cancel_scenario(&accepted, &read_cancelled, &connected); });
+    test_util::run_task([&] { return io_cancel_scenario(&accepted, &read_cancelled, &connected); });
     EXPECT_TRUE(accepted);
     EXPECT_TRUE(connected);
     EXPECT_TRUE(read_cancelled); // 挂起中的读被超时取消 (CancelIoEx 联动), 无泄漏无挂死

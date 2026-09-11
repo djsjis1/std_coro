@@ -10,39 +10,35 @@
 #include <iostream>
 #include <thread>
 
-coro::Task<> shutdown_task(web_server *s)
-{
+coro::Task<> shutdown_task(web_server* s) {
     std::cout << "[check] shutdown signal received\n";
     s->stop();
     co_return;
 }
 
-int main()
-{
+int main() {
     web_server server;
     if (!server.listen("127.0.0.1", 18080))
         return 1;
 
     std::atomic<bool> exited{false};
     // 1.5s 后模拟 Ctrl+C
-    std::thread t([&]
-                  {
-                      std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                      std::raise(SIGINT);
-                  });
+    std::thread t([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        std::raise(SIGINT);
+    });
 
-    coro::run([](web_server &s, std::atomic<bool> &ok) -> coro::Task<>
-              {
+    coro::run([](web_server& s, std::atomic<bool>& ok) -> coro::Task<> {
         auto srv = coro::spawn(s.serve());
         auto h1 = coro::signal::handle(SIGINT, [&s] { return shutdown_task(&s); });
         auto h2 = coro::signal::handle(SIGBREAK, [&s] { return shutdown_task(&s); });
         co_await std::move(srv);
         s.wait_all();
-        ok = true; }(server, exited));
+        ok = true;
+    }(server, exited));
 
     t.join();
-    if (!exited)
-    {
+    if (!exited) {
         std::cout << "[check] FAILED: server did not exit\n";
         return 1;
     }

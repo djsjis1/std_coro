@@ -9,14 +9,11 @@
 
 using namespace std::chrono_literals;
 
-namespace
-{
+namespace {
 
     // ── Lock: 互斥 (计数累加) ──
-    coro::Task<> lock_worker(coro::Lock *lock, int *counter, int rounds)
-    {
-        for (int i = 0; i < rounds; ++i)
-        {
+    coro::Task<> lock_worker(coro::Lock* lock, int* counter, int rounds) {
+        for (int i = 0; i < rounds; ++i) {
             co_await lock->acquire();
             int cur = *counter;
             co_await coro::yield(); // 临界区内让出, 若锁失效则计数被破坏
@@ -25,8 +22,7 @@ namespace
         }
     }
 
-    coro::Task<> lock_scenario(int *final_count)
-    {
+    coro::Task<> lock_scenario(int* final_count) {
         coro::Lock lock;
         int counter = 0;
         auto a = coro::spawn(lock_worker(&lock, &counter, 50));
@@ -39,8 +35,7 @@ namespace
     }
 
     // ── Semaphore: 并发上限 ──
-    coro::Task<> sem_worker(coro::Semaphore *sem, int *cur, int *max_seen)
-    {
+    coro::Task<> sem_worker(coro::Semaphore* sem, int* cur, int* max_seen) {
         co_await sem->acquire();
         ++*cur;
         if (*cur > *max_seen)
@@ -50,8 +45,7 @@ namespace
         sem->release();
     }
 
-    coro::Task<> sem_scenario(int *max_seen)
-    {
+    coro::Task<> sem_scenario(int* max_seen) {
         coro::Semaphore sem(2);
         int cur = 0;
         *max_seen = 0;
@@ -66,14 +60,12 @@ namespace
     }
 
     // ── Event: 等待者被唤醒 ──
-    coro::Task<> event_waiter(coro::Event *ev, int *woken)
-    {
+    coro::Task<> event_waiter(coro::Event* ev, int* woken) {
         co_await ev->wait();
         *woken = 1;
     }
 
-    coro::Task<> event_scenario(int *woken)
-    {
+    coro::Task<> event_scenario(int* woken) {
         coro::Event ev;
         auto w = coro::spawn(event_waiter(&ev, woken));
         co_await coro::yield(); // 等待者挂到 ev 上
@@ -82,20 +74,17 @@ namespace
     }
 
     // ── Queue: 生产者-消费者往返 ──
-    coro::Task<> queue_producer(coro::Queue<int> *q, int n)
-    {
+    coro::Task<> queue_producer(coro::Queue<int>* q, int n) {
         for (int i = 0; i < n; ++i)
             co_await q->put(i);
     }
 
-    coro::Task<> queue_consumer(coro::Queue<int> *q, int n, int *sum)
-    {
+    coro::Task<> queue_consumer(coro::Queue<int>* q, int n, int* sum) {
         for (int i = 0; i < n; ++i)
             *sum += co_await q->get();
     }
 
-    coro::Task<> queue_scenario(int *sum, int *size_after)
-    {
+    coro::Task<> queue_scenario(int* sum, int* size_after) {
         coro::Queue<int> q;
         auto p = coro::spawn(queue_producer(&q, 100));
         auto c = coro::spawn(queue_consumer(&q, 100, sum));
@@ -105,8 +94,7 @@ namespace
     }
 
     // ── Queue 有界: put 满则挂起, get 腾出空间 ──
-    coro::Task<> bounded_scenario(int *put_rounds, int *final_sum)
-    {
+    coro::Task<> bounded_scenario(int* put_rounds, int* final_sum) {
         coro::Queue<int> q(2); // 容量 2
         auto producer = coro::spawn(queue_producer(&q, 10));
         // 消费者: 逐个取出
@@ -119,10 +107,8 @@ namespace
     }
 
     // ── Lock RAII 守卫: 离开作用域自动 release (含异常路径) ──
-    coro::Task<> guard_worker(coro::Lock *lock, int *counter, int rounds)
-    {
-        for (int i = 0; i < rounds; ++i)
-        {
+    coro::Task<> guard_worker(coro::Lock* lock, int* counter, int rounds) {
+        for (int i = 0; i < rounds; ++i) {
             {
                 auto g = co_await lock->guard(); // RAII: 离开块自动 release
                 int cur = *counter;
@@ -132,8 +118,7 @@ namespace
         }
     }
 
-    coro::Task<> guard_scenario(int *final_count)
-    {
+    coro::Task<> guard_scenario(int* final_count) {
         coro::Lock lock;
         int counter = 0;
         auto w1 = coro::spawn(guard_worker(&lock, &counter, 50));
@@ -144,17 +129,13 @@ namespace
     }
 
     // 守卫的异常安全: 临界区抛异常, 锁仍被释放
-    coro::Task<> guard_exception(bool *released)
-    {
+    coro::Task<> guard_exception(bool* released) {
         coro::Lock lock;
-        try
-        {
+        try {
             auto g = co_await lock.guard();
             throw std::runtime_error("x");
             co_return;
-        }
-        catch (...)
-        {
+        } catch (...) {
         }
         // 异常路径后锁应已释放: 再次获取应立即成功
         auto g2 = co_await lock.guard();
@@ -162,8 +143,7 @@ namespace
     }
 
     // ── Semaphore RAII 守卫 ──
-    coro::Task<> sem_guard_worker(coro::Semaphore *sem, int *cur, int *max_seen)
-    {
+    coro::Task<> sem_guard_worker(coro::Semaphore* sem, int* cur, int* max_seen) {
         {
             auto g = co_await sem->guard();
             ++*cur;
@@ -174,8 +154,7 @@ namespace
         } // 析构自动 release
     }
 
-    coro::Task<> sem_guard_scenario(int *max_seen)
-    {
+    coro::Task<> sem_guard_scenario(int* max_seen) {
         coro::Semaphore sem(2);
         int cur = 0;
         *max_seen = 0;
@@ -188,8 +167,7 @@ namespace
     }
 
     // ── Queue 非阻塞接口 ──
-    coro::Task<> nowait_scenario(int *empty_gets, int *rejected_puts)
-    {
+    coro::Task<> nowait_scenario(int* empty_gets, int* rejected_puts) {
         coro::Queue<int> q(2);
 
         // get_nowait: 空 → nullopt
@@ -211,79 +189,61 @@ namespace
 
 } // namespace
 
-TEST(SyncTest, LockMutualExclusion)
-{
+TEST(SyncTest, LockMutualExclusion) {
     int final_count = 0;
-    test_util::run_task([&]
-                        { return lock_scenario(&final_count); });
+    test_util::run_task([&] { return lock_scenario(&final_count); });
     EXPECT_EQ(final_count, 150); // 3 协程 × 50 轮, 无丢失
 }
 
-TEST(SyncTest, SemaphoreLimitsConcurrency)
-{
+TEST(SyncTest, SemaphoreLimitsConcurrency) {
     int max_seen = 0;
-    test_util::run_task([&]
-                        { return sem_scenario(&max_seen); });
+    test_util::run_task([&] { return sem_scenario(&max_seen); });
     EXPECT_LE(max_seen, 2); // 信号量上限
     EXPECT_GE(max_seen, 1);
 }
 
-TEST(SyncTest, EventWakesWaiter)
-{
+TEST(SyncTest, EventWakesWaiter) {
     int woken = 0;
-    test_util::run_task([&]
-                        { return event_scenario(&woken); });
+    test_util::run_task([&] { return event_scenario(&woken); });
     EXPECT_EQ(woken, 1);
 }
 
-TEST(SyncTest, QueueRoundTrip)
-{
+TEST(SyncTest, QueueRoundTrip) {
     int sum = 0, size_after = -1;
-    test_util::run_task([&]
-                        { return queue_scenario(&sum, &size_after); });
+    test_util::run_task([&] { return queue_scenario(&sum, &size_after); });
     EXPECT_EQ(sum, 4950); // 0+1+...+99
     EXPECT_EQ(size_after, 0);
 }
 
-TEST(SyncTest, BoundedQueueBackpressure)
-{
+TEST(SyncTest, BoundedQueueBackpressure) {
     int put_rounds = 0, final_sum = 0;
-    test_util::run_task([&]
-                        { return bounded_scenario(&put_rounds, &final_sum); });
+    test_util::run_task([&] { return bounded_scenario(&put_rounds, &final_sum); });
     EXPECT_EQ(put_rounds, 10);
     EXPECT_EQ(final_sum, 45); // 0+1+...+9
 }
 
-TEST(SyncTest, LockGuardRAII)
-{
+TEST(SyncTest, LockGuardRAII) {
     int final_count = 0;
-    test_util::run_task([&]
-                        { return guard_scenario(&final_count); });
+    test_util::run_task([&] { return guard_scenario(&final_count); });
     EXPECT_EQ(final_count, 100); // 2 协程 × 50 轮, 无丢失
 }
 
-TEST(SyncTest, LockGuardExceptionSafety)
-{
+TEST(SyncTest, LockGuardExceptionSafety) {
     bool released = false;
-    test_util::run_task([&]
-                        { return guard_exception(&released); });
+    test_util::run_task([&] { return guard_exception(&released); });
     EXPECT_TRUE(released); // 异常路径后锁已释放
 }
 
-TEST(SyncTest, SemaphoreGuardRAII)
-{
+TEST(SyncTest, SemaphoreGuardRAII) {
     int max_seen = 0;
-    test_util::run_task([&]
-                        { return sem_guard_scenario(&max_seen); });
+    test_util::run_task([&] { return sem_guard_scenario(&max_seen); });
     EXPECT_LE(max_seen, 2);
     EXPECT_GE(max_seen, 1);
 }
 
-TEST(SyncTest, QueueNowait)
-{
+TEST(SyncTest, QueueNowait) {
     int empty_gets = 0, rejected_puts = 0;
-    test_util::run_task([&]
-                        { return nowait_scenario(&empty_gets, &rejected_puts); });
+    test_util::run_task([&] { return nowait_scenario(&empty_gets, &rejected_puts); });
     EXPECT_EQ(empty_gets, 1);
     EXPECT_EQ(rejected_puts, 1);
 }

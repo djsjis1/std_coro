@@ -22,23 +22,17 @@
 //    可能不被正确复制进协程帧, 见 README/14 讲)
 // ============================================================================
 
-namespace coro
-{
+namespace coro {
 
-    namespace detail
-    {
+    namespace detail {
 
         // ==================================================================
         // call_soon 的执行协程: 命名函数, 参数进帧 (规避 MSVC Debug 问题)
         // ==================================================================
-        template <typename F>
-        Task<void> call_soon_impl(F func)
-        {
-            if constexpr (std::is_invocable_v<F>)
-            {
+        template <typename F> Task<void> call_soon_impl(F func) {
+            if constexpr (std::is_invocable_v<F>) {
                 using result_t = std::invoke_result_t<F>;
-                if constexpr (std::is_same_v<result_t, Task<void>>)
-                {
+                if constexpr (std::is_same_v<result_t, Task<void>>) {
                     // 协程回调: 等待它完成
                     co_await func();
                     co_return;
@@ -52,16 +46,11 @@ namespace coro
         // ==================================================================
         // call_later / call_at 的执行协程: 命名函数, 参数进帧
         // ==================================================================
-        template <typename F>
-        Task<void> call_at_impl(std::chrono::steady_clock::time_point deadline,
-                                F func)
-        {
+        template <typename F> Task<void> call_at_impl(std::chrono::steady_clock::time_point deadline, F func) {
             co_await sleep_awaiter{deadline};
-            if constexpr (std::is_invocable_v<F>)
-            {
+            if constexpr (std::is_invocable_v<F>) {
                 using result_t = std::invoke_result_t<F>;
-                if constexpr (std::is_same_v<result_t, Task<void>>)
-                {
+                if constexpr (std::is_same_v<result_t, Task<void>>) {
                     // 协程回调: 等待它完成
                     co_await func();
                     co_return;
@@ -78,11 +67,8 @@ namespace coro
     // call_soon — 将回调/协程立即加入就绪队列
     // ============================================================================
 
-    template <typename F>
-    void call_soon(F &&func)
-    {
-        if constexpr (std::is_invocable_v<F>)
-        {
+    template <typename F> void call_soon(F&& func) {
+        if constexpr (std::is_invocable_v<F>) {
             // 命名协程函数 + detach 自持有: 协程帧自持有运行到完成
             Task<void> t = detail::call_soon_impl(std::forward<F>(func));
             t.start();
@@ -95,11 +81,9 @@ namespace coro
     // ============================================================================
 
     template <typename Rep, typename Period, typename F>
-    void call_later(std::chrono::duration<Rep, Period> delay, F &&func)
-    {
+    void call_later(std::chrono::duration<Rep, Period> delay, F&& func) {
         // 命名协程函数 + detach 自持有 (同 call_soon)
-        Task<void> t = detail::call_at_impl(
-            std::chrono::steady_clock::now() + delay, std::forward<F>(func));
+        Task<void> t = detail::call_at_impl(std::chrono::steady_clock::now() + delay, std::forward<F>(func));
         t.start();
         t.detach();
     }
@@ -108,9 +92,7 @@ namespace coro
     // call_at — 在指定时间点调度
     // ============================================================================
 
-    template <typename F>
-    void call_at(std::chrono::steady_clock::time_point deadline, F &&func)
-    {
+    template <typename F> void call_at(std::chrono::steady_clock::time_point deadline, F&& func) {
         // 命名协程函数 + detach 自持有 (同 call_soon)
         Task<void> t = detail::call_at_impl(deadline, std::forward<F>(func));
         t.start();

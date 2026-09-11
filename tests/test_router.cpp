@@ -13,16 +13,14 @@
 #include <string>
 #include <string_view>
 
-namespace
-{
+namespace {
     using router_int = radix_router<int>;
     using params = router_int::params_view;
-}
+} // namespace
 
 // ── 静态路由 ──
 
-TEST(Router, StaticExactMatch)
-{
+TEST(Router, StaticExactMatch) {
     router_int r;
     ASSERT_TRUE(r.insert("/", 1));
     ASSERT_TRUE(r.insert("/hello", 2));
@@ -34,8 +32,7 @@ TEST(Router, StaticExactMatch)
     EXPECT_EQ(*r.lookup("/api/v1/users"), 3);
 }
 
-TEST(Router, StaticNoPartialMatch)
-{
+TEST(Router, StaticNoPartialMatch) {
     router_int r;
     r.insert("/api/v1/users", 1);
     // 前缀不是完整路由 → 不命中 (静态路由必须逐段完整相等)
@@ -47,13 +44,12 @@ TEST(Router, StaticNoPartialMatch)
 
 // ── 参数路由: :param 捕获 ──
 
-TEST(Router, ParamCapture)
-{
+TEST(Router, ParamCapture) {
     router_int r;
     ASSERT_TRUE(r.insert("/user/:id", 10));
 
     params p;
-    auto *v = r.lookup("/user/42", &p);
+    auto* v = r.lookup("/user/42", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, 10);
     ASSERT_EQ(p.size(), 1u);
@@ -61,8 +57,7 @@ TEST(Router, ParamCapture)
     EXPECT_EQ(p[0].second, "42");
 }
 
-TEST(Router, ParamRequiresSegment)
-{
+TEST(Router, ParamRequiresSegment) {
     router_int r;
     r.insert("/user/:id", 10);
     // /user 后面没有段, :id 无东西可捕获 → 不命中
@@ -71,13 +66,12 @@ TEST(Router, ParamRequiresSegment)
     EXPECT_EQ(r.lookup("/user/"), nullptr);
 }
 
-TEST(Router, MultiParam)
-{
+TEST(Router, MultiParam) {
     router_int r;
     ASSERT_TRUE(r.insert("/user/:uid/post/:pid", 20));
 
     params p;
-    auto *v = r.lookup("/user/7/post/99", &p);
+    auto* v = r.lookup("/user/7/post/99", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, 20);
     ASSERT_EQ(p.size(), 2u);
@@ -89,13 +83,12 @@ TEST(Router, MultiParam)
 
 // ── 通配路由: *wildcard 吞掉剩余路径 ──
 
-TEST(Router, WildcardCaptureRest)
-{
+TEST(Router, WildcardCaptureRest) {
     router_int r;
     ASSERT_TRUE(r.insert("/files/*path", 30));
 
     params p;
-    auto *v = r.lookup("/files/a/b/c.txt", &p);
+    auto* v = r.lookup("/files/a/b/c.txt", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, 30);
     ASSERT_EQ(p.size(), 1u);
@@ -103,8 +96,7 @@ TEST(Router, WildcardCaptureRest)
     EXPECT_EQ(p[0].second, "a/b/c.txt");
 }
 
-TEST(Router, WildcardOnlyLast)
-{
+TEST(Router, WildcardOnlyLast) {
     router_int r;
     // 通配符后面还有段 → 非法模式
     EXPECT_FALSE(r.insert("/files/*path/edit", 1));
@@ -112,8 +104,7 @@ TEST(Router, WildcardOnlyLast)
 
 // ── 优先级: 静态 > 参数 > 通配 ──
 
-TEST(Router, PriorityStaticOverParam)
-{
+TEST(Router, PriorityStaticOverParam) {
     router_int r;
     // 故意先注册参数路由, 再注册静态路由, 验证匹配按优先级而非注册顺序
     r.insert("/user/:id", 1);
@@ -123,8 +114,7 @@ TEST(Router, PriorityStaticOverParam)
     EXPECT_EQ(*r.lookup("/user/42"), 1);    // 其他值落到参数
 }
 
-TEST(Router, PriorityParamOverWildcard)
-{
+TEST(Router, PriorityParamOverWildcard) {
     router_int r;
     r.insert("/user/:id", 1);
     r.insert("/user/*rest", 2);
@@ -135,8 +125,7 @@ TEST(Router, PriorityParamOverWildcard)
 
 // ── DFS 回溯: 参数分支深层失败时改试其他分支 ──
 
-TEST(Router, BacktrackingParamToWildcard)
-{
+TEST(Router, BacktrackingParamToWildcard) {
     router_int r;
     r.insert("/files/:lang/readme", 1);
     r.insert("/files/*any", 2);
@@ -147,7 +136,7 @@ TEST(Router, BacktrackingParamToWildcard)
 
     // /files/go/x/y: :lang 捕获 go 后深层找不到 readme → 回溯到通配
     p.clear();
-    auto *v = r.lookup("/files/go/x/y", &p);
+    auto* v = r.lookup("/files/go/x/y", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, 2);
     ASSERT_EQ(p.size(), 1u);
@@ -155,8 +144,7 @@ TEST(Router, BacktrackingParamToWildcard)
     EXPECT_EQ(p[0].second, "go/x/y");
 }
 
-TEST(Router, BacktrackingStaticPreferredButParamFallback)
-{
+TEST(Router, BacktrackingStaticPreferredButParamFallback) {
     router_int r;
     r.insert("/a/b/c", 1);
     r.insert("/a/:x/c", 2);
@@ -167,8 +155,7 @@ TEST(Router, BacktrackingStaticPreferredButParamFallback)
 
 // ── 根路径 & 尾斜杠归一 ──
 
-TEST(Router, RootPath)
-{
+TEST(Router, RootPath) {
     router_int r;
     ASSERT_TRUE(r.insert("/", 1));
     ASSERT_NE(r.lookup("/"), nullptr);
@@ -176,8 +163,7 @@ TEST(Router, RootPath)
     EXPECT_EQ(r.lookup(""), nullptr); // 空路径不是合法请求目标
 }
 
-TEST(Router, TrailingSlashNormalization)
-{
+TEST(Router, TrailingSlashNormalization) {
     router_int r;
     // 查找方向: "/user/" 归一到 "/user"
     ASSERT_TRUE(r.insert("/user", 1));
@@ -191,7 +177,7 @@ TEST(Router, TrailingSlashNormalization)
     // 动态路由的尾斜杠同样归一
     ASSERT_TRUE(r.insert("/u/:id", 3));
     params p;
-    auto *v = r.lookup("/u/42/", &p);
+    auto* v = r.lookup("/u/42/", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, 3);
     ASSERT_EQ(p.size(), 1u);
@@ -200,8 +186,7 @@ TEST(Router, TrailingSlashNormalization)
 
 // ── 冲突检测: 同位置参数名/通配名不一致必须拒绝 ──
 
-TEST(Router, ParamNameConflictRejected)
-{
+TEST(Router, ParamNameConflictRejected) {
     router_int r;
     ASSERT_TRUE(r.insert("/user/:id/profile", 1));
     // 同位置的参数名不同 → 拒绝 (否则会静默改写第一条路由的参数名)
@@ -211,13 +196,12 @@ TEST(Router, ParamNameConflictRejected)
     // 同名不冲突 (相当于共享参数节点)
     EXPECT_TRUE(r.insert("/user/:id/settings", 3));
     params p;
-    auto *v = r.lookup("/user/42/profile", &p);
+    auto* v = r.lookup("/user/42/profile", &p);
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(p[0].first, "id"); // 参数名未被污染
 }
 
-TEST(Router, WildcardNameConflictRejected)
-{
+TEST(Router, WildcardNameConflictRejected) {
     router_int r;
     ASSERT_TRUE(r.insert("/files/*a", 1));
     EXPECT_FALSE(r.insert("/files/*b", 2)); // 异名冲突
@@ -226,8 +210,7 @@ TEST(Router, WildcardNameConflictRejected)
     EXPECT_EQ(r.size(), 1u);
 }
 
-TEST(Router, EmptyParamNameRejected)
-{
+TEST(Router, EmptyParamNameRejected) {
     router_int r;
     EXPECT_FALSE(r.insert("/x/:", 1));
     EXPECT_FALSE(r.insert("/x/:/y", 1));
@@ -236,8 +219,7 @@ TEST(Router, EmptyParamNameRejected)
 
 // ── 失败插入无副作用 (两遍扫描: 先校验后建树) ──
 
-TEST(Router, FailedInsertNoSideEffect)
-{
+TEST(Router, FailedInsertNoSideEffect) {
     router_int r;
     EXPECT_FALSE(r.insert("/a/*w/illegal", 1)); // 通配不在末尾
     EXPECT_EQ(r.size(), 0u);
@@ -254,8 +236,7 @@ TEST(Router, FailedInsertNoSideEffect)
 
 // ── params 容器复用: lookup 必须先清空 ──
 
-TEST(Router, ParamsClearedOnReuse)
-{
+TEST(Router, ParamsClearedOnReuse) {
     router_int r;
     r.insert("/a/:x/:y", 1);
     r.insert("/static", 2);
@@ -275,8 +256,7 @@ TEST(Router, ParamsClearedOnReuse)
 
 // ── 模式校验 ──
 
-TEST(Router, RejectInvalidPatterns)
-{
+TEST(Router, RejectInvalidPatterns) {
     router_int r;
     EXPECT_FALSE(r.insert("", 1));            // 空
     EXPECT_FALSE(r.insert("no-slash", 1));    // 无 / 开头
@@ -286,8 +266,7 @@ TEST(Router, RejectInvalidPatterns)
     EXPECT_TRUE(r.insert("/ok", 1));
 }
 
-TEST(Router, RejectMisplacedSpecialChars)
-{
+TEST(Router, RejectMisplacedSpecialChars) {
     // ':'/'*' 只允许出现在段首 (与 httprouter 对齐),
     // 防止 "/user:id" 拼写错误被静默当静态字面量注册
     router_int r;
@@ -297,13 +276,12 @@ TEST(Router, RejectMisplacedSpecialChars)
     EXPECT_EQ(r.size(), 0u);
 }
 
-TEST(Router, ManyParamsOverflowInlineBuffer)
-{
+TEST(Router, ManyParamsOverflowInlineBuffer) {
     // 参数超过内联容量 (8) 时迁移到堆, 行为不变
     router_int r;
     ASSERT_TRUE(r.insert("/a/:p1/:p2/:p3/:p4/:p5/:p6/:p7/:p8/:p9", 1));
     params p;
-    auto *v = r.lookup("/a/1/2/3/4/5/6/7/8/9", &p);
+    auto* v = r.lookup("/a/1/2/3/4/5/6/7/8/9", &p);
     ASSERT_NE(v, nullptr);
     ASSERT_EQ(p.size(), 9u);
     EXPECT_EQ(p[0].first, "p1");
@@ -321,8 +299,7 @@ TEST(Router, ManyParamsOverflowInlineBuffer)
     EXPECT_EQ(p[0].second, "5");
 }
 
-TEST(Router, ReplaceExisting)
-{
+TEST(Router, ReplaceExisting) {
     router_int r;
     r.insert("/x", 1);
     r.insert("/x", 2); // 重复注册 = 替换
@@ -337,16 +314,14 @@ TEST(Router, ReplaceExisting)
 
 // ── 未命中 & 计数 ──
 
-TEST(Router, MissReturnsNull)
-{
+TEST(Router, MissReturnsNull) {
     router_int r;
     r.insert("/a", 1);
     EXPECT_EQ(r.lookup("/b"), nullptr);
     EXPECT_EQ(r.lookup(""), nullptr);
 }
 
-TEST(Router, SizeCounts)
-{
+TEST(Router, SizeCounts) {
     router_int r;
     EXPECT_TRUE(r.empty());
     r.insert("/a", 1);
@@ -360,8 +335,7 @@ TEST(Router, SizeCounts)
 
 // ── string_view 生命周期: 捕获视图指向传入的 path ──
 
-TEST(Router, ParamViewPointsIntoPath)
-{
+TEST(Router, ParamViewPointsIntoPath) {
     router_int r;
     r.insert("/u/:id", 1);
     std::string path = "/u/abc123";
@@ -375,23 +349,19 @@ TEST(Router, ParamViewPointsIntoPath)
 
 // ── 基准: 千级路由下的匹配开销 (只报告数据, 不做易碎断言) ──
 
-TEST(Router, BenchmarkManyRoutes)
-{
+TEST(Router, BenchmarkManyRoutes) {
     router_int r;
     // 1000 条静态路由 (一级路径 200 + 深层路径 800) + 100 条动态路由
     char buf[64];
-    for (int i = 0; i < 200; ++i)
-    {
+    for (int i = 0; i < 200; ++i) {
         std::snprintf(buf, sizeof(buf), "/top%d", i);
         r.insert(buf, i);
     }
-    for (int i = 0; i < 800; ++i)
-    {
+    for (int i = 0; i < 800; ++i) {
         std::snprintf(buf, sizeof(buf), "/api/v%d/res%d/item", i / 40, i);
         r.insert(buf, i);
     }
-    for (int i = 0; i < 100; ++i)
-    {
+    for (int i = 0; i < 100; ++i) {
         std::snprintf(buf, sizeof(buf), "/dyn%d/:id/sub", i);
         r.insert(buf, 10000 + i);
     }
@@ -400,8 +370,7 @@ TEST(Router, BenchmarkManyRoutes)
     // 待查路径: 静态命中 / 动态命中 / 未命中 三类混合
     std::vector<std::string> paths;
     paths.reserve(300);
-    for (int i = 0; i < 100; ++i)
-    {
+    for (int i = 0; i < 100; ++i) {
         std::snprintf(buf, sizeof(buf), "/top%d", i);
         paths.emplace_back(buf);
         std::snprintf(buf, sizeof(buf), "/api/v%d/res%d/item", i / 40, i);
@@ -415,7 +384,7 @@ TEST(Router, BenchmarkManyRoutes)
     size_t hits = 0;
     auto t0 = std::chrono::steady_clock::now();
     for (int rep = 0; rep < rounds; ++rep)
-        for (const auto &path : paths)
+        for (const auto& path : paths)
             if (r.lookup(path, &p))
                 ++hits;
     auto t1 = std::chrono::steady_clock::now();
@@ -423,20 +392,16 @@ TEST(Router, BenchmarkManyRoutes)
     long long total = (long long)rounds * paths.size();
     double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     EXPECT_EQ(hits, (size_t)total); // 全部命中 (含动态)
-    std::printf("[bench] %lld lookups over %d routes: %.1f ns/lookup\n",
-                total, (int)r.size(), ns / total);
+    std::printf("[bench] %lld lookups over %d routes: %.1f ns/lookup\n", total, (int)r.size(), ns / total);
 }
 
 // ── 分档基准: 验证路由规模增长时的查找开销趋势 ──
 
-TEST(Router, BenchmarkScaleTiers)
-{
+TEST(Router, BenchmarkScaleTiers) {
     char buf[64];
-    for (int tier : {100, 1000, 10000})
-    {
+    for (int tier : {100, 1000, 10000}) {
         router_int r;
-        for (int i = 0; i < tier; ++i)
-        {
+        for (int i = 0; i < tier; ++i) {
             std::snprintf(buf, sizeof(buf), "/api/v%d/res%d/item", i / 50, i);
             ASSERT_TRUE(r.insert(buf, i));
         }
@@ -444,8 +409,7 @@ TEST(Router, BenchmarkScaleTiers)
         // 均匀采样命中路径 (上限 256 条)
         std::vector<std::string> paths;
         const int step = (tier + 255) / 256;
-        for (int i = 0; i < tier; i += step)
-        {
+        for (int i = 0; i < tier; i += step) {
             std::snprintf(buf, sizeof(buf), "/api/v%d/res%d/item", i / 50, i);
             paths.emplace_back(buf);
         }
@@ -455,7 +419,7 @@ TEST(Router, BenchmarkScaleTiers)
         size_t hits = 0;
         auto t0 = std::chrono::steady_clock::now();
         for (int rep = 0; rep < rounds; ++rep)
-            for (const auto &path : paths)
+            for (const auto& path : paths)
                 if (r.lookup(path, &p))
                     ++hits;
         auto t1 = std::chrono::steady_clock::now();
@@ -463,7 +427,6 @@ TEST(Router, BenchmarkScaleTiers)
         long long total = (long long)rounds * paths.size();
         double ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
         EXPECT_EQ(hits, (size_t)total);
-        std::printf("[bench] tier %6d routes: %7.1f ns/lookup (%lld lookups)\n",
-                    tier, ns / total, total);
+        std::printf("[bench] tier %6d routes: %7.1f ns/lookup (%lld lookups)\n", tier, ns / total, total);
     }
 }
