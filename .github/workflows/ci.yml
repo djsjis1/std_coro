@@ -120,7 +120,12 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build all targets
-        run: cmake --build build -j$(nproc)
+        run: |
+          cmake --build build -j$(nproc) 2>&1 | tee build.log || {
+            echo "=== BUILD FAILED ==="
+            grep -E "error:|fatal error:" build.log | head -20
+            exit 1
+          }
 
       - name: Run unit tests
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
