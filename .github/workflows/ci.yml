@@ -70,19 +70,32 @@ jobs:
   # Linux — GCC 13 + Clang 15, Debug + Release
   # ============================================================
   build-linux:
-    name: Linux (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    name: Linux (${{ matrix.label }}, ${{ matrix.build_type }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - compiler: g++-13
+          - label: "GCC 13"
+            compiler: g++-13
             cc: gcc-13
             install: g++-13
-          - compiler: clang++-15
+            build_type: Debug
+          - label: "GCC 13"
+            compiler: g++-13
+            cc: gcc-13
+            install: g++-13
+            build_type: Release
+          - label: "Clang 15"
+            compiler: clang++-15
             cc: clang-15
             install: clang-15
-        build_type: [Debug, Release]
+            build_type: Debug
+          - label: "Clang 15"
+            compiler: clang++-15
+            cc: clang-15
+            install: clang-15
+            build_type: Release
     env:
       CXX: ${{ matrix.compiler }}
       CC: ${{ matrix.cc }}
