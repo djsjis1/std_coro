@@ -302,10 +302,12 @@ namespace coro {
             }
 
             decltype(auto) await_resume() {
-                // I/O 已完成: 清除 pending_io (cancel 不再需要取消底层 I/O)
-                // 注意: 不清除 suspended_ 和 cancel_hook_ —
-                // 它们在下一次 await_suspend 覆盖或帧销毁时清理。
-                // 这确保 cancel() 在协程恢复后仍能有效取消底层 I/O。
+                // 协程已恢复: 必须清除挂起标记 — cancel() 不得把「运行中的」
+                // 协程再次 schedule, 否则队列会残留已销毁帧的僵尸句柄
+                // (final_suspend 不挂起, 帧立即释放 → done()/resume() 是 UB)。
+                // 若协程再次挂起, 下一次 await_suspend 会重新置位。
+                promise->suspended_ = false;
+                // 底层 I/O 已完成: cancel() 不再需要取消它
                 promise->pending_io_ = false;
                 // 取消注入点: 恢复时若已被取消, 抛 CancelledError
                 // (不执行 inner.await_resume, 底层结果直接丢弃 — Python 语义)
