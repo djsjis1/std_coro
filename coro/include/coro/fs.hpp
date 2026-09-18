@@ -358,8 +358,10 @@ namespace coro {
                 coro::detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~read_at_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~read_at_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -418,8 +420,10 @@ namespace coro {
                 coro::detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~write_at_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~write_at_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -474,8 +478,10 @@ namespace coro {
                 coro::detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~fsync_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~fsync_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -548,8 +554,10 @@ namespace coro {
                 coro::detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~open_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~open_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 

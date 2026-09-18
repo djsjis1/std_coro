@@ -305,8 +305,10 @@ namespace coro {
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~read_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~read_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 

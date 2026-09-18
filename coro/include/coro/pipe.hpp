@@ -270,8 +270,10 @@ namespace coro {
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~read_awaiter() { if (uring_) uring_->untrack_op(&op); }
+                ~read_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -325,8 +327,10 @@ namespace coro {
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
-
-                ~write_awaiter() { if (uring_) uring_->untrack_op(&op); } // 帧销毁时标记 op 失效
+                ~write_awaiter() {
+                    if (uring_)
+                        uring_->untrack_op(&op);
+                } // 帧销毁时标记 op 失效
 
                 bool await_ready() const noexcept { return false; }
 
@@ -417,10 +421,12 @@ namespace coro {
             int fd;
             short events; // POLLIN / POLLOUT / POLLRDHUP ... (poll.h 语义)
             detail::uring_op op;
-                net::UringEventSource* uring_ = nullptr;
+            net::UringEventSource* uring_ = nullptr;
 
-
-            ~poll_awaiter() { if (uring_) uring_->untrack_op(&op); }
+            ~poll_awaiter() {
+                if (uring_)
+                    uring_->untrack_op(&op);
+            }
 
             bool await_ready() const noexcept { return false; }
 
@@ -451,8 +457,8 @@ namespace coro {
                 }
                 io_uring_prep_poll_add(sqe, fd, events);
                 detail::uring_submit(u, sqe, &op);
-                    uring_ = u;
-                    u->track_op(&op);
+                uring_ = u;
+                u->track_op(&op);
             }
 
             uint32_t await_resume() { return (uint32_t)op.result; }
