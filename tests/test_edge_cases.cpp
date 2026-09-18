@@ -85,7 +85,8 @@ namespace {
     }
 
     coro::Task<> gather_single(int* result) {
-        *result = co_await coro::gather(single_value());
+        auto [v] = co_await coro::gather(single_value());
+        *result = v;
     }
 
     // ── gather_all 空集 ──
