@@ -46,16 +46,25 @@ namespace coro {
         /// 获取锁。如果锁空闲则立即获取并设 locked_=true,
         /// 否则挂起当前协程排队等待
         bool await_ready() noexcept {
-            if (!locked_) {
-                locked_ = true;
-                return true;
-            }
+            // 总是进入 await_suspend 以便获取协程句柄设置 owner
             return false;
         }
 
-        void await_suspend(std::coroutine_handle<> h) {
-            // locked_ 已经是 true (被当前持有者保持)
+        bool await_suspend(std::coroutine_handle<> h) {
+            // 重入检测: 如果当前协程已持有锁, 增加计数并立即恢复
+            if (owner_ == h.address()) {
+                ++recursion_count_;
+                return false; // 不挂起, 立即恢复
+            }
+            // 如果锁空闲, 获取锁并设置所有者
+            if (!locked_) {
+                locked_ = true;
+                owner_ = h.address();
+                return false; // 不挂起, 立即恢复
+            }
+            // 否则加入等待队列
             waiters_.push_back(h);
+            return true;
         }
 
         bool await_resume() const noexcept { return true; }
@@ -63,9 +72,17 @@ namespace coro {
         /// 释放锁。如果有等待者, 直接将锁移交给队首等待者 (locked_ 保持 true)
         /// 如果没有等待者, 设 locked_=false
         void release() {
+            // 重入: 减少计数, 只有计数到 0 才真正释放
+            if (recursion_count_ > 0) {
+                --recursion_count_;
+                return;
+            }
+            // 清除所有者
+            owner_ = nullptr;
             if (!waiters_.empty()) {
                 auto h = waiters_.front();
                 waiters_.pop_front();
+                owner_ = h.address();
                 EventLoop::get().schedule(h);
                 // locked_ 保持 true, 转移给新的持有者
             } else {
@@ -110,13 +127,24 @@ namespace coro {
             Lock* lock;
 
             bool await_ready() noexcept {
-                if (!lock->locked_) {
-                    lock->locked_ = true;
-                    return true;
-                }
+                // 总是进入 await_suspend 以便获取协程句柄设置 owner
                 return false;
             }
-            void await_suspend(std::coroutine_handle<> h) { lock->waiters_.push_back(h); }
+            bool await_suspend(std::coroutine_handle<> h) {
+                // 重入检测: 如果当前协程已持有锁, 增加计数并立即恢复
+                if (lock->owner_ == h.address()) {
+                    ++lock->recursion_count_;
+                    return false;
+                }
+                // 如果锁空闲, 获取锁并设置所有者
+                if (!lock->locked_) {
+                    lock->locked_ = true;
+                    lock->owner_ = h.address();
+                    return false;
+                }
+                lock->waiters_.push_back(h);
+                return true;
+            }
             Guard await_resume() noexcept { return Guard{lock}; }
         };
 
@@ -126,6 +154,8 @@ namespace coro {
 
       private:
         bool locked_ = false;
+        void* owner_ = nullptr;   // 当前持有锁的协程帧地址
+        int recursion_count_ = 0; // 重入计数
         std::deque<std::coroutine_handle<>> waiters_;
     };
 
