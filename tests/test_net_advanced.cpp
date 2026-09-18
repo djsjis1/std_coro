@@ -52,7 +52,7 @@ namespace {
         conn.close();
     }
 
-    coro::Task<> multi_client_scenario(int n_clients, std::vector<bool>* results, std::atomic<int>* served) {
+    coro::Task<> multi_client_scenario(int n_clients, std::vector<int>* results, std::atomic<int>* served) {
         coro::net::TcpListener listener;
         if (!listener.bind_listen("127.0.0.1", 19001))
             co_return;
@@ -61,8 +61,8 @@ namespace {
 
         std::vector<coro::Task<>> clients;
         for (int i = 0; i < n_clients; ++i) {
-            results->push_back(false);
-            clients.push_back(multi_client_worker(i, &results->back()));
+            results->push_back(0);
+            clients.push_back(multi_client_worker(i, reinterpret_cast<bool*>(&results->back())));
         }
         for (auto& c : clients)
             c.start();
@@ -194,10 +194,11 @@ namespace {
             if (!listener.bind_listen("127.0.0.1", 19010 + (i % 10)))
                 continue;
 
-            auto acceptor = coro::spawn([&listener]() -> coro::Task<> {
+            auto acceptor_task = ([&listener]() -> coro::Task<> {
                 auto conn = co_await listener.accept();
                 // 立即关闭
-            });
+            })();
+            auto acceptor = coro::spawn(std::move(acceptor_task));
 
             co_await coro::sleep(5ms);
             auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 19010 + (i % 10));
@@ -214,13 +215,13 @@ namespace {
 // ── 多客户端并发连接 ──
 TEST(NetAdvancedTest, MultipleConcurrentClients) {
     constexpr int N = 5;
-    std::vector<bool> results;
+    std::vector<int> results;
     std::atomic<int> served{0};
     test_util::run_task([&] { return multi_client_scenario(N, &results, &served); });
 
     ASSERT_EQ(results.size(), (size_t)N);
     int ok_count = 0;
-    for (bool r : results)
+    for (int r : results)
         if (r)
             ++ok_count;
     EXPECT_GE(ok_count, N - 1); // 至少 N-1 个成功

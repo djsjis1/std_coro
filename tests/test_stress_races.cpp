@@ -162,7 +162,7 @@ TEST(StressRaceTest, CancelDuringSleep) {
     // 从另一个线程 cancel
     std::thread canceler([&worker] {
         std::this_thread::sleep_for(10ms);
-        const_cast<std::remove_reference_t<decltype(worker)>*>(&worker)->cancel();
+        worker.cancel();
     });
 
     coro::EventLoop::get().run(); // 驱动到完成
