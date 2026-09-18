@@ -184,7 +184,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build all targets
-        run: cmake --build build --config ${{ matrix.build_type }} -j$env:NUMBER_OF_PROCESSORS
+        run: cmake --build build --config ${{ matrix.build_type }} -j
 
       - name: Run unit tests
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
