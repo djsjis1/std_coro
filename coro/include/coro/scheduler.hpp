@@ -51,13 +51,13 @@ namespace coro {
                 w.thread = std::thread([&w] {
                     // 本线程的 EventLoop (惰性创建)
                     EventLoop& loop = EventLoop::get();
-                    w.loop = &loop; // 公布给主线程 (构造完成后才被读取)
+                    w.loop.store(&loop, std::memory_order_release); // 公布给主线程 (atomic store 消除数据竞争)
                     loop.run_until_stopped();
                 });
             }
             // 等所有 worker 的 loop 就绪 (避免 spawn_any 时 loop 为空)
             for (auto& w : workers_) {
-                while (!w.loop)
+                while (!w.loop.load(std::memory_order_acquire))
                     std::this_thread::yield();
             }
         }
@@ -65,8 +65,9 @@ namespace coro {
         /// 停止并 join 所有 worker (等待正在跑的任务自然结束)
         ~Scheduler() {
             for (auto& w : workers_) {
-                if (w.loop)
-                    w.loop->stop();
+                auto* lp = w.loop.load(std::memory_order_acquire);
+                if (lp)
+                    lp->stop();
             }
             for (auto& w : workers_) {
                 if (w.thread.joinable())
@@ -92,7 +93,7 @@ namespace coro {
             // 还要 index_of 再扫一遍, O(2N) → O(N))
             size_t best = pick_least_loaded_index();
             ++assigned_[best];
-            workers_[best].loop->dispatch([this, factory = std::move(factory)]() mutable {
+            workers_[best].loop.load(std::memory_order_acquire)->dispatch([this, factory = std::move(factory)]() mutable {
                 // 在 worker 线程: 创建帧 → 启动 → 自持有
                 auto t = factory();
                 t.start();
@@ -117,7 +118,8 @@ namespace coro {
                 }
                 bool all_idle = true;
                 for (auto& w : workers_) {
-                    if (w.loop && w.loop->active_task_count() > 0) {
+                    auto* lp = w.loop.load(std::memory_order_acquire);
+                    if (lp && lp->active_task_count() > 0) {
                         all_idle = false;
                         break;
                     }
@@ -132,7 +134,9 @@ namespace coro {
         size_t worker_count() const noexcept { return workers_.size(); }
 
         /// 第 i 个 worker 的 loop (高级用法: 手动调度/查询状态)
-        EventLoop* loop_at(size_t i) const { return i < workers_.size() ? workers_[i].loop : nullptr; }
+        EventLoop* loop_at(size_t i) const {
+            return i < workers_.size() ? workers_[i].loop.load(std::memory_order_acquire) : nullptr;
+        }
 
       private:
         /// 选择「活跃协程最少」的 worker, 返回其索引。
@@ -144,7 +148,7 @@ namespace coro {
             size_t best_i = 0;
             size_t best_active = SIZE_MAX, best_assigned = SIZE_MAX;
             for (size_t i = 0; i < workers_.size(); ++i) {
-                EventLoop* loop = workers_[i].loop;
+                EventLoop* loop = workers_[i].loop.load(std::memory_order_relaxed); // 辅助决策, relaxed 足够
                 if (!loop)
                     continue;
                 size_t a = loop->active_task_count();
@@ -160,7 +164,17 @@ namespace coro {
 
         struct Worker {
             std::thread thread;
-            EventLoop* loop = nullptr;
+            std::atomic<EventLoop*> loop{nullptr}; // atomic: worker 线程写, 主线程读 (消除数据竞争)
+
+            Worker() = default;
+            Worker(Worker&& other) noexcept : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)) {}
+            Worker& operator=(Worker&& other) noexcept {
+                thread = std::move(other.thread);
+                loop.store(other.loop.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                return *this;
+            }
+            Worker(const Worker&) = delete;
+            Worker& operator=(const Worker&) = delete;
         };
         std::vector<Worker> workers_;
         std::unique_ptr<std::atomic<size_t>[]> assigned_; // 每 worker 累计分发数 (均衡辅助)

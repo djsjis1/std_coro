@@ -311,6 +311,7 @@ namespace coro {
 
         HandleQueue ready_queue_;        // 就绪协程 FIFO
         HandleQueue batch_;              // 本轮批量消费缓冲 (容量跨迭代复用)
+        std::vector<std::coroutine_handle<>> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
         mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 
         // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
@@ -437,17 +438,18 @@ namespace coro {
         // 10 万个同时到期的场景就是 10 万次加锁。
         // 注意: 仍经过 scheduled_set_ 去重 (与 schedule() 保持一致),
         // 否则跨线程 schedule(h) 和定时器到期可能将同一句柄双入队 → double-resume UB
+        // 优化: 用成员 timer_expired_buf_ 代替局部 vector, 跨迭代复用容量 (同 batch_ 策略)
+        timer_expired_buf_.clear();
         {
-            std::vector<std::coroutine_handle<>> expired;
             while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
                 auto entry = timer_heap_.top();
                 timer_heap_.pop();
                 if (entry.handle && !entry.handle.done()) // 跳过已完成/已取消的协程
-                    expired.push_back(entry.handle);
+                    timer_expired_buf_.push_back(entry.handle);
             }
-            if (!expired.empty()) {
+            if (!timer_expired_buf_.empty()) {
                 std::lock_guard lock(queue_mutex_);
-                for (auto eh : expired)
+                for (auto eh : timer_expired_buf_)
                     if (scheduled_set_.insert(eh.address()).second)
                         ready_queue_.push(eh);
             }

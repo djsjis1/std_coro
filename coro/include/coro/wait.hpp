@@ -145,6 +145,64 @@ namespace coro {
         co_return std::move(*state->result);
     }
 
+    // ============================================================================
+    // wait_any — N 路竞速 (vector 版本)
+    // ============================================================================
+    //
+    // 用法:
+    //   auto result = co_await coro::wait_any(std::move(tasks));
+    //
+    // 第一个完成 (成功或失败) 的 Task 决定返回值;
+    // 其余 Task 继续在后台运行 (结果丢弃, 与两路版语义一致)。
+    // ============================================================================
+
+    namespace detail {
+        // N 路 wait_any 的 monitor: 指针方式 (与两路版 wait_any_monitor 一致)
+        // task 指向调用方帧内局部 Task: 首行 co_await std::move(*task)
+        // 把 Task 移入本帧, 之后指针不再使用 (调用方帧挂起期间始终存活)。
+        // 注意: 不可按值传递 Task<T> 协程参数 —— GCC 10 帧布局对含
+        //       std::optional<T> 的 move-only 类型有 double-free bug。
+        template <typename T>
+        Task<void> wait_any_n_monitor(Task<T>* task, std::shared_ptr<wait_any_state<T>> state) {
+            try {
+                T val = co_await std::move(*task);
+                if (!state->done) {
+                    state->result = std::move(val);
+                    state->done = true;
+                    if (state->cont)
+                        EventLoop::get().schedule(state->cont);
+                }
+            } catch (...) {
+                if (!state->done) {
+                    state->exc = std::current_exception();
+                    state->done = true;
+                    if (state->cont)
+                        EventLoop::get().schedule(state->cont);
+                }
+            }
+        }
+    } // namespace detail
+
+    template <typename T> Task<T> wait_any(std::vector<Task<T>> tasks) {
+        if (tasks.empty())
+            throw std::invalid_argument("wait_any: empty task list");
+        if (tasks.size() == 1)
+            co_return co_await std::move(tasks[0]);
+
+        auto state = std::make_shared<detail::wait_any_state<T>>();
+        for (size_t i = 0; i < tasks.size(); i++) {
+            Task<void> m = detail::wait_any_n_monitor<T>(&tasks[i], state);
+            m.start();
+            m.detach();
+        }
+
+        co_await suspend_awaiter{[state](std::coroutine_handle<> h) { state->cont = h; }};
+
+        if (state->exc)
+            std::rethrow_exception(state->exc);
+        co_return std::move(*state->result);
+    }
+
     namespace detail {
         template <typename T> struct gather_all_state {
             std::vector<T> results;
@@ -153,11 +211,13 @@ namespace coro {
             std::exception_ptr exc;
         };
 
-        // gather_all 的 monitor 协程: 命名函数 (参数进帧)
+        // gather_all 的 monitor 协程: 指针方式 (同 wait_any_monitor)
+        // task 指向调用方帧内局部 vector 元素, 地址稳定, 调用方挂起期间始终存活。
+        // 注意: 不可按值传递 Task<T> 协程参数 (GCC 10 帧布局 double-free)。
         template <typename T>
-        Task<void> gather_all_monitor(size_t index, Task<T> task, std::shared_ptr<gather_all_state<T>> state) {
+        Task<void> gather_all_monitor(size_t index, Task<T>* task, std::shared_ptr<gather_all_state<T>> state) {
             try {
-                state->results[index] = co_await std::move(task);
+                state->results[index] = co_await std::move(*task);
             } catch (...) {
                 if (!state->exc)
                     state->exc = std::current_exception();
@@ -181,7 +241,7 @@ namespace coro {
         // 每个 monitor 用命名协程函数 (参数进帧, 规避 MSVC Debug lambda 问题);
         // start + detach: monitor 帧自持有运行到完成, 无需堆上 Task 对象
         for (size_t i = 0; i < tasks.size(); i++) {
-            Task<void> mon = detail::gather_all_monitor(i, std::move(tasks[i]), s);
+            Task<void> mon = detail::gather_all_monitor(i, &tasks[i], s);
             mon.start();
             mon.detach();
         }
@@ -213,13 +273,13 @@ namespace coro {
             std::exception_ptr first_exception; // 第一个异常 (全部完成后重新抛出)
         };
 
-        // gather_void 的 monitor 协程: 命名函数 (参数进帧)
+        // gather_void 的 monitor 协程: 指针方式 (同 wait_any_monitor)
         // 注意: inline — 非模板函数定义在头文件中, 多 TU 链接时必须 inline
-        inline Task<void> gather_void_monitor(Task<void> task, std::shared_ptr<gather_void_state> state) {
+        inline Task<void> gather_void_monitor(Task<void>* task, std::shared_ptr<gather_void_state> state) {
             // 无论成败都计数 (防止异常路径死锁);
             // 异常不吞: 记录第一个, 全部完成后由调用方重新抛出
             try {
-                co_await std::move(task);
+                co_await std::move(*task);
             } catch (...) {
                 if (!state->first_exception)
                     state->first_exception = std::current_exception();
@@ -234,7 +294,7 @@ namespace coro {
 
             auto launch = [&]<size_t... Is>(std::index_sequence<Is...>) {
                 (([&] {
-                     Task<void> mon = gather_void_monitor(std::move(std::get<Is>(tasks)), state);
+                     Task<void> mon = gather_void_monitor(&std::get<Is>(tasks), state);
                      mon.start();
                      mon.detach(); // monitor 帧自持有运行到完成
                  }()),
@@ -291,12 +351,14 @@ namespace coro {
             size_t first_done_index = 0;         // FirstCompleted 下首个完成任务的索引
         };
 
-        // monitor 协程: 命名函数 (参数进帧, MSVC Debug 安全)
+        // monitor 协程: 指针方式 (同 wait_any_monitor)
+        // task 指向调用方帧内局部 vector 元素, 地址稳定。
+        // 注意: 不可按值传递 Task<T> 协程参数 (GCC 10 帧布局 double-free)。
         template <typename T>
-        Task<void> wait_tasks_monitor(size_t index, Task<T> task, std::shared_ptr<wait_tasks_state<T>> state) {
+        Task<void> wait_tasks_monitor(size_t index, Task<T>* task, std::shared_ptr<wait_tasks_state<T>> state) {
             bool task_failed = false;
             try {
-                state->results[index] = co_await std::move(task);
+                state->results[index] = co_await std::move(*task);
             } catch (...) {
                 task_failed = true;
                 if (!state->first_exception)
@@ -337,7 +399,7 @@ namespace coro {
             state->mode = mode;
 
             for (size_t i = 0; i < tasks.size(); ++i) {
-                Task<void> mon = wait_tasks_monitor(i, std::move(tasks[i]), state);
+                Task<void> mon = wait_tasks_monitor(i, &tasks[i], state);
                 mon.start();
                 mon.detach(); // monitor 帧自持有运行到完成
             }

@@ -150,6 +150,17 @@ namespace coro {
             bool await_ready() const noexcept { return q->unfinished_tasks_ == 0; }
             void await_suspend(std::coroutine_handle<> h) { q->join_waiters_.push_back(h); }
             void await_resume() const noexcept {}
+
+            /// 等待者协程帧被销毁时, 从 join 等待队列摘除僵尸句柄
+            /// (否则 task_done() 时 schedule 已销毁的帧 → UB)
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                for (auto it = q->join_waiters_.begin(); it != q->join_waiters_.end();) {
+                    if (*it == h)
+                        it = q->join_waiters_.erase(it);
+                    else
+                        ++it;
+                }
+            }
         };
 
         auto join() { return join_awaiter{this}; }

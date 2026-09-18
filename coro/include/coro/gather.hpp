@@ -87,6 +87,7 @@ namespace coro {
             std::tuple<Ts...> results;            // 所有 Task 的结果
             std::atomic<size_t> remaining;        // 剩余未完成的 Task 数量
             std::coroutine_handle<> continuation; // 调用方协程句柄
+            EventLoop* caller_loop = nullptr;     // 调用方所在的 loop (唤醒路由, 跨 Scheduler 场景)
             std::exception_ptr first_exception;   // 第一个异常 (如果有)
 
             gather_shared_state(size_t n, std::coroutine_handle<> h) : remaining(n), continuation(h) {}
@@ -135,7 +136,10 @@ namespace coro {
             // 原子减 1; 如果是最后一个, 恢复调用方
             // 使用前缀 -- 确保先减后比较
             if (--state->remaining == 0) {
-                EventLoop::get().schedule(state->continuation);
+                // 路由回调用方所在的 loop (而非 monitor 所在的 loop):
+                // Scheduler 多 loop 场景下调用方与 monitor 可能在不同线程
+                EventLoop* loop = state->caller_loop ? state->caller_loop : &EventLoop::get();
+                loop->schedule(state->continuation);
             }
         }
 
@@ -172,6 +176,8 @@ namespace coro {
             void await_suspend(std::coroutine_handle<> h) {
                 // 创建共享状态: 计数器初始化为 Task 数量
                 state_ = std::make_shared<gather_shared_state<Ts...>>(sizeof...(Ts), h);
+                // 捕获调用方所在的 loop: monitor 完成时路由回这里 (跨 Scheduler 场景)
+                state_->caller_loop = &EventLoop::get();
 
                 // 为每个 Task 创建一个 monitor 协程
                 // make_monitors 使用 index_sequence 展开参数包:

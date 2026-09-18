@@ -4,7 +4,7 @@
 #
 #  全部并行:
 #    - lint: 格式检查 → 失败时自动格式化并回推
-#    - Linux: GCC 13 + Clang 15 × {Debug, Release}
+#    - Linux: GCC 13 + Clang 18 × {Debug, Release}
 #    - macOS: (暂时禁用, 待 kqueue 事件源实现)
 #    - Windows: MSVC × {Debug, Release}
 #    - Sanitizer: ASan+UBSan (GCC), TSan (Clang)
@@ -67,7 +67,7 @@ jobs:
           git push
 
   # ============================================================
-  # Linux — GCC 13 + Clang 15, Debug + Release
+  # Linux — GCC 13 + Clang 18, Debug + Release
   # ============================================================
   build-linux:
     name: Linux (${{ matrix.label }}, ${{ matrix.build_type }})
@@ -86,15 +86,15 @@ jobs:
             cc: gcc-13
             install: g++-13
             build_type: Release
-          - label: "Clang 15"
-            compiler: clang++-15
-            cc: clang-15
-            install: clang-15
+          - label: "Clang 18"
+            compiler: clang++-18
+            cc: clang-18
+            install: clang-18
             build_type: Debug
-          - label: "Clang 15"
-            compiler: clang++-15
-            cc: clang-15
-            install: clang-15
+          - label: "Clang 18"
+            compiler: clang++-18
+            cc: clang-18
+            install: clang-18
             build_type: Release
     env:
       CXX: ${{ matrix.compiler }}
@@ -210,10 +210,10 @@ jobs:
             flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
             install: g++-13
           - name: "TSan (Clang)"
-            cxx: clang++-15
-            cc: clang-15
+            cxx: clang++-18
+            cc: clang-18
             flags: "-fsanitize=thread -fno-omit-frame-pointer"
-            install: clang-15
+            install: clang-18
     env:
       CXX: ${{ matrix.cxx }}
       CC: ${{ matrix.cc }}
