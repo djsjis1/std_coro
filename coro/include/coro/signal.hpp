@@ -241,17 +241,20 @@ namespace coro {
                     maybe_stop_reader();
                 }
 
-                /// 投递 (读者协程在 loop 线程调用): 唤醒该信号的一个等待者。
+                /// 投递 (读者协程在 loop 线程调用): 唤醒该信号的全部当前等待者
+                /// (广播语义, 与 Windows 端一致)。
                 /// 无等待者余留时停掉读者 (挂起的 signalfd 读被取消,
                 /// 事件循环不会被常驻读者拖住无法退出)。
                 void deliver(int sig) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT || waiters_[slot].empty())
                         return;
-                    waiter_entry w = waiters_[slot].front();
-                    waiters_[slot].erase(waiters_[slot].begin());
-                    if (w.handle)
-                        EventLoop::get().schedule(w.handle);
+                    // 广播: 唤醒全部当前等待者 (与 Windows deliver 语义一致)
+                    for (auto& w : waiters_[slot]) {
+                        if (w.handle)
+                            EventLoop::get().schedule(w.handle);
+                    }
+                    waiters_[slot].clear();
                     maybe_stop_reader();
                 }
 
