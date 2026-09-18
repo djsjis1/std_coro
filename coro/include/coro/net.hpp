@@ -553,6 +553,8 @@ namespace coro {
                 size_t len;
                 detail::uring_op op;
 
+                ~read_awaiter() { op.alive = false; }
+
                 bool await_ready() noexcept { return false; }
 
                 /// 取消挂起的读 (Task::cancel 的取消钩子):
@@ -608,6 +610,8 @@ namespace coro {
                 size_t len;
                 detail::uring_op op;
 
+                ~write_awaiter() { op.alive = false; }
+
                 bool await_ready() noexcept { return false; }
 
                 /// 取消挂起的写 (同 read_awaiter::cancel_op)
@@ -657,6 +661,8 @@ namespace coro {
                 int fd = -1;
                 sockaddr_in addr{};
                 detail::uring_op op;
+
+                ~connect_awaiter() { op.alive = false; }
 
                 bool await_ready() noexcept { return false; }
 
@@ -776,6 +782,8 @@ namespace coro {
             struct accept_awaiter {
                 TcpListener* listener;
                 detail::uring_op op;
+
+                ~accept_awaiter() { op.alive = false; }
 
                 bool await_ready() noexcept { return false; }
 

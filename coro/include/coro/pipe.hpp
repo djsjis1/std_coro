@@ -269,6 +269,8 @@ namespace coro {
                 size_t len;
                 detail::uring_op op;
 
+                ~read_awaiter() { op.alive = false; }
+
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* self) {
@@ -317,6 +319,8 @@ namespace coro {
                 const char* buf;
                 size_t len;
                 detail::uring_op op;
+
+                ~write_awaiter() { op.alive = false; } // 帧销毁时标记 op 失效
 
                 bool await_ready() const noexcept { return false; }
 
@@ -405,6 +409,8 @@ namespace coro {
             int fd;
             short events; // POLLIN / POLLOUT / POLLRDHUP ... (poll.h 语义)
             detail::uring_op op;
+
+            ~poll_awaiter() { op.alive = false; }
 
             bool await_ready() const noexcept { return false; }
 

@@ -357,6 +357,8 @@ namespace coro {
                 uint64_t offset;
                 coro::detail::uring_op op;
 
+                ~read_at_awaiter() { op.alive = false; }
+
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* self) {
@@ -411,6 +413,8 @@ namespace coro {
                 uint64_t offset;
                 coro::detail::uring_op op;
 
+                ~write_at_awaiter() { op.alive = false; }
+
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* self) {
@@ -460,6 +464,8 @@ namespace coro {
             struct fsync_awaiter {
                 File* file;
                 coro::detail::uring_op op;
+
+                ~fsync_awaiter() { op.alive = false; }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -528,6 +534,8 @@ namespace coro {
                 int flags;
                 mode_t mode_bits;
                 coro::detail::uring_op op;
+
+                ~open_awaiter() { op.alive = false; }
 
                 bool await_ready() const noexcept { return false; }
 

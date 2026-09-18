@@ -269,11 +269,10 @@ namespace coro {
                 : inner(std::forward<Awaiter>(a)), promise(p), cancel_flag(flag) {}
 
             ~cancel_check_awaiter() {
-                // 清除取消钩子 (帧销毁后钩子不可再用)
-                if (promise) {
-                    promise->cancel_hook_ = nullptr;
-                    promise->cancel_hook_self_ = nullptr;
-                }
+                // 注意: 不清除 cancel_hook_ / cancel_hook_self_。
+                // 钩子在 await_suspend 时被下一次 I/O 覆盖, 或随帧销毁失效。
+                // 保留钩子使 cancel() 在协程恢复后仍能有效取消底层 I/O
+                // (修复 signal::handle 取消时 io_uring 操作泄漏导致的 use-after-free)。
                 // my_handle 非空说明协程挂起后帧被销毁而 await_resume 未执行
                 // (取消注入的异常路径): 通知 inner 摘除等待队列中的僵尸句柄
                 if (my_handle) {
@@ -297,13 +296,19 @@ namespace coro {
                 if constexpr (has_cancel_op<inner_t>::value) {
                     promise->cancel_hook_ = [](void* self) { inner_t::cancel_op(self); };
                     promise->cancel_hook_self_ = &inner;
+                    promise->pending_io_ = true; // 标记有挂起的底层 I/O 可被取消
                 }
                 inner.await_suspend(h);
             }
 
             decltype(auto) await_resume() {
-                // 协程已恢复: 不再处于挂起状态
+                // 协程已恢复: 必须清除挂起标记 — cancel() 不得把「运行中的」
+                // 协程再次 schedule, 否则队列会残留已销毁帧的僵尸句柄
+                // (final_suspend 不挂起, 帧立即释放 → done()/resume() 是 UB)。
+                // 若协程再次挂起, 下一次 await_suspend 会重新置位。
                 promise->suspended_ = false;
+                // 底层 I/O 已完成: cancel() 不再需要取消它
+                promise->pending_io_ = false;
                 // 取消注入点: 恢复时若已被取消, 抛 CancelledError
                 // (不执行 inner.await_resume, 底层结果直接丢弃 — Python 语义)
                 // 注入后立即清除标志: 取消只注入一次。若协程体 catch 了

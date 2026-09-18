@@ -304,6 +304,8 @@ namespace coro {
                 char buf[4096];
                 detail::uring_op op;
 
+                ~read_awaiter() { op.alive = false; }
+
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* self) {

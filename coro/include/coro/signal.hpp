@@ -285,6 +285,8 @@ namespace coro {
                 size_t len;
                 detail::uring_op op;
 
+                ~sfd_read_awaiter() { op.alive = false; }
+
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* self) {

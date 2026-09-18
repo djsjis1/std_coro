@@ -44,6 +44,7 @@ namespace coro {
             std::coroutine_handle<> continuation{}; // 完成时要恢复的协程
             int result = 0;                         // 完成结果 (字节数, 负值=错误)
             int error = 0;                          // 错误码 (0=成功)
+            bool alive = true;                      // 帧是否存活 (防止延迟 CQE 写已释放内存)
         };
 
 #endif
@@ -85,7 +86,7 @@ namespace coro {
                     return 1;
 
                 // 没有就绪的 CQE, 带超时等待 (定时器到点 / 新 CQE / 被唤醒)
-                struct __kernel_timespec ts {};
+                struct __kernel_timespec ts{};
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 
@@ -118,6 +119,9 @@ namespace coro {
                     return; // 唤醒包, 无事可做
 
                 --pending_ops_; // 挂起计数 -1
+                // 帧已销毁 (Task 析构/取消): 跳过写入, 防止 use-after-free
+                if (!op->alive)
+                    return;
                 op->result = cqe->res;
                 op->error = cqe->res < 0 ? -cqe->res : 0;
                 if (op->continuation)
