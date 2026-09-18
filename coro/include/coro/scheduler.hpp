@@ -64,12 +64,12 @@ namespace coro {
 
         /// 停止并 join 所有 worker (等待正在跑的任务自然结束)
         ~Scheduler() {
+            // 逐个 stop+join: 确保每个 worker 的 EventLoop 完全析构后
+            // 再处理下一个, 防止主线程 stop() 访问正在销毁的 EventLoop
             for (auto& w : workers_) {
                 auto* lp = w.loop.load(std::memory_order_acquire);
                 if (lp)
                     lp->stop();
-            }
-            for (auto& w : workers_) {
                 if (w.thread.joinable())
                     w.thread.join();
             }

@@ -222,7 +222,7 @@ jobs:
       CXXFLAGS: ${{ matrix.flags }}
       CFLAGS: ${{ matrix.flags }}
       ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
-      TSAN_OPTIONS: "abort_on_error=1:suppressions=${{ github.workspace }}/tsan_suppressions.txt"
+      TSAN_OPTIONS: "abort_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:abort_on_error=1"
     steps:
       - uses: actions/checkout@v4

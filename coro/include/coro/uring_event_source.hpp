@@ -4,6 +4,9 @@
 
 #ifdef __linux__
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <poll.h>
+#include <unistd.h>
 #endif
 
 #include <atomic>
@@ -19,8 +22,13 @@
 //
 // 这是 EventLoop 在 Linux 上的默认等待原语 (等价 Python ProactorEventLoop):
 //   - wait_for()  →  io_uring_wait_cqe_timeout: 定时器超时 / I/O 完成 / 外部唤醒
-//   - wake()      →  提交一个 NOP SQE: 产生一个假 CQE 唤醒 (self-pipe 等价物)
+//   - wake()      →  写 eventfd: 产生一个假 CQE 唤醒 (线程安全, 不访问 ring)
 //   - has_pending()→ 还有挂起的 I/O 操作, 事件循环不应退出
+//
+// 线程安全:
+//   - ring 操作都在事件循环线程, 无需加锁
+//   - wake() 使用 eventfd, 不访问 ring, 可从任意线程安全调用
+//   - track_op/untrack_op 使用 tracked_mutex_ 保护 (跨线程访问)
 //
 // 依赖 liburing (io_uring 官方用户态库, github.com/axboe/liburing):
 //   Ubuntu/Debian:  sudo apt install liburing-dev
@@ -59,9 +67,21 @@ namespace coro {
         class UringEventSource : public EventSource {
           public:
             // 完成队列深度 256: 同时挂起的异步操作上限 (可按需调大)
-            UringEventSource() { io_uring_queue_init(256, &ring_, 0); }
+            UringEventSource() {
+                io_uring_queue_init(256, &ring_, 0);
+                // 创建 eventfd 用于跨线程唤醒
+                wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+                if (wake_fd_ >= 0) {
+                    // 提交一个 POLLIN SQE 等待 eventfd 可读
+                    submit_wake_poll();
+                }
+            }
 
-            ~UringEventSource() override { io_uring_queue_exit(&ring_); }
+            ~UringEventSource() override {
+                if (wake_fd_ >= 0)
+                    close(wake_fd_);
+                io_uring_queue_exit(&ring_);
+            }
 
             /// 获取底层 ring (网络层提交 SQE 用)
             io_uring* handle() { return &ring_; }
@@ -88,7 +108,6 @@ namespace coro {
                 // 先非阻塞地消费所有已就绪的 CQE
                 int completed = 0;
                 io_uring_cqe* cqe = nullptr;
-                unsigned head = 0;
                 while (io_uring_peek_batch_cqe(&ring_, &cqe, 1) > 0) {
                     process_cqe(cqe);
                     io_uring_cqe_seen(&ring_, cqe);
@@ -115,21 +134,26 @@ namespace coro {
             }
 
             void wake() override {
-                // 提交一个 NOP 操作: 产生一个假 CQE 唤醒等待者
-                // (等价 IOCP 的 PostQueuedCompletionStatus / Python 的 self-pipe)
-                io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-                if (sqe) {
-                    io_uring_prep_nop(sqe);
-                    io_uring_sqe_set_data(sqe, nullptr); // nullptr = 唤醒标记
-                    io_uring_submit(&ring_);
+                // 写 eventfd 唤醒事件循环 (线程安全, 不访问 ring)
+                if (wake_fd_ >= 0) {
+                    uint64_t val = 1;
+                    [[maybe_unused]] auto r = write(wake_fd_, &val, sizeof(val));
                 }
             }
 
           private:
             void process_cqe(io_uring_cqe* cqe) {
                 auto* op = static_cast<detail::uring_op*>(io_uring_cqe_get_data(cqe));
-                if (!op)
-                    return; // 唤醒包, 无事可做
+                if (!op) {
+                    // 唤醒包 (eventfd POLLIN 完成): 重新提交 POLLIN 等待下次唤醒
+                    if (wake_fd_ >= 0 && cqe->res > 0) {
+                        // 读取 eventfd 清除信号
+                        uint64_t val;
+                        [[maybe_unused]] auto r = read(wake_fd_, &val, sizeof(val));
+                        submit_wake_poll();
+                    }
+                    return;
+                }
 
                 --pending_ops_; // 挂起计数 -1
                 // 帧已销毁 (awaiter 析构 → untrack_op): 跳过写入, 防止 use-after-free
@@ -144,7 +168,18 @@ namespace coro {
                     on_complete(op->continuation); // 交还给事件循环
             }
 
+            // 提交 eventfd POLLIN SQE
+            void submit_wake_poll() {
+                io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (sqe) {
+                    io_uring_prep_poll_add(sqe, wake_fd_, POLLIN);
+                    io_uring_sqe_set_data(sqe, nullptr); // nullptr = 唤醒标记
+                    io_uring_submit(&ring_);
+                }
+            }
+
             io_uring ring_;
+            int wake_fd_ = -1;                // eventfd 用于跨线程唤醒
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数
             std::mutex tracked_mutex_;
             std::unordered_set<detail::uring_op*> tracked_ops_; // 存活的 op (帧未销毁)
