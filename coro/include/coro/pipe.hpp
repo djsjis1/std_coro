@@ -268,8 +268,10 @@ namespace coro {
                 char* buf;
                 size_t len;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~read_awaiter() { op.alive = false; }
+
+                ~read_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -301,6 +303,8 @@ namespace coro {
                     // 非寻位设备: offset=-1 (使用文件位置, 管道忽略之)
                     io_uring_prep_read(sqe, pipe->fd_, buf, (unsigned)len, -1);
                     detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 int await_resume() {
@@ -319,8 +323,10 @@ namespace coro {
                 const char* buf;
                 size_t len;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~write_awaiter() { op.alive = false; } // 帧销毁时标记 op 失效
+
+                ~write_awaiter() { if (uring_) uring_->untrack_op(&op); } // 帧销毁时标记 op 失效
 
                 bool await_ready() const noexcept { return false; }
 
@@ -351,6 +357,8 @@ namespace coro {
                     }
                     io_uring_prep_write(sqe, pipe->fd_, buf, (unsigned)len, -1);
                     detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 int await_resume() {
@@ -409,8 +417,10 @@ namespace coro {
             int fd;
             short events; // POLLIN / POLLOUT / POLLRDHUP ... (poll.h 语义)
             detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-            ~poll_awaiter() { op.alive = false; }
+
+            ~poll_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
             bool await_ready() const noexcept { return false; }
 
@@ -441,6 +451,8 @@ namespace coro {
                 }
                 io_uring_prep_poll_add(sqe, fd, events);
                 detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
             }
 
             uint32_t await_resume() { return (uint32_t)op.result; }

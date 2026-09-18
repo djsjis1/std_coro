@@ -10,6 +10,8 @@
 #include <chrono>
 #include <coroutine>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 // ============================================================================
 // coro::net::UringEventSource — Linux io_uring 等待原语 (平台默认事件源)
@@ -44,7 +46,6 @@ namespace coro {
             std::coroutine_handle<> continuation{}; // 完成时要恢复的协程
             int result = 0;                         // 完成结果 (字节数, 负值=错误)
             int error = 0;                          // 错误码 (0=成功)
-            bool alive = true;                      // 帧是否存活 (防止延迟 CQE 写已释放内存)
         };
 
 #endif
@@ -67,6 +68,18 @@ namespace coro {
 
             /// 标记一个异步操作开始 (提交 SQE 后调用)
             void op_start() { ++pending_ops_; }
+
+            /// 注册 op 为存活 (awaiter 挂起时调用)
+            void track_op(detail::uring_op* op) {
+                std::lock_guard lock(tracked_mutex_);
+                tracked_ops_.insert(op);
+            }
+
+            /// 注销 op (awaiter 析构时调用, 帧销毁后防止延迟 CQE 写已释放内存)
+            void untrack_op(detail::uring_op* op) {
+                std::lock_guard lock(tracked_mutex_);
+                tracked_ops_.erase(op);
+            }
 
             /// 是否还有挂起的 I/O 操作 (事件循环据此决定是否退出)
             bool has_pending() const override { return pending_ops_ > 0; }
@@ -119,9 +132,12 @@ namespace coro {
                     return; // 唤醒包, 无事可做
 
                 --pending_ops_; // 挂起计数 -1
-                // 帧已销毁 (Task 析构/取消): 跳过写入, 防止 use-after-free
-                if (!op->alive)
-                    return;
+                // 帧已销毁 (awaiter 析构 → untrack_op): 跳过写入, 防止 use-after-free
+                {
+                    std::lock_guard lock(tracked_mutex_);
+                    if (tracked_ops_.find(op) == tracked_ops_.end())
+                        return;
+                }
                 op->result = cqe->res;
                 op->error = cqe->res < 0 ? -cqe->res : 0;
                 if (op->continuation)
@@ -130,6 +146,8 @@ namespace coro {
 
             io_uring ring_;
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数
+            std::mutex tracked_mutex_;
+            std::unordered_set<detail::uring_op*> tracked_ops_; // 存活的 op (帧未销毁)
         };
 
 #endif // __linux__

@@ -303,8 +303,10 @@ namespace coro {
                 DirectoryWatcher* w;
                 char buf[4096];
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~read_awaiter() { op.alive = false; }
+
+                ~read_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -335,6 +337,8 @@ namespace coro {
                     }
                     io_uring_prep_read(sqe, w->fd_, buf, sizeof(buf), -1);
                     detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 void await_resume() { w->parse_records(buf, op.result); }

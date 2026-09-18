@@ -356,8 +356,10 @@ namespace coro {
                 size_t len;
                 uint64_t offset;
                 coro::detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~read_at_awaiter() { op.alive = false; }
+
+                ~read_at_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -389,6 +391,8 @@ namespace coro {
                     // IORING_OP_READ 自带偏移: 定位读, 不移动文件游标
                     io_uring_prep_read(sqe, file->fd_, buf, (unsigned)len, (__s64)offset);
                     coro::detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 int await_resume() {
@@ -412,8 +416,10 @@ namespace coro {
                 size_t len;
                 uint64_t offset;
                 coro::detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~write_at_awaiter() { op.alive = false; }
+
+                ~write_at_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -444,6 +450,8 @@ namespace coro {
                     }
                     io_uring_prep_write(sqe, file->fd_, buf, (unsigned)len, (__s64)offset);
                     coro::detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 int await_resume() {
@@ -464,8 +472,10 @@ namespace coro {
             struct fsync_awaiter {
                 File* file;
                 coro::detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~fsync_awaiter() { op.alive = false; }
+
+                ~fsync_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -496,6 +506,8 @@ namespace coro {
                     }
                     io_uring_prep_fsync(sqe, file->fd_, 0);
                     coro::detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 bool await_resume() {
@@ -534,8 +546,10 @@ namespace coro {
                 int flags;
                 mode_t mode_bits;
                 coro::detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~open_awaiter() { op.alive = false; }
+
+                ~open_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -566,6 +580,8 @@ namespace coro {
                     }
                     io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode_bits);
                     coro::detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 File await_resume() {

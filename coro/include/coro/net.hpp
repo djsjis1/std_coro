@@ -552,8 +552,10 @@ namespace coro {
                 char* buf;
                 size_t len;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~read_awaiter() { op.alive = false; }
+
+                ~read_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -584,6 +586,8 @@ namespace coro {
                         }
                         io_uring_prep_recv(sqe, stream->fd_, buf, len, 0);
                         uring_submit_op(u, u->handle(), &op, sqe);
+                        uring_ = u;
+                        u->track_op(&op);
                     } else {
                         // 没有 io_uring 事件源: 立即失败
                         op.result = -ENOTSUP;
@@ -609,8 +613,10 @@ namespace coro {
                 const char* buf;
                 size_t len;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~write_awaiter() { op.alive = false; }
+
+                ~write_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -637,6 +643,8 @@ namespace coro {
                         }
                         io_uring_prep_send(sqe, stream->fd_, buf, len, 0);
                         uring_submit_op(u, u->handle(), &op, sqe);
+                        uring_ = u;
+                        u->track_op(&op);
                     } else {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -661,8 +669,10 @@ namespace coro {
                 int fd = -1;
                 sockaddr_in addr{};
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~connect_awaiter() { op.alive = false; }
+
+                ~connect_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -689,6 +699,8 @@ namespace coro {
                         }
                         io_uring_prep_connect(sqe, fd, (sockaddr*)&addr, sizeof(addr));
                         uring_submit_op(u, u->handle(), &op, sqe);
+                        uring_ = u;
+                        u->track_op(&op);
                     } else {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -782,8 +794,10 @@ namespace coro {
             struct accept_awaiter {
                 TcpListener* listener;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~accept_awaiter() { op.alive = false; }
+
+                ~accept_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() noexcept { return false; }
 
@@ -810,6 +824,8 @@ namespace coro {
                         }
                         io_uring_prep_accept(sqe, listener->fd_, nullptr, nullptr, 0);
                         uring_submit_op(u, u->handle(), &op, sqe);
+                        uring_ = u;
+                        u->track_op(&op);
                     } else {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);

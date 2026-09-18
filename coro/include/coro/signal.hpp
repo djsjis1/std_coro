@@ -284,8 +284,10 @@ namespace coro {
                 void* buf;
                 size_t len;
                 detail::uring_op op;
+                net::UringEventSource* uring_ = nullptr;
 
-                ~sfd_read_awaiter() { op.alive = false; }
+
+                ~sfd_read_awaiter() { if (uring_) uring_->untrack_op(&op); }
 
                 bool await_ready() const noexcept { return false; }
 
@@ -316,6 +318,8 @@ namespace coro {
                     }
                     io_uring_prep_read(sqe, fd, buf, (unsigned)len, -1);
                     detail::uring_submit(u, sqe, &op);
+                    uring_ = u;
+                    u->track_op(&op);
                 }
 
                 int await_resume() { return op.error ? -1 : op.result; }
