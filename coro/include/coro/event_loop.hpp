@@ -309,8 +309,8 @@ namespace coro {
 
         // ---- 成员变量 ----
 
-        HandleQueue ready_queue_;        // 就绪协程 FIFO
-        HandleQueue batch_;              // 本轮批量消费缓冲 (容量跨迭代复用)
+        HandleQueue ready_queue_;                                // 就绪协程 FIFO
+        HandleQueue batch_;                                      // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<std::coroutine_handle<>> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
         mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 

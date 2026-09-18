@@ -162,8 +162,7 @@ namespace coro {
         // 把 Task 移入本帧, 之后指针不再使用 (调用方帧挂起期间始终存活)。
         // 注意: 不可按值传递 Task<T> 协程参数 —— GCC 10 帧布局对含
         //       std::optional<T> 的 move-only 类型有 double-free bug。
-        template <typename T>
-        Task<void> wait_any_n_monitor(Task<T>* task, std::shared_ptr<wait_any_state<T>> state) {
+        template <typename T> Task<void> wait_any_n_monitor(Task<T>* task, std::shared_ptr<wait_any_state<T>> state) {
             try {
                 T val = co_await std::move(*task);
                 if (!state->done) {

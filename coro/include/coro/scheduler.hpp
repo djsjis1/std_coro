@@ -93,13 +93,15 @@ namespace coro {
             // 还要 index_of 再扫一遍, O(2N) → O(N))
             size_t best = pick_least_loaded_index();
             ++assigned_[best];
-            workers_[best].loop.load(std::memory_order_acquire)->dispatch([this, factory = std::move(factory)]() mutable {
-                // 在 worker 线程: 创建帧 → 启动 → 自持有
-                auto t = factory();
-                t.start();
-                t.detach();            // 协程自持有到完成 (帧在 worker 线程销毁)
-                --pending_dispatches_; // start 已登记活跃计数 → 放行 wait_all
-            });
+            workers_[best]
+                .loop.load(std::memory_order_acquire)
+                ->dispatch([this, factory = std::move(factory)]() mutable {
+                    // 在 worker 线程: 创建帧 → 启动 → 自持有
+                    auto t = factory();
+                    t.start();
+                    t.detach();            // 协程自持有到完成 (帧在 worker 线程销毁)
+                    --pending_dispatches_; // start 已登记活跃计数 → 放行 wait_all
+                });
         }
 
         /// 阻塞等待所有已分发任务完成。
@@ -167,7 +169,8 @@ namespace coro {
             std::atomic<EventLoop*> loop{nullptr}; // atomic: worker 线程写, 主线程读 (消除数据竞争)
 
             Worker() = default;
-            Worker(Worker&& other) noexcept : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)) {}
+            Worker(Worker&& other) noexcept
+                : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)) {}
             Worker& operator=(Worker&& other) noexcept {
                 thread = std::move(other.thread);
                 loop.store(other.loop.load(std::memory_order_relaxed), std::memory_order_relaxed);
