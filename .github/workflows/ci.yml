@@ -128,6 +128,7 @@ jobs:
           }
 
       - name: Run unit tests
+        timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
@@ -187,6 +188,7 @@ jobs:
         run: cmake --build build --config ${{ matrix.build_type }} -j
 
       - name: Run unit tests
+        timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
@@ -294,6 +296,7 @@ jobs:
         run: cmake --build build --target coro_tests -j$(nproc)
 
       - name: Run tests
+        timeout-minutes: 5
         run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
 
       - name: Generate coverage report
