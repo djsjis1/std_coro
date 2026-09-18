@@ -269,11 +269,10 @@ namespace coro {
                 : inner(std::forward<Awaiter>(a)), promise(p), cancel_flag(flag) {}
 
             ~cancel_check_awaiter() {
-                // 清除取消钩子 (帧销毁后钩子不可再用)
-                if (promise) {
-                    promise->cancel_hook_ = nullptr;
-                    promise->cancel_hook_self_ = nullptr;
-                }
+                // 注意: 不清除 cancel_hook_ / cancel_hook_self_。
+                // 钩子在 await_suspend 时被下一次 I/O 覆盖, 或随帧销毁失效。
+                // 保留钩子使 cancel() 在协程恢复后仍能有效取消底层 I/O
+                // (修复 signal::handle 取消时 io_uring 操作泄漏导致的 use-after-free)。
                 // my_handle 非空说明协程挂起后帧被销毁而 await_resume 未执行
                 // (取消注入的异常路径): 通知 inner 摘除等待队列中的僵尸句柄
                 if (my_handle) {
@@ -297,13 +296,17 @@ namespace coro {
                 if constexpr (has_cancel_op<inner_t>::value) {
                     promise->cancel_hook_ = [](void* self) { inner_t::cancel_op(self); };
                     promise->cancel_hook_self_ = &inner;
+                    promise->pending_io_ = true; // 标记有挂起的底层 I/O 可被取消
                 }
                 inner.await_suspend(h);
             }
 
             decltype(auto) await_resume() {
-                // 协程已恢复: 不再处于挂起状态
-                promise->suspended_ = false;
+                // I/O 已完成: 清除 pending_io (cancel 不再需要取消底层 I/O)
+                // 注意: 不清除 suspended_ 和 cancel_hook_ —
+                // 它们在下一次 await_suspend 覆盖或帧销毁时清理。
+                // 这确保 cancel() 在协程恢复后仍能有效取消底层 I/O。
+                promise->pending_io_ = false;
                 // 取消注入点: 恢复时若已被取消, 抛 CancelledError
                 // (不执行 inner.await_resume, 底层结果直接丢弃 — Python 语义)
                 // 注入后立即清除标志: 取消只注入一次。若协程体 catch 了
@@ -446,6 +449,10 @@ namespace coro {
             // 「还在就绪队列中」(无需唤醒, 避免 double-schedule)
             bool suspended_ = false;
 
+            // 底层 I/O 是否挂起 (wrapper 在 await_suspend 置 true, await_resume 置 false)
+            // cancel() 据此判断是否调用取消钩子: pending_io_ = true 时钩子有效。
+            bool pending_io_ = false;
+
             // 目标事件循环 (Scheduler 分发用; nullptr = 当前线程的 loop)
             // 必须在 start()/首次 co_await 之前由 bind_loop() 设置
             EventLoop* target_loop_ = nullptr;
@@ -453,7 +460,7 @@ namespace coro {
             // ---- 取消钩子 (挂起在网络 I/O 上时由 wrapper 注册) ----
             // Task::cancel() 时先取消底层 I/O (CancelIoEx / ASYNC_CANCEL),
             // 由完成包唤醒协程, 保证 OVERLAPPED 先于协程帧销毁被消费。
-            // 仅事件循环线程访问 (cancel 由事件循环线程发起)。
+            // 注意: 钩子在 await_resume 后不清除, 保留到下一次 await_suspend 覆盖或帧销毁。
             void (*cancel_hook_)(void*) = nullptr;
             void* cancel_hook_self_ = nullptr;
         };
@@ -624,10 +631,9 @@ namespace coro {
                     p.release_handle();
                     h.destroy();
                     handle_ = nullptr;
-                } else if (p.cancel_hook_) {
+                } else if (p.pending_io_ && p.cancel_hook_) {
                     // 挂起在网络 I/O 上: 先取消底层 I/O, 由完成包唤醒协程。
-                    // 不直接 schedule: 必须等完成包先消费 OVERLAPPED,
-                    // 协程帧销毁才是安全的。
+                    // pending_io_ 确保钩子在 I/O 完成后不再被调用。
                     p.cancel_hook_(p.cancel_hook_self_);
                 } else if (p.suspended_) {
                     // 挂起在时间/同步/任务等待上: 强制唤醒,
@@ -636,7 +642,7 @@ namespace coro {
                     EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();
                     loop.schedule(handle_);
                 }
-                // else: 协程已在就绪队列中 (spawn 后尚未运行),
+                // else: 协程已在就绪队列中或正在运行,
                 //   不重复 schedule (double-schedule 会 resume 已销毁的帧 → UB)。
                 //   它运行到第一个 await 点时自然抛出 CancelledError。
             }
@@ -736,6 +742,7 @@ namespace coro {
             Task* task_ = nullptr;
             std::atomic<bool> cancelled_ = false; // atomic: cancel 可跨线程 (Scheduler 场景)
             bool suspended_ = false;              // 挂起标记 (同 Task<T>)
+            bool pending_io_ = false;             // 底层 I/O 挂起标记 (同 Task<T>)
             EventLoop* target_loop_ = nullptr;    // 目标事件循环 (同 Task<T>)
 
             // 取消钩子: 同 Task<T>::promise_type
@@ -837,15 +844,16 @@ namespace coro {
                     p.release_handle();
                     h.destroy();
                     handle_ = nullptr;
-                } else if (p.cancel_hook_) {
+                } else if (p.pending_io_ && p.cancel_hook_) {
                     // 挂起在网络 I/O 上: 取消底层 I/O, 由完成包唤醒
+                    // pending_io_ 确保钩子在 I/O 完成后不再被调用
                     p.cancel_hook_(p.cancel_hook_self_);
                 } else if (p.suspended_) {
                     // 挂起中: 强制唤醒 — 调度到目标 loop (而非调用者线程的 loop)
                     EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();
                     loop.schedule(handle_);
                 }
-                // else: 已在就绪队列中, 运行到第一个 await 点自然抛出
+                // else: 已在就绪队列中或正在运行, 运行到第一个 await 点自然抛出
             }
         }
 
