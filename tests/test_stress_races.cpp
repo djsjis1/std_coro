@@ -71,9 +71,7 @@ namespace {
         for (int round = 0; round < 5; ++round) {
             coro::Scheduler sched(2);
             for (int i = 0; i < 20; ++i) {
-                sched.spawn_any([total_tasks] {
-                    return rapid_scheduler_task(total_tasks);
-                });
+                sched.spawn_any([total_tasks] { return rapid_scheduler_task(total_tasks); });
             }
             sched.wait_all();
         }

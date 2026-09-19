@@ -222,9 +222,7 @@ namespace coro {
         }
 
         /// 检查句柄是否已废弃 (仅事件循环线程调用)
-        bool is_abandoned(std::coroutine_handle<> h) const {
-            return abandoned_handles_.count(h.address()) > 0;
-        }
+        bool is_abandoned(std::coroutine_handle<> h) const { return abandoned_handles_.count(h.address()) > 0; }
 
         /// 移除废弃标记并销毁帧 (事件循环清理路径)
         void cleanup_abandoned(std::coroutine_handle<> h) {
@@ -612,7 +610,7 @@ namespace coro {
                     std::lock_guard lock(queue_mutex_);
                     scheduled_set_.erase(h.address());
                 }
-                if (h && !h.done()) {           // 跳过已完成的协程 (防止 double-resume)
+                if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)
                     if (is_abandoned(h)) {
                         // Task 已析构但帧仍存活 (在就绪队列中未被销毁):
                         // 安全销毁帧, 补记活跃计数递减 (对应 Task 析构时跳过的 on_coroutine_finished)

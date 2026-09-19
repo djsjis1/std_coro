@@ -240,7 +240,7 @@ namespace coro {
                     std::call_once(init_flag, [this] {
                         efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
                         // 安装 sigaction 处理器
-                        struct sigaction sa{};
+                        struct sigaction sa {};
                         sa.sa_handler = &global_signal_state::signal_handler;
                         sa.sa_flags = 0; // 不用 SA_RESTART, 让 poll 可中断
                         sigemptyset(&sa.sa_mask);
@@ -305,7 +305,8 @@ namespace coro {
                         return;
                     {
                         std::lock_guard lock(wmtx_);
-                        std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
+                        std::erase_if(waiters_[slot],
+                                      [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
                     }
                     // 无等待者时注销 (reader 线程不再分发到本 manager)
                     if (!has_waiters()) {
@@ -353,8 +354,10 @@ namespace coro {
                 while (!stopped.load(std::memory_order_acquire)) {
                     struct pollfd pfd = {.fd = efd, .events = POLLIN};
                     int pr = ::poll(&pfd, 1, 200);
-                    if (pr <= 0) continue;
-                    if (!(pfd.revents & POLLIN)) continue;
+                    if (pr <= 0)
+                        continue;
+                    if (!(pfd.revents & POLLIN))
+                        continue;
                     uint64_t val = 0;
                     ssize_t nr = ::read(efd, &val, sizeof(val));
                     if (nr == (ssize_t)sizeof(val)) {
