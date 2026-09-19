@@ -56,6 +56,11 @@ namespace {
         co_return v + 1;
     }
 
+    // 命名函数协程驱动 (避免 lambda 协程的临时闭包销毁后 use-after-free)
+    coro::Task<> recursive_spawn_driver(int* result) {
+        *result = co_await recursive_spawn(10);
+    }
+
     // ── 大量 yield 不崩溃 ──
     coro::Task<> yield_storm(int n, int* count) {
         for (int i = 0; i < n; ++i)
@@ -200,7 +205,7 @@ TEST(EdgeCaseTest, TaskStateQueries) {
 // ── 递归 spawn ──
 TEST(EdgeCaseTest, RecursiveSpawn) {
     int result = 0;
-    test_util::run_task([&] { return [&]() -> coro::Task<> { result = co_await recursive_spawn(10); }(); });
+    test_util::run_task([&] { return recursive_spawn_driver(&result); });
     EXPECT_EQ(result, 11);
 }
 
