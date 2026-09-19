@@ -784,6 +784,10 @@ namespace coro {
                 if (fd_ < 0)
                     return false;
 
+                // 允许端口复用: 防止 TIME_WAIT 状态导致 bind 失败
+                int opt = 1;
+                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);

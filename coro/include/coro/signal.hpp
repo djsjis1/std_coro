@@ -7,16 +7,20 @@
 // windows.h 已由 io.hpp 引入; signal.h 由 <csignal> 提供
 #elif defined(__linux__)
 #include <csignal>
-#include <sys/signalfd.h>
+#include <sys/eventfd.h>
+#include <poll.h>
 #include <pthread.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -189,184 +193,181 @@ namespace coro {
 #elif defined(__linux__)
 
             // ==================================================================
-            // Linux 信号管理器 (每 loop 一个: thread_local; 全部访问都在本
-            // loop 线程上 —— add/remove 来自协程挂起/恢复, deliver 来自读者协程)
+            // Linux 信号管理器
             // ==================================================================
-            // 注意: 本仓库在 Windows 上开发, 本节需要 Linux 环境编译验证。
-
-            struct reader_state; // 前向声明 (定义在下方)
+            // 实现策略: sigaction + eventfd + 全局 reader 线程
+            //
+            // 背景: signalfd 的 poll() 只能看到调用线程的 pending 信号,
+            //   跨线程 poll signalfd 无法看到其他线程 raise 的信号。
+            //   io_uring 在 kernel <5.14 也不支持 signalfd。
+            //   因此改用 sigaction 信号处理器 + eventfd 跨线程通知。
+            //
+            // 架构:
+            //   1. 全局 eventfd (进程级单例)
+            //   2. sigaction 处理器: 向 eventfd 写入信号编号 (async-signal-safe)
+            //   3. 全局 reader 线程: poll eventfd → 分发到全部已注册的 manager
+            //   4. 每 loop 一个 manager (thread_local): 维护等待者列表
+            // ==================================================================
 
             struct waiter_entry {
                 void* awaiter;
                 std::coroutine_handle<> handle;
             };
 
+            // ── 全局信号基础设施 (进程级单例) ──
+            struct global_signal_state {
+                int efd = -1;
+                std::thread reader_thread;
+                std::atomic<bool> stopped{false};
+                std::mutex managers_mtx;
+                std::vector<struct manager*> managers;
+                std::once_flag init_flag;
+
+                static global_signal_state& instance() {
+                    static global_signal_state s;
+                    return s;
+                }
+
+                ~global_signal_state() {
+                    stopped.store(true, std::memory_order_release);
+                    if (reader_thread.joinable())
+                        reader_thread.join();
+                    if (efd >= 0)
+                        ::close(efd);
+                }
+
+                void ensure_initialized() {
+                    std::call_once(init_flag, [this] {
+                        efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+                        // 安装 sigaction 处理器
+                        struct sigaction sa{};
+                        sa.sa_handler = &global_signal_state::signal_handler;
+                        sa.sa_flags = 0; // 不用 SA_RESTART, 让 poll 可中断
+                        sigemptyset(&sa.sa_mask);
+                        for (int sig : supported)
+                            sigaction(sig, &sa, nullptr);
+                        // 启动 reader 线程
+                        reader_thread = std::thread([this] { reader_loop(); });
+                    });
+                }
+
+                static void signal_handler(int sig) {
+                    auto& s = instance();
+                    if (s.efd >= 0) {
+                        uint64_t val = (uint64_t)sig;
+                        // write() 是 async-signal-safe
+                        ::write(s.efd, &val, sizeof(val));
+                    }
+                }
+
+                void reader_loop(); // 定义在 manager 之后 (需要完整类型)
+
+                void register_manager(manager* m) {
+                    std::lock_guard lock(managers_mtx);
+                    managers.push_back(m);
+                }
+
+                void unregister_manager(manager* m) {
+                    std::lock_guard lock(managers_mtx);
+                    std::erase(managers, m);
+                }
+            };
+
             class manager {
               public:
                 static manager& get() {
-                    static thread_local manager m; // 每 loop (线程) 一个
+                    static thread_local manager m;
                     return m;
                 }
 
-                int sfd() const { return sfd_; }
-
-                /// 注册等待者; 必要时阻塞信号 + 创建/更新 signalfd + 启动读者
                 void add(int sig, void* awaiter, std::coroutine_handle<> h) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
-                    waiters_[slot].push_back({awaiter, h});
-
-                    // 阻塞本线程的该信号 (signalfd 的前提; 之后创建的线程继承)
-                    sigset_t set;
-                    sigemptyset(&set);
-                    sigaddset(&set, sig);
-                    pthread_sigmask(SIG_BLOCK, &set, nullptr);
-
-                    // signalfd 掩码累计 (首次创建, 之后原地更新)
-                    sigaddset(&mask_, sig);
-                    if (sfd_ < 0)
-                        sfd_ = signalfd(-1, &mask_, SFD_NONBLOCK | SFD_CLOEXEC);
-                    else
-                        signalfd(sfd_, &mask_, SFD_NONBLOCK | SFD_CLOEXEC);
-
-                    ensure_reader();
+                    {
+                        std::lock_guard lock(wmtx_);
+                        waiters_[slot].push_back({awaiter, h});
+                    }
+                    loop_ = &EventLoop::get();
+                    // 注册到全局基础设施
+                    auto& gs = global_signal_state::instance();
+                    gs.ensure_initialized();
+                    {
+                        std::lock_guard lock(gs.managers_mtx);
+                        if (std::find(gs.managers.begin(), gs.managers.end(), this) == gs.managers.end())
+                            gs.managers.push_back(this);
+                    }
                 }
 
                 void remove(int sig, void* awaiter) {
                     size_t slot = slot_of(sig);
                     if (slot == NSLOT)
                         return;
-                    std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
-                    maybe_stop_reader();
+                    {
+                        std::lock_guard lock(wmtx_);
+                        std::erase_if(waiters_[slot], [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
+                    }
+                    // 无等待者时注销 (reader 线程不再分发到本 manager)
+                    if (!has_waiters()) {
+                        auto& gs = global_signal_state::instance();
+                        std::lock_guard lock(gs.managers_mtx);
+                        std::erase(gs.managers, this);
+                    }
                 }
 
-                /// 投递 (读者协程在 loop 线程调用): 唤醒该信号的全部当前等待者
-                /// (广播语义, 与 Windows 端一致)。
-                /// 无等待者余留时停掉读者 (挂起的 signalfd 读被取消,
-                /// 事件循环不会被常驻读者拖住无法退出)。
+                /// 投递: 唤醒该信号的全部当前等待者
+                /// 从 reader 线程调用, 用 loop_ 调度到正确的 EventLoop
                 void deliver(int sig) {
                     size_t slot = slot_of(sig);
-                    if (slot == NSLOT || waiters_[slot].empty())
+                    if (slot == NSLOT)
                         return;
-                    // 广播: 唤醒全部当前等待者 (与 Windows deliver 语义一致)
-                    for (auto& w : waiters_[slot]) {
-                        if (w.handle)
-                            EventLoop::get().schedule(w.handle);
+                    std::vector<waiter_entry> wake;
+                    {
+                        std::lock_guard lock(wmtx_);
+                        if (waiters_[slot].empty())
+                            return;
+                        wake.swap(waiters_[slot]);
                     }
-                    waiters_[slot].clear();
-                    maybe_stop_reader();
+                    for (auto& w : wake) {
+                        if (w.handle && loop_)
+                            loop_->schedule(w.handle);
+                    }
                 }
 
                 bool has_waiters() const {
+                    std::lock_guard lock(wmtx_);
                     for (auto& v : waiters_)
                         if (!v.empty())
                             return true;
                     return false;
                 }
 
-                // 读者协程的自持有状态 (避免 reader_task_ 未初始化先被引用)
-                std::shared_ptr<reader_state> rstate;
-
               private:
-                void ensure_reader();
-                void maybe_stop_reader();
-
                 std::array<std::vector<waiter_entry>, NSLOT> waiters_;
-                sigset_t mask_{};
-                int sfd_ = -1;
-                bool reader_started_ = false;
+                mutable std::mutex wmtx_;
+                EventLoop* loop_ = nullptr;
             };
 
-            // signalfd 的一次 io_uring 读 (结构同 pipe/fs 的读)
-            struct sfd_read_awaiter {
-                int fd;
-                void* buf;
-                size_t len;
-                detail::uring_op op;
-                net::UringEventSource* uring_ = nullptr;
-
-                ~sfd_read_awaiter() {
-                    if (uring_)
-                        uring_->untrack_op(&op);
-                }
-
-                bool await_ready() const noexcept { return false; }
-
-                static void cancel_op(void* self) {
-                    auto* aw = static_cast<sfd_read_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
+            // reader_loop 定义 (需要 manager 完整类型)
+            inline void global_signal_state::reader_loop() {
+                while (!stopped.load(std::memory_order_acquire)) {
+                    struct pollfd pfd = {.fd = efd, .events = POLLIN};
+                    int pr = ::poll(&pfd, 1, 200);
+                    if (pr <= 0) continue;
+                    if (!(pfd.revents & POLLIN)) continue;
+                    uint64_t val = 0;
+                    ssize_t nr = ::read(efd, &val, sizeof(val));
+                    if (nr == (ssize_t)sizeof(val)) {
+                        int sig = (int)val;
+                        std::vector<manager*> snapshot;
+                        {
+                            std::lock_guard lock(managers_mtx);
+                            snapshot = managers;
                         }
+                        for (auto* m : snapshot)
+                            m->deliver(sig);
                     }
                 }
-
-                void await_suspend(std::coroutine_handle<> h) {
-                    op.continuation = h;
-                    auto* u = EventLoop::get().uring();
-                    if (!u) {
-                        op.result = -ENOTSUP;
-                        EventLoop::get().schedule(h);
-                        return;
-                    }
-                    io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                    if (!sqe) {
-                        op.result = -ENOBUFS;
-                        EventLoop::get().schedule(h);
-                        return;
-                    }
-                    io_uring_prep_read(sqe, fd, buf, (unsigned)len, -1);
-                    detail::uring_submit(u, sqe, &op);
-                    uring_ = u;
-                    u->track_op(&op);
-                }
-
-                int await_resume() { return op.error ? -1 : op.result; }
-            };
-
-            // 读者协程状态: 自持有 (rstate 由帧和 manager 共享)
-            struct reader_state {
-                int sfd = -1;
-                Task<> self; // 读者协程自身 (停止时 cancel)
-            };
-
-            // 读者循环: 持续读 signalfd, 每条 signalfd_siginfo 分发一个等待者。
-            // 无等待者时被 cancel → CancelledError → 收尾退出 (不阻止 loop 退出)
-            inline Task<> reader_loop(std::shared_ptr<reader_state> st) {
-                try {
-                    while (true) {
-                        signalfd_siginfo si;
-                        int n = co_await sfd_read_awaiter{st->sfd, &si, sizeof(si), {}};
-                        if (n != (int)sizeof(si))
-                            break; // fd 关闭或错误: 退出读者
-                        manager::get().deliver((int)si.ssi_signo);
-                    }
-                } catch (const CancelledError&) {
-                    // 正常停止路径 (最后一个等待者离开时被 cancel)
-                }
-            }
-
-            inline void manager::ensure_reader() {
-                if (reader_started_)
-                    return;
-                reader_started_ = true;
-                rstate = std::make_shared<reader_state>();
-                rstate->sfd = sfd_;
-                rstate->self = reader_loop(rstate);
-                rstate->self.start(); // 常驻: 挂起在 signalfd 读上
-            }
-
-            inline void manager::maybe_stop_reader() {
-                if (!reader_started_ || has_waiters())
-                    return;
-                // 无等待者: 取消读者 (挂起的 uring 读被 ASYNC_CANCEL,
-                // 读者协程收到 CancelledError 退出), signalfd 留待下次复用
-                rstate->self.cancel();
-                reader_started_ = false;
-                rstate.reset();
             }
 
 #endif

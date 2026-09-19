@@ -59,6 +59,10 @@ namespace {
 
         auto server = coro::spawn(multi_client_server(&listener, n_clients, served));
 
+        // 预分配: 防止 push_back 重新分配导致之前 &results->back() 指针失效
+        results->reserve(n_clients);
+        results->clear();
+
         std::vector<coro::Task<>> clients;
         for (int i = 0; i < n_clients; ++i) {
             results->push_back(0);

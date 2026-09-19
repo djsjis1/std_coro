@@ -207,6 +207,31 @@ namespace coro {
             (void)h;
 #endif
         }
+
+        /// Task 析构时调用: 尝试将句柄标记为「已废弃」。
+        /// 如果句柄在就绪队列中 (scheduled_set_ 有记录), 注册废弃, 延迟到事件循环安全销毁。
+        /// 返回 true 表示已注册废弃 (帧保持存活), false 表示不在队列中 (调用方可安全销毁)。
+        bool mark_abandoned(std::coroutine_handle<> h) {
+            std::lock_guard lock(queue_mutex_);
+            auto it = scheduled_set_.find(h.address());
+            if (it == scheduled_set_.end())
+                return false; // 不在就绪队列: 调用方可安全销毁帧
+            scheduled_set_.erase(it);
+            abandoned_handles_.insert(h.address());
+            return true; // 已注册废弃: 调用方不要销毁帧
+        }
+
+        /// 检查句柄是否已废弃 (仅事件循环线程调用)
+        bool is_abandoned(std::coroutine_handle<> h) const {
+            return abandoned_handles_.count(h.address()) > 0;
+        }
+
+        /// 移除废弃标记并销毁帧 (事件循环清理路径)
+        void cleanup_abandoned(std::coroutine_handle<> h) {
+            abandoned_handles_.erase(h.address());
+            h.destroy();
+        }
+
         bool has_active_coroutines() const { return active_coroutines_ > 0; }
 
         /// 活跃任务数 (已启动且未完成)
@@ -321,6 +346,10 @@ namespace coro {
         // 若双入队, W 第一次 resume 后帧销毁, 第二次 pop 到它时 done() 是 UB。
         // schedule 时查重, 出队 (批量 swap) 时移除。
         std::unordered_set<const void*> scheduled_set_;
+
+        // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
+        // 仅事件循环线程访问 (mark_abandoned 也在事件循环线程调用)。
+        std::unordered_set<const void*> abandoned_handles_;
 
         // 跨线程投递的普通函数队列 (dispatch 用), queue_mutex_ 保护
         std::queue<std::function<void()>> fn_queue_;
@@ -584,6 +613,13 @@ namespace coro {
                     scheduled_set_.erase(h.address());
                 }
                 if (h && !h.done()) {           // 跳过已完成的协程 (防止 double-resume)
+                    if (is_abandoned(h)) {
+                        // Task 已析构但帧仍存活 (在就绪队列中未被销毁):
+                        // 安全销毁帧, 补记活跃计数递减 (对应 Task 析构时跳过的 on_coroutine_finished)
+                        on_coroutine_finished(h);
+                        cleanup_abandoned(h);
+                        continue;
+                    }
                     detail::t_current_task = h; // 设置当前任务 (对标 current_task)
                     h.resume();
                     detail::t_current_task = nullptr;

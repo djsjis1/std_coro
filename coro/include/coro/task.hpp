@@ -288,7 +288,14 @@ namespace coro {
                 return inner.await_ready();
             }
 
-            void await_suspend(std::coroutine_handle<Promise> h) {
+            // await_suspend: 正确传播内层 awaiter 的返回值。
+            // 关键修复: 旧实现返回 void, 导致内层 await_suspend 返回 false
+            // (不挂起) 时协程仍然挂起 → 死锁 (Lock 重入等场景)。
+            // 现在根据内层返回类型选择:
+            //   bool   → 传播 (false = 不挂起)
+            //   void   → 返回 void (总是挂起)
+            //   handle → 传播 (对称转移)
+            auto await_suspend(std::coroutine_handle<Promise> h) {
                 my_handle = h;
                 promise->suspended_ = true; // 标记挂起: Task::cancel 据此决定是否强制唤醒
                 // 网络 I/O awaiter: 向 promise 注册取消钩子,
@@ -298,7 +305,34 @@ namespace coro {
                     promise->cancel_hook_self_ = &inner;
                     promise->pending_io_ = true; // 标记有挂起的底层 I/O 可被取消
                 }
-                inner.await_suspend(h);
+                using inner_result_t = decltype(inner.await_suspend(h));
+                if constexpr (std::is_void_v<inner_result_t>) {
+                    inner.await_suspend(h);
+                    // void: 总是挂起 (无需传播)
+                } else if constexpr (std::is_same_v<inner_result_t, bool>) {
+                    bool result = inner.await_suspend(h);
+                    if (!result) {
+                        // 内层决定不挂起: 清除挂起标记并传播
+                        my_handle = nullptr;
+                        promise->suspended_ = false;
+                        if constexpr (has_cancel_op<inner_t>::value) {
+                            promise->pending_io_ = false;
+                        }
+                    }
+                    return result;
+                } else {
+                    // coroutine_handle: 对称转移
+                    auto transfer_to = inner.await_suspend(h);
+                    if (!transfer_to) {
+                        // 返回了空句柄: 不转移, 清除标记
+                        my_handle = nullptr;
+                        promise->suspended_ = false;
+                        if constexpr (has_cancel_op<inner_t>::value) {
+                            promise->pending_io_ = false;
+                        }
+                    }
+                    return transfer_to;
+                }
             }
 
             decltype(auto) await_resume() {
@@ -487,11 +521,19 @@ namespace coro {
         /// 都在帧销毁前置空 handle_), 因此非空即可安全 destroy。
         ~Task() {
             if (handle_) {
-                // 销毁"已启动但未完成"的帧时, 必须补记完成:
-                // 否则活跃协程计数泄漏, 事件循环会无限等待 (挂死)。
-                if (started_ && !ready_)
-                    EventLoop::get().on_coroutine_finished(handle_);
-                handle_.destroy();
+                if (started_ && !ready_) {
+                    // 已启动但未完成: 帧可能在就绪队列中
+                    if (!EventLoop::get().mark_abandoned(handle_)) {
+                        // 不在就绪队列 (挂起在定时器/I/O 等): 安全销毁
+                        // 定时器路径: sleep_awaiter 析构会置 token, 事件循环跳过僵尸条目
+                        EventLoop::get().on_coroutine_finished(handle_);
+                        handle_.destroy();
+                    }
+                    // 在就绪队列: mark_abandoned 返回 true, 帧保持存活
+                    // 事件循环 resume 前检测废弃集合, 安全销毁
+                } else {
+                    handle_.destroy();
+                }
             }
         }
 
@@ -509,11 +551,15 @@ namespace coro {
         Task& operator=(Task&& other) noexcept {
             if (this != &other) {
                 if (handle_) {
-                    // 销毁「已启动未完成」的旧帧时补记完成 (同析构):
-                    // 防活跃计数泄漏 → 事件循环无限等待挂死
-                    if (started_ && !ready_)
-                        EventLoop::get().on_coroutine_finished(handle_);
-                    handle_.destroy();
+                    // 销毁旧帧 (同析构逻辑): 在就绪队列则延迟销毁
+                    if (started_ && !ready_) {
+                        if (!EventLoop::get().mark_abandoned(handle_)) {
+                            EventLoop::get().on_coroutine_finished(handle_);
+                            handle_.destroy();
+                        }
+                    } else {
+                        handle_.destroy();
+                    }
                 }
                 handle_ = std::exchange(other.handle_, nullptr);
                 result_ = std::move(other.result_);
@@ -762,10 +808,14 @@ namespace coro {
         }
         ~Task() {
             if (handle_) {
-                // 销毁未完成帧时补记完成 (同 Task<T>): 防活跃计数泄漏 → 事件循环挂死
-                if (started_ && !ready_)
-                    EventLoop::get().on_coroutine_finished(handle_);
-                handle_.destroy();
+                if (started_ && !ready_) {
+                    if (!EventLoop::get().mark_abandoned(handle_)) {
+                        EventLoop::get().on_coroutine_finished(handle_);
+                        handle_.destroy();
+                    }
+                } else {
+                    handle_.destroy();
+                }
             }
         }
 
@@ -779,10 +829,14 @@ namespace coro {
         Task& operator=(Task&& other) noexcept {
             if (this != &other) {
                 if (handle_) {
-                    // 销毁「已启动未完成」的旧帧时补记完成 (同析构)
-                    if (started_ && !ready_)
-                        EventLoop::get().on_coroutine_finished(handle_);
-                    handle_.destroy();
+                    if (started_ && !ready_) {
+                        if (!EventLoop::get().mark_abandoned(handle_)) {
+                            EventLoop::get().on_coroutine_finished(handle_);
+                            handle_.destroy();
+                        }
+                    } else {
+                        handle_.destroy();
+                    }
                 }
                 handle_ = std::exchange(other.handle_, nullptr);
                 exception_ = std::move(other.exception_);

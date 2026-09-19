@@ -62,15 +62,17 @@ namespace {
 
     // ── 快速创建/销毁 Scheduler ──
     // 回归: ~Scheduler 中 stop() 访问正在销毁的 EventLoop
+    coro::Task<> rapid_scheduler_task(std::atomic<int>* total_tasks) {
+        ++*total_tasks;
+        co_return;
+    }
+
     void rapid_scheduler_lifecycle(std::atomic<int>* total_tasks) {
         for (int round = 0; round < 5; ++round) {
             coro::Scheduler sched(2);
             for (int i = 0; i < 20; ++i) {
                 sched.spawn_any([total_tasks] {
-                    return [total_tasks]() -> coro::Task<> {
-                        ++*total_tasks;
-                        co_return;
-                    }();
+                    return rapid_scheduler_task(total_tasks);
                 });
             }
             sched.wait_all();
@@ -80,11 +82,13 @@ namespace {
     // ── 跨线程 dispatch 风暴 ──
     // 多线程同时向同一个 EventLoop dispatch 协程
     coro::Task<> dispatch_storm_scenario(std::atomic<int>* completed, int n_threads, int per_thread) {
+        // 捕获当前线程的 EventLoop: 工作线程需要 dispatch 到这个 loop
+        auto* main_loop = &coro::EventLoop::get();
         std::vector<std::thread> threads;
         for (int t = 0; t < n_threads; ++t) {
-            threads.emplace_back([completed, per_thread] {
+            threads.emplace_back([completed, per_thread, main_loop] {
                 for (int i = 0; i < per_thread; ++i) {
-                    coro::EventLoop::get().dispatch([completed] { ++*completed; });
+                    main_loop->dispatch([completed] { ++*completed; });
                 }
             });
         }
