@@ -142,19 +142,24 @@ int main() { coro::run(main_task()); }   // 启动事件循环，跑完自动退
 构建：
 
 ```bash
-cmake -B build -A x64                 # Windows
+# Windows (Visual Studio)
+cmake -S . -B build -A x64
 cmake --build build --config Debug
-# Linux: sudo apt install liburing-dev 后 cmake -B build && cmake --build build
+# Linux (Ninja/Make；先安装 liburing-dev)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
 
 # 运行单元测试 (googletest, 集成于 thirdparty/googletest-main)
 ctest --test-dir build -C Debug --output-on-failure
-# 或直接运行: build/Debug/coro_tests.exe
+# Windows 也可直接运行: build/Debug/coro_tests.exe
+# Linux 也可直接运行: ./build/coro_tests
 # 测试覆盖: Task/spawn/异常、取消语义、并发原语、同步原语、Future、调度、TCP、
 #           文件 IO、管道、信号、目录监视、子进程 (128 用例)
 
 # 高并发压力测试 (独立程序):
 cmake --build build --config Release --target coro_stress
-build/Release/coro_stress.exe
+# Windows: .\build\Release\coro_stress.exe
+# Linux:   ./build/coro_stress
 # 覆盖: 10 万协程并发 / 10 万定时器 / 400 万次 yield / 100 万队列吞吐
 #       10 万 spawn 往返 / 4 线程 × 10 万协程并行
 ```

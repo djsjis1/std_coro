@@ -5,7 +5,8 @@
 > 使用层面的问题请看 [API 参考](api-reference.md) 与 [教程](tutorial/README.md)；
 > 语言机制请看 [C++20 协程课程](cpp20-coroutines-course/README.md)。
 >
-> 库本体：`include/coro/` 下的头文件，共约 8900 行，header-only。
+> 库本体：`include/coro/` 下的 24 个 header-only 头文件；文档刻意不固化行数，
+> 避免每次实现调整都产生无意义的文档漂移。
 > 行文自底向上：事件源 → 事件循环 → Task → 取消 → 并发组合 → IO 层 →
 > 多线程模型 → 横切设计模式。
 
@@ -66,7 +67,7 @@ coro 是一个 **Proactor 模型**的单线程协作式调度框架（每线程�
 
 ## 2. 事件源抽象 EventSource 与三大实现
 
-`event_source.hpp`（120 行）定义了"事件循环如何睡眠与被唤醒"的抽象，
+`event_source.hpp` 定义了"事件循环如何睡眠与被唤醒"的抽象，
 模仿 Python 的 selectors 模块：
 
 ```cpp
@@ -89,7 +90,7 @@ protected:
 历史上这里是全局函数指针，在多线程同时构造 loop 时存在数据竞争，
 改为事件源成员后每 loop 自持。
 
-### IocpEventSource（Windows，155 行）
+### IocpEventSource（Windows）
 
 - 构造：`CreateIoCompletionPort(INVALID_HANDLE_VALUE, ...)` 创建完成端口；
   socket/文件/管道/目录句柄经 `associate(SOCKET/HANDLE)` 挂进来；
@@ -114,7 +115,7 @@ protected:
   同步成功（rc==0，**IOCP 仍会投递完成包**）、立即失败（无完成包，
   awaiter 自己 `schedule(h)` 恢复）。
 
-### UringEventSource（Linux，150 行）
+### UringEventSource（Linux）
 
 - 构造：`io_uring_queue_init(256, &ring_, 0)`；
 - 操作状态 `uring_op { continuation, result, error }`，用 SQE 的
@@ -135,7 +136,7 @@ mutex + condition_variable + bool 模拟 self-pipe；`has_pending` 恒 false
 
 ## 3. 事件循环 EventLoop
 
-`event_loop.hpp`（618 行）是全库的心脏。核心数据结构：
+`event_loop.hpp` 是全库的心脏。核心数据结构：
 
 | 成员 | 保护 | 用途 |
 |---|---|---|
@@ -217,7 +218,7 @@ void run_impl(bool stay)  // stay=true 即 run_until_stopped (Scheduler worker)
 
 ## 4. Task 的 promise_type 设计
 
-`task.hpp`（1067 行，最大文件）。`Task<T>` 同时是**返回类型 + 句柄
+`task.hpp` 是核心文件。`Task<T>` 同时是**返回类型 + 句柄
 外壳 + awaitable** 三合一。
 
 ### 4.1 关键选型
@@ -374,7 +375,7 @@ TaskGroup 的组取消在此基础上多两步：
 
 ## 7. 同步原语与 Future 的实现要点
 
-### sync.hpp（461 行）与 queue.hpp（257 行）
+### sync.hpp 与 queue.hpp
 
 - 全部**无内部锁**：等待队列是 `deque<coroutine_handle<>>`，
   仅 loop 线程操作（与事件循环同一线程，天然串行）；
@@ -387,7 +388,7 @@ TaskGroup 的组取消在此基础上多两步：
 - 五个原语都实现 `on_waiter_destroyed`，配合 cancel_check_awaiter
   的析构钩子做僵尸等待者摘除（见第 5 节）。
 
-### future.hpp（402 行）
+### future.hpp
 
 ```
 Promise<T> ──get_future──> SharedState(shared_ptr) <──共享── Future<T> ×N
@@ -410,7 +411,7 @@ Promise<T> ──get_future──> SharedState(shared_ptr) <──共享── F
 ## 8. IO 层：Proactor 统一完成路径
 
 net / fs / pipe / fs_watch 共用同一条路径
-（io.hpp 158 行 + 各模块头文件）：
+（`io.hpp` + 各模块头文件）：
 
 ```
 awaiter (协程帧内) 持有 detail::iocp_op / uring_op
@@ -433,7 +434,7 @@ awaiter (协程帧内) 持有 detail::iocp_op / uring_op
 `ERROR_OPERATION_ABORTED`（取消）→ `EINTR`（MSVC errno 无 ECANCELED）；
 `ERROR_HANDLE_EOF` / `ERROR_BROKEN_PIPE` → 0（EOF 语义）。
 
-### 平台难点备忘（net.hpp 977 行 / fs.hpp 752 行）
+### 平台难点备忘（net.hpp / fs.hpp）
 
 - Windows `ConnectEx` 要求 socket 先 bind 本地地址（否则 WSAEINVAL）；
   `get_connect_ex()` 进程级 WSAIoctl 缓存；
@@ -485,7 +486,7 @@ loop-per-thread），而非 Go 式 work-stealing。收益：
 | `Task::cancel()`（任意线程） | 唤醒路由到协程自己的 `target_loop_` |
 | `Scheduler::spawn_any` | dispatch **工厂**到 worker 线程，帧在 worker 上创建 |
 
-`Scheduler`（scheduler.hpp 193 行）= N × `EventLoop::run_until_stopped()`
+`Scheduler`（`scheduler.hpp`）= N × `EventLoop::run_until_stopped()`
 + 负载选择 + dispatch。选 worker：主键 `active_task_count()`，
 次键累计分发数（活跃数恒 0 的短任务场景防聚集，退化为 round-robin）。
 `wait_all` 用自适应退避轮询（50µs 起每轮翻倍至 1ms 封顶）而非常规的
@@ -548,34 +549,26 @@ Linux 部分直接引用 `net::UringEventSource`（经 event_loop.hpp 条件
 
 ---
 
-## 12. 代码规模与阅读顺序
+## 12. 代码模块与阅读顺序
 
-| 文件 | 行数 | 主题 |
-|---|---|---|
-| task.hpp | 1046 | Task / promise / cancel |
-| net.hpp | 977 | TCP (IOCP/io_uring) |
-| wait.hpp | 463 | wait_for / wait_any / wait_tasks / gather_all |
-| event_loop.hpp | 618 | 循环核心 |
-| fs.hpp | 752 | 文件 IO |
-| fs_watch.hpp | 535 | 目录监视 |
-| pipe.hpp | 531 | 管道 |
-| signal.hpp | 525 | 信号 |
-| process.hpp | 518 | 子进程 |
-| sync.hpp | 461 | 四原语 |
-| future.hpp | 402 | Promise/Future |
-| gather.hpp | 263 | 静态 gather |
-| queue.hpp | 257 | 队列 |
-| task_group.hpp | 230 | 结构化并发 |
-| scheduler.hpp | 193 | 多核分发 |
-| thread.hpp | 172 | to_thread |
-| io.hpp | 158 | 错误模型 |
-| iocp_event_source.hpp | 155 | Windows 事件源 |
-| uring_event_source.hpp | 150 | Linux 事件源 |
-| sleep.hpp | 132 | 时间原语 |
-| schedule.hpp | 120 | call_* |
-| event_source.hpp | 120 | 事件源抽象 |
-| exceptions.hpp | 48 | ExceptionGroup |
-| coro.hpp | 59 | 聚合入口 |
+| 文件 | 主题 |
+|---|---|
+| task.hpp | Task / promise / cancel |
+| net.hpp | TCP/UDP（IOCP/io_uring） |
+| wait.hpp | wait_for / wait_any / wait_tasks / gather_all |
+| event_loop.hpp | 循环核心 |
+| fs.hpp | 文件 IO |
+| fs_watch.hpp | 目录监视 |
+| pipe.hpp | 管道 |
+| signal.hpp | 信号 |
+| process.hpp | 子进程 |
+| sync.hpp / queue.hpp | 同步原语与队列 |
+| future.hpp | Promise/Future |
+| gather.hpp / task_group.hpp | 组合器与结构化并发 |
+| scheduler.hpp / thread.hpp | 多核分发与线程池桥接 |
+| io.hpp / *_event_source.hpp | 错误模型与平台事件源 |
+| sleep.hpp / schedule.hpp | 时间与调度辅助 |
+| exceptions.hpp / coro.hpp | 异常类型与聚合入口 |
 
 **推荐阅读顺序**（每个文件都能在前一个的知识上展开）：
 
@@ -592,7 +585,7 @@ process.hpp      → 组合技 (pipe + future + 平台进程 API)
 scheduler.hpp/thread.hpp → 多核层
 ```
 
-配套的测试（`tests/test_*.cpp`，22 个文件）是行为的最佳注解——
+配套的测试（当前 `tests/test_*.cpp` 有 24 个测试源）是行为的最佳注解——
 每个头文件都有同名测试，改代码前先跑
 `ctest --test-dir build -C Debug --output-on-failure`。
 
@@ -605,7 +598,7 @@ scheduler.hpp/thread.hpp → 多核层
 ### 13.1 对称转移未启用（MSVC C4737）
 
 `co_await task` 的 `await_suspend` 返回子协程句柄可实现对称转移
-（直跳执行, 绕开就绪队列, 预计再省 ~30% 串行调度开销）。实测被
+（直跳执行，绕开就绪队列，理论上可降低部分串行调度开销）。实测被
 MSVC 拒绝：**`cancel_check_awaiter` 的析构函数承担取消清理职责**
 （协程帧销毁时摘除等待队列中的僵尸句柄）, 而 MSVC 要求对称转移
 路径上的 awaiter 临时对象可尾调用（C4737: "无法执行所需尾调用"）。

@@ -1,7 +1,9 @@
 # coro 文档中心
 
 > C++20 协程事件循环框架 — 类似 Python asyncio 的使用体验。
-> 核心库 header-only；Windows 使用 IOCP，Linux 使用 io_uring（需要系统提供 liburing）。
+> 核心库 header-only；Windows 使用 IOCP，Linux 默认使用 io_uring（需要 `liburing`）。
+> Linux 也可用 `-DCORO_ENABLE_URING=OFF` 构建 portable core；macOS 当前没有启用的
+> kqueue 后端和 CI 目标，不应按已支持平台发布。
 
 这里是 coro 项目的完整文档地图。按你的目标选择入口：
 
@@ -65,7 +67,8 @@
 
 - **[FAQ 与故障排查](faq.md)** — 按症状索引：编译错误、链接错误、运行时挂死、UB 崩溃、
   协程闭包生命周期、跨线程问题。
-- **[已知限制](#)** — 见 [coro-guide.md 第十五节](coro-guide.md#十五已知限制)。
+- **[已知限制](coro-guide.md#十五已知限制)** — 平台、协议和组合器边界集中记录在指南第十五节；
+  发布前还应查看[质量基线与发布说明](quality-status.md)。
 
 ---
 
@@ -76,7 +79,7 @@ coro/                     # 项目根
 ├── include/coro/         # ★ 库本体（header-only，可整体复制到别的项目）
 ├── CMakeLists.txt        #   库目标 coro::coro + 安装导出
 ├── examples/             # 8 个可运行示例
-├── tests/                # googletest 单元测试（22 个文件）+ 高并发压测 stress.cpp
+├── tests/                # googletest 单元测试（当前 24 个测试源）+ 高并发压测 stress.cpp
 ├── Web/                  # HTTP 服务器框架（llhttp 解析 + 路由 + 多线程 worker）
 ├── router/               # 独立的泛型基数树路由 radix_router<T>（header-only）
 ├── docs/                 # 本文档中心

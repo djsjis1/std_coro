@@ -233,8 +233,9 @@ while (true) {
 - `ev.path` 是相对监视目录的 UTF-8 路径（`/` 分隔）；
 - 内核事件粒度粗：编辑器保存一次常产生多条
   created/modified——应用层做**去抖**（例如同路径事件收进 100ms 窗口）；
-- Linux 平台 v1 的递归参数只作用于初始已存在的子目录枚举限制
-  （详见[已知限制](../coro-guide.md#十五已知限制)），Windows 原生递归完整；
+- Linux 递归模式会为初始目录树以及之后新建/移入的子目录维护 inotify watch，
+  但每个子目录都会消耗 watch 配额；收到 `overflow` 后应按业务做全量扫描兜底
+  （详见[已知限制](../coro-guide.md#十五已知限制)）。Windows 使用原生递归；
 - 配合 `wait_for(w.next(), 100ms)` 可实现"轮询 + 事件"混合模式。
 
 ---

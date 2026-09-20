@@ -7,7 +7,12 @@
 >
 > 每完成一项把 `- [ ]` 勾成 `- [x]`；实施中发现锚点漂移（行号变化等）随手修正本文档。
 >
-> 制定日期：2026-09-18 ｜ 状态：**阶段 0 待启动**
+> 制定日期：2026-09-18 ｜ 最近核对：2026-09-21 ｜ 状态：**阶段 0 部分完成，需重新核对**
+>
+> 说明：本手册是演进计划，不是自动生成的能力清单。当前代码已经包含 UDP、
+> Linux process 条件编译和多项 Web/生命周期修复；因此下面的历史复选框和行号
+> 不能直接当作未实现证明。发布前请以 [质量基线](quality-status.md)、测试结果和
+> 当前符号搜索为准。
 
 ---
 
@@ -60,27 +65,24 @@ ctest --test-dir build --output-on-failure
 
 | # | 领域 | 现状 | 代码/文档锚点 |
 |---|---|---|---|
-| 1 | 网络 | 仅 TCP + IPv4；`sockaddr_in` + `inet_addr` 全程，无域名 | `include/coro/net.hpp`（双平台实现） |
+| 1 | 网络 | TCP + UDP，当前地址 API 仍以 IPv4 为主；暂无 DNS/IPv6 抽象 | `include/coro/net.hpp`（双平台实现） |
 | 2 | Web 层 | 无中间件、无 chunked 生成、响应体全量缓存 | `docs/web-framework.md` §已知限制（~251-261） |
-| 3 | 平台 | Linux 禁用 process（GCC 12 ICE，注释写明待 GCC 13+） | `CMakeLists.txt:46`；macOS 预留 `ci.yml:141`（已注释） |
+| 3 | 平台 | Linux 在检测到 io_uring 时启用 process；portable-core 和 macOS 不提供该 IO 模块 | `CMakeLists.txt`；`.github/workflows/ci.yml` |
 | 4 | 性能 | 网络吞吐/延迟、每连接内存无基准 | `docs/performance.md` §3「未覆盖」清单（95-99） |
 
 **核实中发现的补充事实**（比原始设想更精确，实施时以此为准）：
 
-- `process.hpp` **本体已是双平台实现**（Windows 段 62-298 行，Linux 段 299-422 行），
-  禁用只发生在两处：CMake 变量（根 `CMakeLists.txt:31,46`）和
-  `tests/test_process.cpp:2` 的 `#ifdef _WIN32` 硬守卫（2-115 行包住全部用例）。
-  `examples/process_demo.cpp` **没有任何平台守卫**，只是被 CMake 目标门控。
-  → 0.1 的改动面就是这三处，不涉及 `process.hpp` 本体。
+- `process.hpp` **本体已是双平台实现**；当前 CMake 在 Linux 检测到 io_uring
+  时启用 process，测试守卫也按 `CORO_HAS_URING` 条件编译，示例由能力开关门控。
+  因此 0.1 不再是“解禁代码”的待办，而是应在 GCC/Clang CI 上持续验证的基线。
 - `router::route()` 的静态文件分支**已经异步化**（`router.h:142`
   `co_await coro::fs::read_all`）；web-framework.md 已知限制里「file() 同步读」
   仅剩 `http_response::file()` 工厂函数（`http_types.h:63`）这一处。
 - Web 写回路径：`web_server.cpp:92` `handle_connection` 解析请求 →
   `:148` 附近 `resp.build()` 全量序列化 → 写回。阶段 2.2 的分叉点就在这里。
-- CI 的压测步骤在 `ci.yml:134-137`（Linux, Release only, `./build/coro_stress`），
-  Windows 对应 194-197；`bench_net` 照此模式加行。
-- `docs/performance.md:33-34` 的运行命令写的是 Windows 路径
-  （`build/Release/coro_stress.exe`），补 Linux 基准时顺手修正。
+- CI 的压测步骤位于 `.github/workflows/ci.yml` 的 Linux/Windows Release job；
+  `bench_net` 若加入，应沿用同一 job 结构。
+- `docs/performance.md` 已同时列出 Visual Studio 与 Ninja/Make 的压力测试运行方式。
 
 ---
 
@@ -207,6 +209,10 @@ Windows 版（`net.hpp:127-173`）结构完全相同，只有三处平台差异�
 > **目标**：让 Linux 上 GCC≥13 / Clang 的 CI 矩阵编译并运行 process 用例。
 > **背景**：`process.hpp` 本体已是双平台代码，当初只因 GCC 12 的协程 ICE
 > （结构化绑定 + co_await 编译器内部错误）整体禁用。
+
+> **当前状态（2026-09-21）**：CMake 能力开关和测试条件编译已经在当前代码中
+> 接线；本节剩余价值是核对目标提交的 Linux GCC/Clang CI 结果，不要重复做已落地的
+> CMake/守卫改动。
 
 - [ ] **步骤 1｜确认编译器版本**
 

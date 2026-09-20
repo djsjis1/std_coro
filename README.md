@@ -19,7 +19,9 @@ Linux 的 io_uring 为可选依赖。核心能力：
 - **取消语义**:`cancel()` 注入 `CancelledError`,RAII 清理、循环终止、取消保护全部对标 Python
 - **网络**:TCP(IOCP / io_uring)
 - **IO 扩展**:异步文件 IO / 管道 / 信号 / 目录监视 / 子进程(与网络同一条完成路径)
-- **性能实测**:10 万协程 151ms、yield 160ns、队列 37ns/元素、Scheduler 40 万协程 300ms(热路径零额外堆分配,详见 [docs/performance.md](docs/performance.md))
+- **性能基线**：当前 Windows/IOCP Release 压测中，10 万协程
+  `sleep(1ms)` 约 141ms、400 万次 `yield` 约 807ms、Scheduler 分发 40 万任务约
+  198ms；这些是单机参考值，不是性能保证，详见 [性能指南](docs/performance.md)。
 
 ## 5 秒快速开始
 
@@ -376,37 +378,36 @@ while (有就绪协程 或 定时器 或 活跃协程 或 挂起 I/O) {
 
 ```
 coro/
-├── coro/                  # ★ 独立库包 (可整体复制引入别的项目)
-│   ├── CMakeLists.txt     #   库 CMake (目标名 coro::coro)
-│   └── include/coro/      #   全部头文件 (header-only, 24 个约 8900 行)
+├── include/coro/          # ★ 核心头文件（header-only，24 个）
+├── CMakeLists.txt         # 库目标 coro::coro + 安装导出
 ├── examples/              # 示例
-├── tests/                 # 单元测试 (googletest, 128 用例) + 高并发压测 (stress.cpp)
+├── tests/                 # 单元测试（googletest，当前 24 个测试源）+ 压测
 ├── Web/                   # HTTP 服务器框架 (见 docs/web-framework.md)
 ├── router/                # 独立泛型基数树路由 radix_router<T>
 ├── docs/                  # 文档中心 (docs/README.md 为地图)
 │   ├── tutorial/          #   使用教程 (10 讲)
 │   └── cpp20-coroutines-course/  #   C++20 协程语言课程 (14 讲)
 ├── thirdparty/            # googletest (开发依赖, 库本身零依赖)
-├── main.cpp               # 协程练习场 (改完直接编译运行)
-└── CMakeLists.txt         # 开发仓库根 CMake (examples + tests + Web)
+└── main.cpp               # 协程练习场（改完直接编译运行）
 ```
 
-## 一键引入到你的项目
+## 作为依赖接入
 
-`coro/` 文件夹是**独立可复制的库包**(header-only,零依赖),复制到你的项目后只需两行:
+推荐使用上面的 CMake 安装包方式；开发阶段也可以把本仓库根目录作为子目录引入：
 
 ```bash
-# 1. 复制库文件夹 (或 git submodule / FetchContent)
+# 复制仓库（或用 git submodule / FetchContent 获取）
 cp -r path/to/coro your_project/thirdparty/coro
 ```
 
 ```cmake
-# 2. 你的 CMakeLists.txt
+# 你的 CMakeLists.txt
 add_subdirectory(thirdparty/coro)
 target_link_libraries(your_app PRIVATE coro::coro)
 ```
 
-`coro::coro` 目标自动携带 include 路径、C++20 标准与平台链接库(Windows: ws2_32 / Linux: pthread + 可选 liburing)。
+`coro::coro` 目标自动携带 include 路径、C++20 标准与平台链接库
+（Windows: `ws2_32`；Linux: `pthread`，以及启用 io_uring 时的 `liburing`）。
 
 ## 构建
 
@@ -423,7 +424,7 @@ cmake --build build
 ./build/Debug/example_dir_watch.exe  # 目录监视
 ./build/Debug/example_process.exe    # 子进程
 
-# 单元测试 (128 用例)
+# 单元测试
 ctest --test-dir build -C Debug --output-on-failure
 
 # 高并发压测 (10 万协程 / 400 万 yield / 100 万队列 / 多线程)

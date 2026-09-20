@@ -1,7 +1,8 @@
 # 质量基线与发布说明
 
 本文记录当前代码库的可验证基线，避免把“本机 Debug 通过”误写成跨平台或
-生产环境保证。
+生产环境保证。本文按当前 checkout 更新（2026-09-21）；CI 的实时绿灯状态
+仍以对应的 GitHub Actions 运行记录为准。
 
 ## 当前基线
 
@@ -18,6 +19,17 @@
   超限在增量回调阶段拒绝，而不是先把数据读入内存。
 - 静态目录同时做路径段边界检查、`..`/编码点检查和 canonical path 校验，避免
   `/static-secret` 前缀误匹配以及 symlink 逃逸。
+
+## 当前验证边界
+
+- 本机已验证 Windows/MSVC 的 Debug 与 Release 构建、单元测试、Web 自测、压力测试，
+  以及安装后 `find_package(coro)` 的 package smoke；Release 压测参考值见
+  [性能指南](performance.md)。
+- `.github/workflows/ci.yml` 配置了 Ubuntu 24.04 的 GCC 13/Clang 18、Windows 2022
+  的 Debug/Release、Linux ASan/UBSan/TSan、格式检查、cppcheck、覆盖率和安装包 smoke。
+  这些是门禁配置，不等同于当前提交已经获得所有平台的绿色结果。
+- Linux portable-core 路径应使用 `-DCORO_ENABLE_URING=OFF` 单独验证；该模式不宣称
+  提供依赖 io_uring 的网络、文件、管道、目录监视和进程模块。
 
 ## 构建、测试、安装
 
@@ -54,8 +66,8 @@ accept/read/write；`wait_all()` 随后等待连接协程在各自 worker 上安
 ## 下一批修复路线
 
 1. 现有 Linux CI 配置已安装 liburing，测试源码覆盖 net/fs/pipe/process/fs_watch；
-   CI 另有 `CORO_ENABLE_URING=OFF` 的 portable-core 构建；仍需确认每个提交的
-   GCC/Clang 与 sanitizer 实际结果。
+   CI 另有 `CORO_ENABLE_URING=OFF` 的 portable-core 构建。每次发布仍需保留并核对
+   对应提交的 GCC/Clang 与 sanitizer 实际结果。
 2. inotify 已具备递归目录表、移动 cookie 跨批次关联和新目录动态 watch；
    下一步用 Linux 压力测覆盖 watch 上限、队列溢出与目录树高频移动。
 3. Web 已有活动连接注册表并能在 shutdown 时取消挂起 I/O；可配置超时

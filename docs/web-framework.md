@@ -29,12 +29,12 @@
      radix_router<T> (独立, 零 HTTP 依赖)
 ```
 
-| 组件 | 位置 | 行数 | 可独立使用 |
-|---|---|---|---|
-| `web_server` | `Web/src/web_server.h/.cpp` | 83+228 | 否（依赖 router/http_types） |
-| `router` | `Web/src/router.h` | 234 | 可（header-only） |
-| `http_request/response` | `Web/src/http_types.h/.cpp` | 75+238 | 可 |
-| `radix_router<T>` | `router/radix_router.h` | 473 | **完全独立**（泛型、无 HTTP 概念） |
+| 组件 | 位置 | 可独立使用 |
+|---|---|---|
+| `web_server` | `Web/src/web_server.h/.cpp` | 否（依赖 router/http_types） |
+| `router` | `Web/src/router.h` | 可（header-only） |
+| `http_request/response` | `Web/src/http_types.h/.cpp` | 可 |
+| `radix_router<T>` | `router/radix_router.h` | **完全独立**（泛型、无 HTTP 概念） |
 
 构建：根 CMake 已接好（`add_subdirectory(Web)`，链接 `coro::coro +
 http::http + router::router`）。llhttp 以独立子目录

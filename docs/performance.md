@@ -1,8 +1,9 @@
 # 性能指南
 
 > coro 的性能模型、实测参考数据、压测复现方法与调优建议。
-> 所有数字来自 `tests/stress.cpp`（Release 构建，Windows/IOCP，
-> 具体数值随机器浮动——重要的是数量级与相对关系）。
+> 下表是 `tests/stress.cpp` 在当前开发机上的一次记录（2026-09-21，
+> Windows x64、Release、IOCP）。数字会随 CPU、工具链和后台负载变化，
+> 只能作为复现基线，不是性能保证或 SLA。
 
 ---
 
@@ -13,10 +14,10 @@
 | 操作 | 量级 | 对比 |
 |---|---|---|
 | 创建 + 运行一个协程 | ~百 ns 级（一次堆分配 + 帧初始化） | 线程创建 ~10µs+，差 2~3 个数量级 |
-| `co_await coro::yield()` | ~160 ns | 一次虚函数调用的几倍 |
-| 队列 put/get 吞吐 | ~37 ns/元素 | 接近裸 mutex 队列 |
+| `co_await coro::yield()` | 本次场景约 202 ns/次* | 一次虚函数调用的几倍 |
+| 队列 put/get 吞吐 | 本次约 54 ns/元素* | 接近裸 mutex 队列 |
 | `co_await sleep` 挂起+唤醒 | ~µs 级（定时器堆操作） | 线程 sleep ~10µs+ 系统调用 |
-| 10 万协程同时 sleep(1ms) | ~150 ms 全部完成 | 同规模线程池无法企及 |
+| 10 万协程同时 sleep(1ms) | 本次约 141 ms 全部完成* | 同规模线程池无法企及 |
 | OS 系统调用（IOCP/io_uring） | ~1 µs | IO 的真正成本在这里 |
 | 网络往返（本机） | ~50 µs | 框架开销可忽略 |
 
@@ -31,22 +32,23 @@
 
 ```bash
 cmake --build build --config Release --target coro_stress
-./build/Release/coro_stress.exe
+# Windows (Visual Studio): .\build\Release\coro_stress.exe
+# Linux (Ninja/Make):    ./build/coro_stress
 ```
+| 场景 | 内容 | 本次记录 |
+|---|---|---:|
+| 1 | 10 万协程同时 `sleep(1ms)` | 141 ms |
+| 2 | 10 万定时器（1~10ms 分散 deadline） | 140 ms |
+| 3 | yield 风暴：4 协程 × 100 万次 | 807 ms（400 万次，约 202 ns/次） |
+| 4 | 队列吞吐：100 万 put/get | 54 ms（约 54 ns/元素） |
+| 5 | spawn + await 往返 10 万次 | 76 ms（约 760 ns/次） |
+| 6 | 4 线程 × 10 万协程（独立 loop） | 206 ms |
+| 7 | Scheduler 分发 40 万协程（4 worker） | 198 ms |
+| 8 | Scheduler 均衡性（4000 个短任务） | 13 ms，4 个 worker 各 1000 |
 
-| 场景 | 内容 | 参考结果* | 0.3 优化前* |
-|---|---|---|---|
-| 1 | 10 万协程同时 `sleep(1ms)` | ~150 ms 全部完成 | ~224 ms |
-| 2 | 10 万定时器（1~10ms 分散 deadline） | ~165 ms | ~259 ms |
-| 3 | yield 风暴：4 协程 × 100 万次 | ~160 ns/次 | ~190 ns/次 |
-| 4 | 队列吞吐：100 万 put/get | ~37 ns/元素 | ~39 ns/元素 |
-| 5 | spawn + await 往返 10 万次 | ~670 ns/次 | ~760 ns/次 |
-| 6 | 4 线程 × 10 万协程（独立 loop） | ~250 ms | ~310 ms |
-| 7 | Scheduler 分发 40 万协程（4 worker） | ~300 ms | ~430 ms |
-| 8 | Scheduler 均衡性 | 4 worker 各 ~1000 | 同左 |
-
-\* 开发机参考值（Release，Windows/IOCP）。你机器上的绝对值会不同，
-跑一遍得到自己的基线。
+本次命令为 `cmake --build build --config Release --target coro_stress` 后运行
+`build/Release/coro_stress.exe`。队列的“每元素”按一次 `put` + 一次 `get`
+计算；yield 平均值包含压力测试中的计数开销。请在目标机器上重新运行以建立自己的基线。
 
 场景 8 验证负载均衡：`spawn_any` 按"活跃协程数（主）+ 累计分发数
 （辅）"选 worker，短任务场景退化为 round-robin，四个 worker
@@ -54,7 +56,8 @@ cmake --build build --config Release --target coro_stress
 
 ### 2.1 0.3 版本优化记录（协程创建热路径去堆分配）
 
-上表"0.3 优化前"列是同一台机器上优化前的实测。两处改动：
+以下记录总结了协程创建和组合器热路径的优化方向；不要把旧版本数字当作
+当前版本的回归阈值，回归比较应在同一台机器、同一工具链和同一构建参数下重新测量。
 
 1. **Task 帧存活标志去 `shared_ptr`**：旧版 promise 内嵌
    `shared_ptr<bool> frame_alive_`——每个协程创建一次堆分配 +
@@ -62,7 +65,7 @@ cmake --build build --config Release --target coro_stress
    「`Task::handle_` 非空 ⟺ 帧存活」不变量已由
    `release_handle()` 维持后整体移除
    （详见[架构文档 4.3 节](architecture.md)）。
-   影响所有场景，协程创建密集型（场景 1/2/7）收益最大（-30%+）。
+   影响所有场景，协程创建密集型（场景 1/2/7）最值得重点回归测量。
 2. **组合子去自引用堆分配**：`wait_for` / `wait_any` /
    `gather_all` / `wait_tasks` / `gather_void` / `call_soon` /
    `call_later` / `call_at` 不再为每个 monitor/定时器协程
@@ -76,11 +79,11 @@ cmake --build build --config Release --target coro_stress
    `coroutine_handle` 每个 16 字节块只装 2 个 —— 旧实现每 2 次 push
    一次堆分配; 现在 batch 与 ready_queue_ 经 swap 往复保留容量,
    **稳态调度零堆分配**。影响所有场景, yield 风暴 / 高频 spawn 收益最大。
-2. **Web 层每请求约 -20 次堆分配**：
+2. **Web 层减少请求热路径的临时分配**：
    - 请求头 `std::map` 深拷贝 → 整表 `std::move`（llhttp 在下一条
      message_begin 会清空容器, move 安全）;
    - `http_response::file()` 由 `istreambuf_iterator` 逐字节改为
-     `tellg` 定长 + 单次 `read`（快约一个数量级; 异步路径已用
+     `tellg` 定长 + 单次 `read`（避免逐字节迭代；异步路径已用
      `coro::fs::read_all`）。
 3. **构建默认**：单配置生成器（Ninja/Makefile）默认 Release;
    `web_server` 目标开启 LTCG（header-only 库的跨 TU 内联）。
@@ -218,7 +221,7 @@ coro::EventLoop::current_task();               // 当前协程句柄 (调试器�
 ```
 
 单线程内挂起/恢复**没有任何原子操作与系统调用**（同线程
-`schedule` 不 wake），这就是 ~160ns yield 的来源。跨线程唤醒才
+`schedule` 不 wake），本次压力测试中 yield 平均约 202ns（包含计数开销）。跨线程唤醒才
 涉及 atomic exchange + 一次 PostQueuedCompletionStatus/NOP SQE。
 
 与线程对比：线程切换 ~1-10µs + 缓存污染；协程切换 ~tens of ns +
