@@ -127,7 +127,7 @@ namespace coro {
                     return 1;
 
                 // 没有就绪的 CQE, 带超时等待 (定时器到点 / 新 CQE / 被唤醒)
-                struct __kernel_timespec ts{};
+                struct __kernel_timespec ts {};
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 

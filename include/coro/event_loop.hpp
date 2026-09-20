@@ -361,7 +361,7 @@ namespace coro {
         HandleQueue ready_queue_;                                // 就绪协程 FIFO
         HandleQueue batch_;                                      // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<std::coroutine_handle<>> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_;                         // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
+        mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 
         // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
         // 为什么需要: 同一句柄可能被多个来源同时调度, 例如
