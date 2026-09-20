@@ -5,8 +5,8 @@
 - 绝大多数协程 bug 都是**生命周期**问题：谁持有谁、谁先死、谁还在用已销毁的东西。
 - 四大高危区：悬空引用参数、销毁挂起中的帧、double-resume、异常静默丢失。
 - 调试协程先查三件事：帧是否还活着、句柄是否重复 resume、等待者是否被唤醒。
-- 编译器与 Debug 模式的差异可能掩盖/暴露 bug（MSVC Debug 的 lambda 协程捕获是知名案例）。
-- 最佳实践可以浓缩为：**RAII 持有句柄、移动而非拷贝、fire-and-forget 必须报告异常、用命名函数而非 lambda 协程**。
+- 捕获型协程 lambda 容易把闭包生命周期问题伪装成随机的 Debug/Release 差异。
+- 最佳实践可以浓缩为：**RAII 持有句柄、移动而非拷贝、fire-and-forget 必须报告异常、逃逸任务按值传参**。
 
 ---
 
@@ -57,14 +57,13 @@ void bug() {
 **防御**：
 
 - 析构前检查 `done()` / 帧存活标志（`frame_alive` 模式）
-- 文档明确生命周期契约："Task 必须保持存活直到完成"
-- fire-and-forget 用**自持有**（协程帧持有自己的外壳）：
+- 库必须在 Task 析构时撤销定时器/IO/等待队列登记，或把销毁延迟到已排队句柄被消费
+- fire-and-forget 使用库明确提供的 `detach()`，让协程帧自持有：
 
   ```cpp
   void launch_fire_and_forget() {
-      auto self = std::make_shared<Task<>>();
-      *self = [self]() -> Task<> { co_await do_work(); }();  // 帧持有 self
-      self->start();        // 协程结束前 self 引用计数不归零 → 帧不销毁
+      auto task = spawn(background_work());
+      task.detach(); // final_suspend 负责销毁帧；未处理异常必须上报
   }
   ```
 
@@ -163,35 +162,49 @@ void resume() {
 }
 ```
 
-## 14.7 陷阱七：MSVC Debug 下的 lambda 协程捕获
+## 14.7 陷阱七：捕获型协程 lambda 的闭包生命周期
 
-MSVC **Debug** 模式下，lambda 协程的捕获变量可能不被正确复制进协程帧，挂起恢复后读到错误值（Release 无此问题）：
+协程 lambda 的捕获保存在闭包对象中。调用返回 `Task` 后，协程帧可能继续
+存在，但闭包不会因此延寿。最常见的错误是立即调用一个临时捕获闭包：
 
 ```cpp
-// ❌ Debug 下捕获的 i 可能出错
+// ❌ 每个临时闭包在语句结束时析构，任务恢复后访问 i 是 UAF
 for (int i = 0; i < 3; ++i)
     tasks.push_back([i]() -> Task<int> { co_await sleep(10ms); co_return i; }());
 
-// ✅ 命名函数: 参数进协程帧, 生命周期由标准保证
+// ✅ 无捕获 lambda + 按值参数；参数复制进协程帧
+auto worker = [](int i) -> Task<int> {
+    co_await sleep(10ms);
+    co_return i;
+};
+for (int i = 0; i < 3; ++i)
+    tasks.push_back(worker(i));
+
+// ✅ 命名函数也把参数复制进帧
 Task<int> make_task(int i) { co_await sleep(10ms); co_return i; }
 for (int i = 0; i < 3; ++i)
     tasks.push_back(make_task(i));
 ```
 
-同样，自持有（14.2）也优先用"命名函数 + `shared_ptr` 参数"而非 self-referencing lambda。
+捕获型 lambda 并非禁止使用：如果闭包是命名局部变量，并且作用域确定覆盖
+任务完成，它就是安全的。难以证明生命周期时，优先按值参数或命名函数。
 
-### 陷阱七·补充：`throw` 之后没有 `co_return`
+### 陷阱七·补充：只有 `throw` 的函数不是协程
 
-协程体内用 `throw` 提前结束时，必须在 `throw` 之后补一个 `co_return;`（即使永远执行不到）：
+返回类型是 `Task` 还不够；函数体必须出现至少一个 `co_await`、`co_yield`
+或 `co_return` 才会被编译成协程。只有 `throw` 时，可用不可达的 `co_return`
+明确这一点：
 
 ```cpp
 Task<int> failing() {
     throw std::runtime_error("boom");
-    co_return 0;    // ✅ 必须补上
+    co_return 0;    // 本函数没有其他协程关键字，用它声明协程身份
 }
 ```
 
-实测：MSVC Debug 下缺了这个 `co_return`，异常会**绕过 `unhandled_exception` 直接逃逸**（等待者收不到异常，程序行为像普通函数 throw），GCC/Clang 无此问题。这是编译器对协程状态机"异常路径终止点"的处理差异；补 `co_return` 是零成本的跨编译器防御写法。
+删掉 `co_return` 后它是普通函数，异常会在调用时同步抛出，自然不会经过
+promise 的 `unhandled_exception`。若其他路径已有协程关键字，每个 `throw`
+后都不需要再加 `co_return`。
 
 ## 14.8 陷阱八：递归协程与栈增长
 
@@ -211,8 +224,9 @@ A 同步 resume B → B 同步 resume C → C 同步 resume D → ... 栈越来�
 | 协程体从不执行 | 惰性启动被遗忘 | 检查 `initial_suspend` / 是否 `start()` |
 | 挂起后永远不恢复 | 等待者队列没唤醒它 | 检查唤醒路径是否 `schedule` |
 | 恢复即崩溃 | 帧已销毁 / double-resume | 检查生命周期、析构、取消路径 |
-| 变量值错乱 | Debug 下 lambda 捕获 / 悬空引用 | 换命名函数、按值传参 |
-| 异常消失 | fire-and-forget 未报告 / `throw` 后缺 `co_return` | 检查 `unhandled_exception`、全局回调、补 `co_return` |
+| 变量值错乱 | lambda 闭包已析构 / 悬空引用 | 延长闭包生命周期，或按值传参 |
+| 异常同步逃逸 | 函数体没有协程关键字 | 确认存在 `co_await` / `co_yield` / `co_return` |
+| 异常静默 | fire-and-forget 未报告 | 检查 `unhandled_exception` 与全局回调 |
 | 内存持续增长 | 忘了 destroy 挂起的帧 | 检查 `final_suspend` 后的销毁责任 |
 
 ## 14.10 最佳实践清单
@@ -231,7 +245,7 @@ A 同步 resume B → B 同步 resume C → C 同步 resume D → ... 栈越来�
 8. fire-and-forget 异常必报告，`CancelledError` 单独成类便于过滤。
 
 **编码习惯**
-9. 优先命名函数 + 参数，避免 lambda 协程捕获（尤其 MSVC Debug）。
+9. lambda 协程可以使用；逃逸任务优先无捕获 lambda + 参数或命名函数。
 10. 引用参数想清楚生命周期；拿不准就按值。
 11. 挂起前的清理用作用域块，挂起后的状态假设全部失效。
 

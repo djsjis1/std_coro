@@ -1,10 +1,15 @@
 #pragma once
 
 #include "event_loop.hpp"
+#include "exceptions.hpp"
 
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <atomic>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // ============================================================================
@@ -51,7 +56,8 @@
 //   Promise 和 Future 通过 shared_ptr<SharedState> 共享状态。
 //   这解决了生命周期问题:
 //     - Future 可以在设置值之前或之后被 co_await
-//     - Promise 析构后 Future 仍然可以读取结果
+//     - Promise 正常完成后即使析构, Future 仍然可以读取结果
+//     - Promise 未完成就析构时, Future 收到 BrokenPromiseError, 不会永久挂起
 //     - 多个 Future 可以从同一个 Promise 创建 (共享同一个 SharedState)
 //
 //   await_ready() 检查:
@@ -87,16 +93,31 @@ namespace coro {
       public:
         Promise() : state_(std::make_shared<SharedState>()) {}
 
+        ~Promise() { abandon_pending(); }
+
+        Promise(Promise&& other) noexcept : state_(std::move(other.state_)) {}
+        Promise& operator=(Promise&& other) noexcept {
+            if (this != &other) {
+                abandon_pending();
+                state_ = std::move(other.state_);
+            }
+            return *this;
+        }
+
+        Promise(const Promise&) = delete;
+        Promise& operator=(const Promise&) = delete;
+
         /// 创建关联的 Future (可多次调用, 返回多个 Future 共享同一状态)
         Future<T> get_future();
 
         /// 设置成功值, 并唤醒所有等待中的 Future
         void set_value(T value) {
+            require_state();
             {
                 std::lock_guard lock(state_->mtx);
                 if (state_->ready)
                     throw std::logic_error("Promise: result already set");
-                state_->result = std::move(value);
+                state_->result.emplace(std::move(value));
                 state_->ready = true;
             }
             notify();
@@ -105,6 +126,9 @@ namespace coro {
         /// 设置异常, 并唤醒所有等待中的 Future
         /// await_resume() 会重新抛出此异常
         void set_exception(std::exception_ptr e) {
+            require_state();
+            if (!e)
+                throw std::invalid_argument("Promise: exception must not be null");
             {
                 std::lock_guard lock(state_->mtx);
                 if (state_->ready)
@@ -117,6 +141,8 @@ namespace coro {
 
         /// 是否已完成
         bool is_done() const noexcept {
+            if (!state_)
+                return false;
             std::lock_guard lock(state_->mtx);
             return state_->ready;
         }
@@ -132,20 +158,41 @@ namespace coro {
             EventLoop* loop; // 挂起时所在的事件循环 (跨线程唤醒路由)
         };
 
-        /// 通知等待者: 交换出所有等待协程并在锁外逐个调度。
-        /// 跨线程 set_value 时, 每个等待者调度回「自己挂起时所在的 loop」。
+        /// 通知等待者。
+        ///
+        /// 这里故意在 state mutex 保护下完成“标记已领取 + schedule”这两个
+        /// 动作。若先把 waiter swap 出锁再 schedule，等待者可能在这段窗口
+        /// 被取消并销毁，随后通知线程会调度悬空 coroutine_handle。
         void notify() {
-            std::vector<Waiter> waiters;
-            {
-                std::lock_guard lock(state_->mtx);
-                waiters.swap(state_->waiters);
-            }
-            for (auto& w : waiters) {
+            std::lock_guard lock(state_->mtx);
+            for (auto& w : state_->waiters) {
                 if (w.loop)
                     w.loop->schedule(w.handle);
                 else
                     EventLoop::get().schedule(w.handle);
             }
+            state_->waiters.clear();
+        }
+
+        void require_state() const {
+            if (!state_)
+                throw std::logic_error("Promise: operation on moved-from promise");
+        }
+
+        void abandon_pending() noexcept {
+            if (!state_)
+                return;
+            bool notify_waiters = false;
+            {
+                std::lock_guard lock(state_->mtx);
+                if (!state_->ready) {
+                    state_->exception = std::make_exception_ptr(BrokenPromiseError{});
+                    state_->ready = true;
+                    notify_waiters = true;
+                }
+            }
+            if (notify_waiters)
+                notify();
         }
 
         /// 共享状态 — Promise 和 Future 通过 shared_ptr 共享
@@ -156,6 +203,7 @@ namespace coro {
             std::exception_ptr exception; // 异常 (如果有)
             std::vector<Waiter> waiters;  // 等待此 Future 的协程 (多个, 各带自己的 loop)
             bool ready = false;           // 是否已完成
+            bool consumed = false;        // move-only T 的单消费者保护
         };
 
         std::shared_ptr<SharedState> state_;
@@ -177,13 +225,17 @@ namespace coro {
         // ---- Awaitable 接口 ----
 
         /// 如果值已经设置, 直接取结果, 不需要挂起
-        bool await_ready() const noexcept {
+        bool await_ready() const {
+            if (!state_)
+                throw std::logic_error("Future: await on invalid future");
             std::lock_guard lock(state_->mtx);
             return state_->ready;
         }
 
         /// 挂起当前协程: 记录到等待者列表 (带自己的 loop), 等待 Promise 通知
         void await_suspend(std::coroutine_handle<> h) {
+            if (!state_)
+                throw std::logic_error("Future: await on invalid future");
             bool already_ready = false;
             {
                 std::lock_guard lock(state_->mtx);
@@ -200,19 +252,34 @@ namespace coro {
                 EventLoop::get().schedule(h);
         }
 
-        /// 获取结果: 如果有异常则重新抛出
+        /// 获取结果: 如果有异常则重新抛出; 多等待者安全 (拷贝语义)
         T await_resume() {
+            if (!state_)
+                throw std::logic_error("Future: resume on invalid future");
             std::lock_guard lock(state_->mtx);
             if (state_->exception) {
                 std::rethrow_exception(state_->exception);
             }
-            return std::move(*state_->result);
+            if constexpr (std::is_copy_constructible_v<T>) {
+                return *state_->result; // copyable T 支持多个等待者
+            } else {
+                if (state_->consumed)
+                    throw std::logic_error("Future: move-only result already consumed");
+                state_->consumed = true;
+                return std::move(*state_->result); // move-only T 只允许一个消费者
+            }
         }
 
         /// 等待者协程帧被销毁时, 从等待列表中摘除自己
         void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+            if (!state_)
+                return;
             std::lock_guard lock(state_->mtx);
-            std::erase_if(state_->waiters, [h](const typename Promise<T>::Waiter& w) { return w.handle == h; });
+            std::erase_if(state_->waiters, [h](typename Promise<T>::Waiter& w) {
+                if (w.handle != h)
+                    return false;
+                return true;
+            });
         }
 
       private:
@@ -221,6 +288,7 @@ namespace coro {
 
     // 分离定义: get_future 需要在 Future<T> 完整定义之后
     template <typename T> Future<T> Promise<T>::get_future() {
+        require_state();
         return Future<T>(state_);
     }
 
@@ -237,9 +305,24 @@ namespace coro {
       public:
         Promise() : state_(std::make_shared<SharedState>()) {}
 
+        ~Promise() { abandon_pending(); }
+
+        Promise(Promise&& other) noexcept : state_(std::move(other.state_)) {}
+        Promise& operator=(Promise&& other) noexcept {
+            if (this != &other) {
+                abandon_pending();
+                state_ = std::move(other.state_);
+            }
+            return *this;
+        }
+
+        Promise(const Promise&) = delete;
+        Promise& operator=(const Promise&) = delete;
+
         Future<void> get_future();
 
         void set_value() {
+            require_state();
             {
                 std::lock_guard lock(state_->mtx);
                 if (state_->ready)
@@ -251,6 +334,9 @@ namespace coro {
         }
 
         void set_exception(std::exception_ptr e) {
+            require_state();
+            if (!e)
+                throw std::invalid_argument("Promise<void>: exception must not be null");
             {
                 std::lock_guard lock(state_->mtx);
                 if (state_->ready)
@@ -262,6 +348,8 @@ namespace coro {
         }
 
         bool is_done() const noexcept {
+            if (!state_)
+                return false;
             std::lock_guard lock(state_->mtx);
             return state_->ready;
         }
@@ -274,17 +362,35 @@ namespace coro {
         };
 
         void notify() {
-            std::vector<Waiter> waiters;
-            {
-                std::lock_guard lock(state_->mtx);
-                waiters.swap(state_->waiters);
-            }
-            for (auto& w : waiters) {
+            std::lock_guard lock(state_->mtx);
+            for (auto& w : state_->waiters) {
                 if (w.loop)
                     w.loop->schedule(w.handle);
                 else
                     EventLoop::get().schedule(w.handle);
             }
+            state_->waiters.clear();
+        }
+
+        void require_state() const {
+            if (!state_)
+                throw std::logic_error("Promise<void>: operation on moved-from promise");
+        }
+
+        void abandon_pending() noexcept {
+            if (!state_)
+                return;
+            bool notify_waiters = false;
+            {
+                std::lock_guard lock(state_->mtx);
+                if (!state_->ready) {
+                    state_->exception = std::make_exception_ptr(BrokenPromiseError{});
+                    state_->ready = true;
+                    notify_waiters = true;
+                }
+            }
+            if (notify_waiters)
+                notify();
         }
 
         struct SharedState {
@@ -308,12 +414,16 @@ namespace coro {
         /// 是否关联了共享状态
         bool valid() const noexcept { return state_ != nullptr; }
 
-        bool await_ready() const noexcept {
+        bool await_ready() const {
+            if (!state_)
+                throw std::logic_error("Future<void>: await on invalid future");
             std::lock_guard lock(state_->mtx);
             return state_->ready;
         }
 
         void await_suspend(std::coroutine_handle<> h) {
+            if (!state_)
+                throw std::logic_error("Future<void>: await on invalid future");
             bool already_ready = false;
             {
                 std::lock_guard lock(state_->mtx);
@@ -330,6 +440,8 @@ namespace coro {
         }
 
         void await_resume() {
+            if (!state_)
+                throw std::logic_error("Future<void>: resume on invalid future");
             std::lock_guard lock(state_->mtx);
             if (state_->exception) {
                 std::rethrow_exception(state_->exception);
@@ -338,8 +450,14 @@ namespace coro {
 
         /// 等待者协程帧被销毁时, 从等待列表中摘除自己
         void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+            if (!state_)
+                return;
             std::lock_guard lock(state_->mtx);
-            std::erase_if(state_->waiters, [h](const typename Promise<void>::Waiter& w) { return w.handle == h; });
+            std::erase_if(state_->waiters, [h](typename Promise<void>::Waiter& w) {
+                if (w.handle != h)
+                    return false;
+                return true;
+            });
         }
 
       private:
@@ -347,6 +465,7 @@ namespace coro {
     };
 
     inline Future<void> Promise<void>::get_future() {
+        require_state();
         return Future<void>(state_);
     }
 

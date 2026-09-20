@@ -5,10 +5,11 @@
 #include <coro/coro.hpp>
 
 #include <chrono>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
-#include <functional>
 
 using namespace std::chrono_literals;
 
@@ -63,16 +64,18 @@ coro::Task<std::string> download_async(AsyncDownloader& dl, const std::string& u
 
 // ---- 用 Promise/Future + spawn 实现延迟计算 ----
 // Promise 被移入后台协程 (通过 shared_ptr), 在延迟后完成
+coro::Task<> complete_later(std::shared_ptr<coro::Promise<int>> promise, int value, int delay_ms) {
+    co_await coro::sleep(std::chrono::milliseconds(delay_ms));
+    promise->set_value(value * 10);
+}
+
 coro::Task<int> delayed_compute(int value, int delay_ms) {
     auto promise = std::make_shared<coro::Promise<int>>();
     auto future = promise->get_future();
 
     // spawn 一个后台协程, 在 delay_ms 后完成 Promise
     // 注意: 必须保存 spawn 的返回值, 否则协程会被立即销毁
-    auto bg = coro::spawn([promise, value, delay_ms]() -> coro::Task<> {
-        co_await coro::sleep(std::chrono::milliseconds(delay_ms));
-        promise->set_value(value * 10);
-    }());
+    auto bg = coro::spawn(complete_later(promise, value, delay_ms));
 
     co_return co_await future;
     // bg 在 delayed_compute 协程帧中保持存活, 直到此处析构

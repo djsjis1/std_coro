@@ -1,5 +1,5 @@
 // test_fs_watch.cpp — 目录监视: 创建/修改/重命名/删除 事件
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -8,21 +8,33 @@
 
 #include "test_util.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace std::chrono_literals;
 
 namespace {
 
     std::string make_watch_dir() {
-        const char* tmp = std::getenv("TEMP");
-        if (!tmp)
-            tmp = std::getenv("TMPDIR");
-        std::string dir = (tmp ? tmp : ".");
-        dir += "/coro_watch_test";
+        static std::atomic<unsigned> sequence{0};
+#ifdef _WIN32
+        const auto pid = _getpid();
+#else
+        const auto pid = getpid();
+#endif
+        const auto dir = (std::filesystem::temp_directory_path() /
+                          ("coro_watch_test_" + std::to_string(pid) + "_" + std::to_string(sequence.fetch_add(1))))
+                             .string();
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
         return dir;
@@ -67,6 +79,46 @@ namespace {
         std::filesystem::remove_all(dir);
     }
 
+    coro::Task<> collect_recursive(coro::fs::DirectoryWatcher* w, std::vector<coro::fs::watch_event>* out) {
+        bool saw_renamed_child = false;
+        bool saw_dynamic_child = false;
+        while (!saw_renamed_child || !saw_dynamic_child) {
+            try {
+                auto ev = co_await coro::wait_for(w->next(), 3s);
+                if (ev.path == "renamed/after.txt")
+                    saw_renamed_child = true;
+                if (ev.path == "dynamic/new.txt")
+                    saw_dynamic_child = true;
+                out->push_back(std::move(ev));
+            } catch (const coro::TimeoutError&) {
+                co_return;
+            }
+        }
+    }
+
+    coro::Task<> recursive_watch_case(std::vector<coro::fs::watch_event>* out) {
+        std::string dir = make_watch_dir();
+        std::filesystem::create_directories(dir + "/existing");
+        auto w = co_await coro::fs::watch(dir, /*recursive=*/true);
+        if (!w.valid())
+            co_return;
+
+        auto collector = coro::spawn(collect_recursive(&w, out));
+        co_await coro::sleep(100ms);
+        co_await coro::fs::write_all(dir + "/existing/seed.txt", "seed");
+        co_await coro::sleep(100ms);
+        co_await coro::to_thread([&dir] { std::filesystem::rename(dir + "/existing", dir + "/renamed"); });
+        co_await coro::sleep(100ms);
+        co_await coro::fs::write_all(dir + "/renamed/after.txt", "after rename");
+        co_await coro::sleep(100ms);
+        co_await coro::to_thread([&dir] { std::filesystem::create_directories(dir + "/dynamic"); });
+        co_await coro::sleep(150ms); // 让 Linux collector 先处理 IN_CREATE 并添加子 watch
+        co_await coro::fs::write_all(dir + "/dynamic/new.txt", "dynamic");
+        co_await std::move(collector);
+        w.close();
+        std::filesystem::remove_all(dir);
+    }
+
 } // namespace
 
 TEST(FsWatchTest, CreateModifyRenameRemoveEvents) {
@@ -94,5 +146,16 @@ TEST(FsWatchTest, CreateModifyRenameRemoveEvents) {
     EXPECT_TRUE(saw_rename) << "未见 a.txt→b.txt 的重命名事件";
     // 删除 b.txt
     EXPECT_TRUE(has(coro::fs::watch_event_type::removed, "b.txt")) << "未见 b.txt 的删除事件";
+}
+
+TEST(FsWatchTest, RecursiveTracksExistingRenamedAndNewDirectories) {
+    std::vector<coro::fs::watch_event> events;
+    test_util::run_task([&] { return recursive_watch_case(&events); });
+
+    auto has_path = [&](const char* path) {
+        return std::any_of(events.begin(), events.end(), [&](const auto& event) { return event.path == path; });
+    };
+    EXPECT_TRUE(has_path("renamed/after.txt")) << "重命名子目录的 watch 映射未更新";
+    EXPECT_TRUE(has_path("dynamic/new.txt")) << "新建子目录未动态加入递归监视";
 }
 #endif // _WIN32 || __linux__

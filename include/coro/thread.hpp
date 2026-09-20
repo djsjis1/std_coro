@@ -105,7 +105,7 @@ namespace coro {
         }
 
         // ==================================================================
-        // to_thread_impl — 命名协程函数 (参数进帧, MSVC Debug 安全):
+        // to_thread_impl — 命名协程函数 (参数进帧, 不依赖调用方闭包生命周期):
         // 挂起等待 Future, 工作线程完成后恢复并转发结果
         // ==================================================================
         template <typename R> Task<R> to_thread_impl(std::shared_ptr<Promise<R>> promise) {

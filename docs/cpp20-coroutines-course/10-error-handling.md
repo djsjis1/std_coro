@@ -172,18 +172,21 @@ void unhandled_exception() {}     // ❌ 异常静默消失
 
 `gather` 抛了第一个异常，但其它任务可能半途而废——调用者 catch 之后不能假设整体状态一致（要么全部完成，要么明确文档"其他任务继续运行"）。
 
-### 错误四：`throw` 之后没有 `co_return`
+### 错误四：函数体没有任何协程关键字
 
-协程体内用 `throw` 提前结束时，**必须**在 `throw` 之后补一个 `co_return;`：
+返回类型写成 `Task` 并不会自动让函数成为协程；函数体必须出现 `co_await`、
+`co_yield` 或 `co_return`。下面的函数如果删掉 `co_return`，就只是一个返回
+`Task<int>` 的普通函数，`throw` 会在调用时同步逃逸：
 
 ```cpp
 Task<int> failing() {
     throw std::runtime_error("boom");
-    co_return 0;    // ✅ 需要补上 (即使永远执行不到)
+    co_return 0;    // 让这个只有 throw 的函数被识别为协程
 }
 ```
 
-实测：MSVC Debug 下若缺少该 `co_return`，异常会**绕过 `unhandled_exception` 直接逃逸**（协程体异常像普通函数一样传播，等待者收不到），GCC/Clang 则无此问题。这是编译器对协程状态机"异常路径的终止点"的处理差异，补一个 `co_return` 是零成本且跨编译器的防御性写法。
+若函数的其他路径已经有协程关键字，`throw` 本身会正常进入
+`promise_type::unhandled_exception`，不需要在每个 `throw` 后再补不可达语句。
 
 ## 10.7 完整示例：异常穿过挂起
 
@@ -232,8 +235,7 @@ Task failing() {
     struct Guard { ~Guard() { std::cout << "  [Guard] 析构 (清理执行了)\n"; } } g;
     std::cout << "  [协程] 即将抛异常\n";
     throw std::runtime_error("boom");
-    co_return;   // 注意: throw 之后要补 co_return!
-                 // MSVC Debug 下缺了它, 异常会绕过 unhandled_exception 直接逃逸 (见 10.6)
+    co_return;   // 本例没有其他协程关键字；用它把 failing 定义成协程
 }
 
 int main() {

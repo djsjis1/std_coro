@@ -65,7 +65,7 @@ coro::Task<> fetch_all() {
 **awaiter 三件套**（`co_await` 任意实现这三者的对象）：
 
 ```cpp
-struct Aw { 
+struct Aw {
     bool await_ready();                       // ① 好了没？true 则不挂起
     void await_suspend(coroutine_handle<> h); // ② 挂起，拿到"被挂起协程"的句柄
     void await_resume();                      // ③ 恢复后取结果
@@ -248,7 +248,7 @@ int v = co_await coro::to_thread([] { return blocking_read(); });
 ## 七、同步原语与队列
 
 ```cpp
-coro::Lock lock;                 // 互斥锁（FIFO 公平，非递归）
+coro::Lock lock;                 // 互斥锁（FIFO 公平，支持递归获取）
 co_await lock.acquire();
 /* 临界区 */
 lock.release();
@@ -425,11 +425,14 @@ coro::Task<> demo() {
     auto [rd, wr] = coro::pipe::pair();          // {读端, 写端}, 默认 64KB 缓冲
 
     // 典型分工: 写端在任意协程, 读端并发消费
-    auto producer = coro::spawn([]() -> coro::Task<> {
+    // 捕获型协程 lambda 可以使用；这里 producer_fn 的闭包一直活到
+    // producer 被 await 完成，因此对 wr 的引用有效。
+    auto producer_fn = [&wr]() -> coro::Task<> {
         for (int i = 0; i < 1000; i++)
             co_await wr.write("chunk;", 6);
         wr.close();                               // 写完关闭 → 读者收到 EOF
-    }());
+    };
+    auto producer = coro::spawn(producer_fn());
 
     char buf[4096];
     while (true) {
@@ -482,7 +485,8 @@ coro::run([&](web_server& s) -> coro::Task<> {
 
 平台说明: Windows 无真信号 —— 控制台事件 (Ctrl+C/Ctrl+Break/关窗) 与
 CRT `raise()` 双路桥接; SIGHUP 仅来自「控制台窗口关闭」事件, 无法经
-`raise()` 触发。Linux 用 signalfd + io_uring, 信号在首次 wait 时阻塞。
+`raise()` 触发。Linux 用 `sigaction + self-pipe + reader 线程`，
+处理器只写管道，reader 再将通知路由到注册时的事件循环。
 
 ### 10.4 目录监视 — coro::fs::watch
 
@@ -490,6 +494,7 @@ CRT `raise()` 双路桥接; SIGHUP 仅来自「控制台窗口关闭」事件, �
 
 ```cpp
 coro::Task<> demo() {
+    // Windows 和 Linux 都支持递归子目录
     auto w = co_await coro::fs::watch("src", /*recursive=*/true);
     while (true) {
         coro::fs::watch_event ev = co_await w.next();   // 挂起到下一个事件
@@ -509,7 +514,7 @@ coro::Task<> demo() {
 
 注意: 「修改」的粒度由内核决定 (编辑器保存常触发多条 created/modified),
 需要去抖请在应用层收集同路径事件 (如 100ms 窗口)。Windows 用
-`ReadDirectoryChangesW` (原生递归), Linux 用 inotify (递归为根目录级)。
+`ReadDirectoryChangesW` 原生递归；Linux 用 inotify 的 wd 映射跟踪整棵目录树。
 
 ### 10.5 子进程 — coro::process
 
@@ -561,16 +566,16 @@ coro::call_at(deadline, callback);   // 指定时间点
 
 | 规则 | 说明 |
 |---|---|
-| **Task 必须保持存活** | 协程完成前销毁 Task = 销毁帧 → UB |
-| **spawn 返回值要保存** | 丢弃返回值协程立即被销毁 |
+| **Task 所有权** | 协程完成前销毁 Task 会安全终止/放弃该任务；若要继续运行，必须持有 Task 或 `detach()` |
+| **spawn 返回值要保存** | 丢弃返回值会终止任务，不会形成后台任务 |
 | **fire-and-forget** | `start()` 后 `detach()`，协程帧自持有运行到完成（见网络示例）；异常会打印警告。需后续 `cancel()` 则自己持有 Task（成员/`shared_ptr`），不要 detach |
 | **单线程模型** | 不要在多线程同时 resume 同一协程 |
 | **嵌套 run() 不支持** | 运行中再次 `run()` 直接返回 |
-| **MSVC Debug lambda 协程** | 用命名函数 + 参数传递代替 lambda 捕获（Debug 下捕获变量可能错乱） |
+| **lambda 协程** | 支持；捕获属于闭包，闭包必须活到任务结束；逃逸任务优先用按值参数 |
 
 其余经典坑：
 
-1. **悬垂句柄**：协程还挂着，外壳 Task 已析构 → 后台 resume 已销毁帧 → UB
+1. **悬垂外部对象**：协程参数/捕获引用的对象先析构，恢复后访问会产生 UB
 2. **final_suspend 忘挂起**：`suspend_never` 结束后帧自动销毁，再碰句柄即 UB
 3. **重复 destroy**：拷贝被禁止就是为了防双重释放
 
@@ -646,17 +651,18 @@ sched.wait_all();                                   // 阻塞直到全部完成
 
 ## 十五、已知限制
 
-- **网络仅 TCP**：无 UDP、Unix socket、TLS、DNS 解析
+- **网络协议范围**：已有 TCP/UDP；尚无 Unix socket、TLS 和域名解析
 - **文件 IO（Windows）**：`fs::open`/`stat` 是同步调用（元数据操作，微秒级）；
   读写/刷盘全异步。Linux 上 open 走 io_uring 全异步
-- **`fs::watch`（Linux）**：递归监视目前只挂根目录 inotify watch，
-  子目录动态跟踪待补；Windows 原生递归完整
+- **`fs::watch`（Linux）**：递归模式依赖每个子目录的 inotify watch，受
+  `/proc/sys/fs/inotify/max_user_watches` 限制；收到 `overflow` 后应全量扫描兜底
 - **信号（Windows）**：无真信号，控制台事件桥接（SIGINT/SIGBREAK/SIGHUP 关窗/
   SIGTERM 注销）；SIGHUP 无法经 `raise()` 触发
 - **子进程**：Windows 侧 stdio 用命名管道（匿名管道不支持 OVERLAPPED），
-  `bInheritHandles=TRUE` 继承（与多数程序兼容，极端句柄泄漏场景注意）
+  通过 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 仅继承 stdin/stdout/stderr 白名单
 - **`gather` 为编译期数量**：动态数量用 `gather_all` / `wait_tasks`（仅同类型）
-- **`wait_any` 仅两路**：N 路竞速用 `wait_tasks(..., WaitMode::FirstCompleted)`
+- **`wait_any`**：支持两路和动态 N 路；需要完成任务集合分组时使用
+  `wait_tasks(..., WaitMode::FirstCompleted)`
 - **`gather_void` 传播第一个异常**（全部完成后，对标 `asyncio.gather` 语义）
 - **TaskGroup 的 `spawn` 不返回句柄**：子任务效果通过参数/共享状态传递
 - **`Condition` 需显式关联 `Lock`**：不自动创建锁（asyncio 默认自建）

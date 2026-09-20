@@ -5,7 +5,7 @@
 
 #ifdef _WIN32
 // windows.h 已由 io.hpp 引入
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -56,9 +56,13 @@ namespace coro {
 
             /// 接管已打开的 OVERLAPPED 管道句柄并关联当前 loop 的 IOCP
             explicit PipeEnd(HANDLE h) : handle_(h) {
-                if (valid())
-                    if (auto* iocp = EventLoop::get().iocp())
-                        iocp->associate(handle_);
+                if (valid()) {
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp || !iocp->associate(handle_)) {
+                        io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
+                        close();
+                    }
+                }
             }
 
             ~PipeEnd() { close(); }
@@ -98,6 +102,12 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp) {
+                        op.error = ERROR_NOT_SUPPORTED;
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     // 管道是流式设备: OVERLAPPED 偏移字段被忽略
                     op.ov.Offset = 0;
                     op.ov.OffsetHigh = 0;
@@ -107,8 +117,7 @@ namespace coro {
                         op.error = GetLastError();
                         EventLoop::get().schedule(h);
                     } else {
-                        if (auto* iocp = EventLoop::get().iocp())
-                            iocp->op_start();
+                        iocp->op_start();
                     }
                 }
 
@@ -147,6 +156,12 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp) {
+                        op.error = ERROR_NOT_SUPPORTED;
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     op.ov.Offset = 0;
                     op.ov.OffsetHigh = 0;
                     DWORD put = 0;
@@ -156,8 +171,7 @@ namespace coro {
                         EventLoop::get().schedule(h);
                     } else {
                         // 缓冲区满时挂起, 读端腾出空间后完成 (背压)
-                        if (auto* iocp = EventLoop::get().iocp())
-                            iocp->op_start();
+                        iocp->op_start();
                     }
                 }
 
@@ -233,7 +247,7 @@ namespace coro {
             return {PipeEnd(server), PipeEnd(client)};
         }
 
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
 
         // ==================================================================
         // Linux 实现 — pipe2 + io_uring
@@ -404,7 +418,7 @@ namespace coro {
 
     } // namespace pipe
 
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
 
     // ======================================================================
     // coro::io::poll — fd 就绪轮询 (仅 Linux; Windows socket 是完成制, 无此概念)
@@ -469,6 +483,6 @@ namespace coro {
         }
     } // namespace io
 
-#endif // __linux__
+#endif // CORO_URING_ENABLED
 
 } // namespace coro

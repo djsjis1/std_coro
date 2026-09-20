@@ -1,7 +1,7 @@
 # coro 文档中心
 
 > C++20 协程事件循环框架 — 类似 Python asyncio 的使用体验。
-> header-only、零第三方依赖、Windows IOCP / Linux io_uring 零配置。
+> 核心库 header-only；Windows 使用 IOCP，Linux 使用 io_uring（需要系统提供 liburing）。
 
 这里是 coro 项目的完整文档地图。按你的目标选择入口：
 
@@ -16,6 +16,7 @@
 | 部署 HTTP 服务 | [Web 框架指南](web-framework.md) |
 | 性能调优 / 压测 | [性能指南](performance.md) |
 | 排查问题 | [FAQ 与故障排查](faq.md) |
+| 查看可验证质量基线 / 安装方式 | [质量基线与发布说明](quality-status.md) |
 | 了解后续计划 / 参与开发 | [路线图](roadmap.md) |
 
 ---
@@ -63,7 +64,7 @@
 ### 帮助
 
 - **[FAQ 与故障排查](faq.md)** — 按症状索引：编译错误、链接错误、运行时挂死、UB 崩溃、
-  MSVC Debug 特有问题、跨线程问题。
+  协程闭包生命周期、跨线程问题。
 - **[已知限制](#)** — 见 [coro-guide.md 第十五节](coro-guide.md#十五已知限制)。
 
 ---
@@ -72,9 +73,8 @@
 
 ```
 coro/                     # 项目根
-├── coro/                 # ★ 库本体（header-only，可整体复制到别的项目）
-│   ├── CMakeLists.txt    #   库目标 coro::coro
-│   └── include/coro/     #   24 个头文件（核心 14 + IO 6 + 平台事件源 2 + 总入口等）
+├── include/coro/         # ★ 库本体（header-only，可整体复制到别的项目）
+├── CMakeLists.txt        #   库目标 coro::coro + 安装导出
 ├── examples/             # 8 个可运行示例
 ├── tests/                # googletest 单元测试（22 个文件）+ 高并发压测 stress.cpp
 ├── Web/                  # HTTP 服务器框架（llhttp 解析 + 路由 + 多线程 worker）

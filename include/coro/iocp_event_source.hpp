@@ -66,13 +66,20 @@ namespace coro {
                     CloseHandle(iocp_);
             }
 
+            /// IOCP creation can fail under resource pressure or a restricted
+            /// process token. EventLoop uses this to fall back to CVEventSource
+            /// instead of later passing a null handle to GQCS.
+            bool valid() const noexcept { return iocp_ != nullptr; }
+
             /// 将 socket 关联到完成端口 (之后其异步操作都投递到此端口)
-            void associate(SOCKET s) { CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), iocp_, 0, 0); }
+            bool associate(SOCKET s) {
+                return iocp_ && CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), iocp_, 0, 0) != nullptr;
+            }
 
             /// 将任意句柄关联到完成端口: 文件 (FILE_FLAG_OVERLAPPED)、
             /// 命名管道、目录句柄 (FILE_FLAG_BACKUP_SEMANTICS) 等。
             /// fs / pipe / fs_watch 模块共用本入口。
-            void associate(HANDLE h) { CreateIoCompletionPort(h, iocp_, 0, 0); }
+            bool associate(HANDLE h) { return iocp_ && CreateIoCompletionPort(h, iocp_, 0, 0) != nullptr; }
 
             /// 标记一个异步操作开始 (提交 WSA_IO_PENDING 后调用)
             void op_start() { ++pending_ops_; }

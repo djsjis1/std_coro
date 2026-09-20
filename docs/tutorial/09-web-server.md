@@ -127,6 +127,7 @@ worker × N  每连接一个协程: llhttp 增量解析 → 路由 → handler �
 - handler 抛异常 → 统一兜底 500（不会打崩 worker）；
 - worker 内单线程语义：同一连接的状态无需加锁；
 - 默认消息体上限 8MB（`server.set_max_body()` 可调）；
+- 默认读空闲/单请求/响应写入超时均为 30s（`set_*_timeout()` 可调，`0ms` 关闭）；
 - `set_verbose(true)` 打开访问日志。
 
 ## 9.6 优雅停机（把第 7 讲的信号用上）

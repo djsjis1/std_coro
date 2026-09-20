@@ -1,7 +1,7 @@
 // process_demo.cpp — coro::process 子进程示例
 //
 // 演示: 捕获 stdout / 退出码 / 并发多进程 / stdin 写入
-// 构建运行: ./build/Release/example_process.exe
+// 构建运行: Windows build/Release/example_process.exe；Linux ./build/example_process
 
 #include <coro/coro.hpp>
 #include <coro/process.hpp>
@@ -11,19 +11,31 @@
 
 // ── 1. 捕获输出 ──
 coro::Task<> run_and_capture() {
+#ifdef _WIN32
     auto [code, out] = co_await coro::process::run_capture({"cmd", "/c", "echo hello from subprocess"});
+#else
+    auto [code, out] = co_await coro::process::run_capture({"sh", "-c", "echo hello from subprocess"});
+#endif
     std::printf("[1] exit=%d stdout=%.*s", code, (int)out.size(), out.c_str());
 }
 
 // ── 2. 退出码 ──
 coro::Task<int> exit_code(int v) {
+#ifdef _WIN32
     auto p = co_await coro::process::spawn({"cmd", "/c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+#else
+    auto p = co_await coro::process::spawn({"sh", "-c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+#endif
     co_return co_await p.wait();
 }
 
 // ── 3. stdin 交互: 管道写入 + 读取回显 ──
 coro::Task<> stdin_roundtrip() {
+#ifdef _WIN32
     auto p = co_await coro::process::spawn({"cmd", "/c", "findstr x"}, {.capture_stdin = true, .capture_stdout = true});
+#else
+    auto p = co_await coro::process::spawn({"grep", "x"}, {.capture_stdin = true, .capture_stdout = true});
+#endif
     if (!p.valid()) {
         std::printf("[3] spawn failed: %d\n", coro::io::last_error());
         co_return;

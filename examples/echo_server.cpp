@@ -19,7 +19,6 @@
 
 #include <iostream>
 #include <string>
-#include <memory>
 
 using namespace std::chrono_literals;
 
@@ -82,9 +81,7 @@ coro::Task<> main_task() {
     std::cout << "[server] listening on 127.0.0.1:8888" << std::endl;
 
     // 并发: 客户端连接 + 服务器 accept
-    auto client_task = std::make_shared<coro::Task<void>>();
-    *client_task = []() -> coro::Task<void> { co_await client(); }();
-    client_task->start();
+    auto client_task = coro::spawn(client());
 
     std::cout << "[server] waiting for connection..." << std::endl;
     auto conn = co_await listener.accept();
@@ -98,7 +95,7 @@ coro::Task<> main_task() {
     co_await echo_handler(std::move(conn));
 
     // 等客户端完成
-    co_await std::move(*client_task);
+    co_await std::move(client_task);
 
     std::cout << "=== Echo test done ===" << std::endl;
 }

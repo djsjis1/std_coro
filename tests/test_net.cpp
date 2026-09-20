@@ -1,5 +1,5 @@
 // test_net.cpp — TCP 回环: accept / connect / read / write (IOCP / io_uring)
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -8,6 +8,24 @@
 #include "test_util.h"
 
 using namespace std::chrono_literals;
+
+#ifdef _WIN32
+TEST(NetTest, MissingIocpFailsListenerCreation) {
+    bool created = true;
+    bool valid = true;
+    std::thread isolated([&] {
+        auto& loop = coro::EventLoop::get();
+        loop.set_event_source(std::make_shared<coro::CVEventSource>());
+        coro::net::TcpListener listener;
+        created = listener.bind_listen("127.0.0.1", 0);
+        valid = listener.valid();
+    });
+    isolated.join();
+
+    EXPECT_FALSE(created);
+    EXPECT_FALSE(valid);
+}
+#endif
 
 namespace {
 
@@ -135,6 +153,45 @@ namespace {
         co_await std::move(client);
     }
 
+#ifdef _WIN32
+    coro::Task<> accept_once(coro::net::TcpListener* listener) {
+        (void)co_await listener->accept();
+    }
+
+    coro::Task<> cancel_one_accept(coro::net::TcpListener* listener) {
+        auto task = coro::spawn(accept_once(listener));
+        co_await coro::yield(); // 让 AcceptEx 提交后再取消
+        task.cancel();
+        try {
+            co_await std::move(task);
+        } catch (const coro::CancelledError&) {
+        }
+    }
+
+    coro::Task<> accept_cancel_handle_scenario(bool* bind_ok, bool* counted, DWORD* before, DWORD* after) {
+        coro::net::TcpListener listener;
+        for (unsigned short port = 19130; port < 19150; ++port) {
+            if (listener.bind_listen("127.0.0.1", port)) {
+                *bind_ok = true;
+                break;
+            }
+        }
+        if (!*bind_ok)
+            co_return;
+
+        // 先预热一次，排除 Winsock/AcceptEx 的一次性初始化句柄。
+        co_await cancel_one_accept(&listener);
+        if (!GetProcessHandleCount(GetCurrentProcess(), before))
+            co_return;
+
+        for (int i = 0; i < 64; ++i)
+            co_await cancel_one_accept(&listener);
+
+        co_await coro::yield();
+        *counted = GetProcessHandleCount(GetCurrentProcess(), after) != FALSE;
+    }
+#endif
+
 } // namespace
 
 TEST(NetTest, TcpEchoRoundTrip) {
@@ -167,4 +224,17 @@ TEST(NetTest, WaitForTimeoutCancelsPendingIo) {
     EXPECT_TRUE(connected);
     EXPECT_TRUE(read_cancelled); // 挂起中的读被超时取消 (CancelIoEx 联动), 无泄漏无挂死
 }
+
+#ifdef _WIN32
+TEST(NetTest, CancelPendingAcceptDoesNotLeakHandles) {
+    bool bind_ok = false;
+    bool counted = false;
+    DWORD before = 0;
+    DWORD after = 0;
+    test_util::run_task([&] { return accept_cancel_handle_scenario(&bind_ok, &counted, &before, &after); });
+    ASSERT_TRUE(bind_ok);
+    ASSERT_TRUE(counted);
+    EXPECT_LE(after, before + 2); // 允许测试进程内部极小的瞬态波动
+}
+#endif
 #endif // _WIN32 || __linux__

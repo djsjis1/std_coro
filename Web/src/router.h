@@ -6,6 +6,7 @@
 #include <coro/fs.hpp>
 #include <radix_router.h>
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -56,7 +57,12 @@ class router {
     /// 例: static_dir("/static", "/var/www")
     ///     请求 GET /static/css/style.css → 读取 /var/www/css/style.css 返回
     void static_dir(const std::string& mount, const std::string& dir) {
-        static_dirs_.emplace_back(mount, dir); // 存入 vector, 支持多个挂载点
+        std::string normalized = mount.empty() ? "/" : mount;
+        while (normalized.size() > 1 && normalized.back() == '/')
+            normalized.pop_back();
+        if (normalized.front() != '/')
+            normalized.insert(normalized.begin(), '/');
+        static_dirs_.emplace_back(std::move(normalized), dir); // 存入 vector, 支持多个挂载点
     }
 
     /// 路由分发: 按优先级依次尝试:
@@ -108,7 +114,11 @@ class router {
         for (const auto& [mount, dir] : static_dirs_) {
             // rfind(mount, 0): 检查 path 是否以 mount 开头 (类似 Python 的 startswith)
             // 返回 0 表示从位置 0 开始匹配成功
-            if (path.rfind(mount, 0) != 0)
+            // 必须按完整路径段匹配; 否则 mount="/static" 会错误匹配
+            // "/static-secret" 并把它映射到静态目录根。
+            const bool mount_match =
+                path == mount || (path.size() > mount.size() && path.rfind(mount, 0) == 0 && path[mount.size()] == '/');
+            if (!mount_match)
                 continue; // 不匹配这个挂载点, 试下一个
 
             // 静态文件只支持 GET; 其他方法返回 405/OPTIONS 应答 (而非默默读文件)
@@ -138,6 +148,23 @@ class router {
             // 且有跨线程开销; 现在直接挂在 worker 的事件循环上, 读大文件
             // 期间 worker 可以继续处理其他连接。
             std::string full_path = dir + "/" + rel_trim;
+            // 规范化后再次确认 real path 仍位于挂载根目录内, 防止 symlink
+            // 把一个看似安全的相对路径带出静态目录。
+            try {
+                const auto base = std::filesystem::weakly_canonical(std::filesystem::path(dir));
+                const auto candidate = std::filesystem::weakly_canonical(std::filesystem::path(full_path));
+                auto rel_to_base = std::filesystem::relative(candidate, base);
+                if (rel_to_base.empty() || rel_to_base == ".") {
+                    // 目录根本身不作为文件返回, 避免把目录读成 404 以外的异常。
+                    co_return http_response::error(404, "not found");
+                }
+                auto rel_text = rel_to_base.generic_string();
+                if (rel_text == ".." || rel_text.rfind("../", 0) == 0)
+                    co_return http_response::error(403, "forbidden");
+                full_path = candidate.string();
+            } catch (const std::filesystem::filesystem_error&) {
+                co_return http_response::error(404, "file not found: " + rel_trim);
+            }
             coro::io::clear_error();
             std::string body = co_await coro::fs::read_all(full_path);
             if (coro::io::last_error() != 0)
@@ -168,6 +195,8 @@ class router {
     ///   4. 按 / 分割, 检查每个路径段是否为 ".."
     static bool is_safe_path(const std::string& rel) {
         std::string normalized = rel;
+        if (normalized.find('\0') != std::string::npos)
+            return false;
         // 步骤 1: 反斜杠统一转正斜杠
         std::replace(normalized.begin(), normalized.end(), '\\', '/');
 

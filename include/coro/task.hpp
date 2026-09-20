@@ -142,29 +142,29 @@ namespace coro {
                 // 步骤 1: 将结果/异常从 promise 移交到 Task
                 promise.store_result();
 
-                // 步骤 2: 如果有协程在等待当前协程完成 (continuation),
-                //         将其加入「等待者所在事件循环」的就绪队列。
-                //         continuation_loop_ 在 await_suspend 设置续体时捕获
-                //         (那时正运行在等待者线程上)。
-                //         旧实现 schedule 到 EventLoop::get() —— 即「完成者」
-                //         线程的 loop: 任务经 bind_loop 跑在别的线程时,
-                //         等待者的帧会被迁移到错误线程 resume (数据竞争 +
-                //         MSVC Debug CRT 跨线程堆断言)。
-                if (promise.continuation_) {
-                    EventLoop& loop = promise.continuation_loop_ ? *promise.continuation_loop_ : EventLoop::get();
-                    loop.schedule(promise.continuation_);
-                }
+                // 步骤 2: 先捕获 target_loop (在 schedule continuation 之前!)
+                // continuation 被 schedule 后可能立即运行并销毁 Task,
+                // 导致后续访问 promise 成员时状态已失效。
+                EventLoop* target = promise.target_loop_ ? promise.target_loop_ : &EventLoop::get();
 
-                // 步骤 3: 通知 Task 不再持有有效句柄
+                // 步骤 3: 先保存 continuation，并完成 owner-loop/Task 外壳
+                // 的收尾。另一个 loop 可能在 schedule 后立即恢复等待者，
+                // 进而销毁它持有的 Task；因此不能把 schedule 放在这些操作前。
+                auto continuation = promise.continuation_;
+                EventLoop* cont_loop = promise.continuation_loop_ ? promise.continuation_loop_ : &EventLoop::get();
+
+                // 步骤 4: 通知 Task 不再持有有效句柄
                 promise.release_handle();
 
-                // 步骤 4: 活跃协程计数 -1, 移出任务注册表 (与启动时的 loop 配对)
-                {
-                    EventLoop& loop = promise.target_loop_ ? *promise.target_loop_ : EventLoop::get();
-                    loop.on_coroutine_finished(h);
-                }
+                // 步骤 5: 活跃协程计数 -1, 移出任务注册表 (与启动时的 loop 配对)
+                // 使用步骤 2 预先捕获的 target (避免访问可能已失效的 promise)
+                target->on_coroutine_finished(h);
 
-                // 步骤 5: 返回 false → 不挂起, 编译器将销毁协程帧
+                // 步骤 6: 所有内部状态已经提交后再发布 continuation。
+                if (continuation)
+                    cont_loop->schedule(continuation);
+
+                // 步骤 7: 返回 false → 不挂起, 编译器将销毁协程帧
                 return false;
             }
 
@@ -425,7 +425,7 @@ namespace coro {
                     }
                     // 如果 variant 的 index 为 1 (存储了 T), 移动结果
                     else if (result_.index() == 1) {
-                        task_->result_ = std::move(std::get<1>(result_));
+                        task_->result_.emplace(std::move(std::get<1>(result_)));
                     }
                     // 如果有异常, 也传递过去
                     if (exception_) {
@@ -521,12 +521,21 @@ namespace coro {
         /// 都在帧销毁前置空 handle_), 因此非空即可安全 destroy。
         ~Task() {
             if (handle_) {
+                EventLoop* owner = handle_.promise().target_loop_;
+                EventLoop& loop = owner ? *owner : EventLoop::get();
                 if (started_ && !ready_) {
-                    // 已启动但未完成: 帧可能在就绪队列中
-                    if (!EventLoop::get().mark_abandoned(handle_)) {
-                        // 不在就绪队列 (挂起在定时器/I/O 等): 安全销毁
+                    auto& promise = handle_.promise();
+                    if (promise.pending_io_ && promise.cancel_hook_) {
+                        // OVERLAPPED/uring_op 位于协程帧内，不能在内核仍持有
+                        // 指针时直接 destroy。先把帧标成废弃并请求取消；完成
+                        // 包/CQE 到达后 EventLoop 只销毁、不恢复该帧。
+                        promise.task_ = nullptr;
+                        loop.mark_io_abandoned(handle_);
+                        promise.cancel_hook_(promise.cancel_hook_self_);
+                    } else if (!loop.mark_abandoned(handle_)) {
+                        // 不在就绪队列 (挂起在定时器/同步原语等): 安全销毁
                         // 定时器路径: sleep_awaiter 析构会置 token, 事件循环跳过僵尸条目
-                        EventLoop::get().on_coroutine_finished(handle_);
+                        loop.on_coroutine_finished(handle_);
                         handle_.destroy();
                     }
                     // 在就绪队列: mark_abandoned 返回 true, 帧保持存活
@@ -539,7 +548,7 @@ namespace coro {
 
         /// 移动构造: 转移所有权, 更新 promise 中的 task_ 指针。
         /// handle_ 非空即帧存活 (见析构注释), 无需额外标志判断。
-        Task(Task&& other) noexcept
+        Task(Task&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
             : handle_(std::exchange(other.handle_, nullptr)), result_(std::move(other.result_)),
               exception_(std::move(other.exception_)), ready_(other.ready_), started_(other.started_) {
             if (handle_) {
@@ -548,13 +557,20 @@ namespace coro {
         }
 
         /// 移动赋值: 先销毁旧协程 (如果有), 再转移所有权
-        Task& operator=(Task&& other) noexcept {
+        Task& operator=(Task&& other) noexcept(std::is_nothrow_move_constructible_v<T>) {
             if (this != &other) {
                 if (handle_) {
+                    EventLoop* owner = handle_.promise().target_loop_;
+                    EventLoop& loop = owner ? *owner : EventLoop::get();
                     // 销毁旧帧 (同析构逻辑): 在就绪队列则延迟销毁
                     if (started_ && !ready_) {
-                        if (!EventLoop::get().mark_abandoned(handle_)) {
-                            EventLoop::get().on_coroutine_finished(handle_);
+                        auto& promise = handle_.promise();
+                        if (promise.pending_io_ && promise.cancel_hook_) {
+                            promise.task_ = nullptr;
+                            loop.mark_io_abandoned(handle_);
+                            promise.cancel_hook_(promise.cancel_hook_self_);
+                        } else if (!loop.mark_abandoned(handle_)) {
+                            loop.on_coroutine_finished(handle_);
                             handle_.destroy();
                         }
                     } else {
@@ -562,7 +578,9 @@ namespace coro {
                     }
                 }
                 handle_ = std::exchange(other.handle_, nullptr);
-                result_ = std::move(other.result_);
+                result_.reset();
+                if (other.result_)
+                    result_.emplace(std::move(*other.result_));
                 exception_ = std::move(other.exception_);
                 ready_ = other.ready_;
                 started_ = other.started_;
@@ -808,9 +826,16 @@ namespace coro {
         }
         ~Task() {
             if (handle_) {
+                EventLoop* owner = handle_.promise().target_loop_;
+                EventLoop& loop = owner ? *owner : EventLoop::get();
                 if (started_ && !ready_) {
-                    if (!EventLoop::get().mark_abandoned(handle_)) {
-                        EventLoop::get().on_coroutine_finished(handle_);
+                    auto& promise = handle_.promise();
+                    if (promise.pending_io_ && promise.cancel_hook_) {
+                        promise.task_ = nullptr;
+                        loop.mark_io_abandoned(handle_);
+                        promise.cancel_hook_(promise.cancel_hook_self_);
+                    } else if (!loop.mark_abandoned(handle_)) {
+                        loop.on_coroutine_finished(handle_);
                         handle_.destroy();
                     }
                 } else {
@@ -829,9 +854,16 @@ namespace coro {
         Task& operator=(Task&& other) noexcept {
             if (this != &other) {
                 if (handle_) {
+                    EventLoop* owner = handle_.promise().target_loop_;
+                    EventLoop& loop = owner ? *owner : EventLoop::get();
                     if (started_ && !ready_) {
-                        if (!EventLoop::get().mark_abandoned(handle_)) {
-                            EventLoop::get().on_coroutine_finished(handle_);
+                        auto& promise = handle_.promise();
+                        if (promise.pending_io_ && promise.cancel_hook_) {
+                            promise.task_ = nullptr;
+                            loop.mark_io_abandoned(handle_);
+                            promise.cancel_hook_(promise.cancel_hook_self_);
+                        } else if (!loop.mark_abandoned(handle_)) {
+                            loop.on_coroutine_finished(handle_);
                             handle_.destroy();
                         }
                     } else {

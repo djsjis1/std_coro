@@ -24,7 +24,7 @@ namespace {
     // deliver() 路由到等待者的 loop 后由事件循环恢复等待者 —— 路径
     // 与真实控制台事件 (专用线程投递) 完全一致, 且避免了 to_thread
     // 的临时 Task 生命周期问题。
-    // Linux: 线程已阻塞该信号, raise 后进入 pending, 由 signalfd 消费。
+    // Linux: sigaction 处理器把信号写入 self-pipe, reader 线程再路由到 loop。
     void raise_sig(int sig) {
         std::raise(sig);
     }

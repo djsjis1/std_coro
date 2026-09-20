@@ -3,7 +3,7 @@
 # ============================================================================
 #
 #  全部并行:
-#    - lint: 格式检查 → 失败时自动格式化并回推
+#    - lint: 只读格式检查
 #    - Linux: GCC 13 + Clang 18 × {Debug, Release}
 #    - macOS: (暂时禁用, 待 kqueue 事件源实现)
 #    - Windows: MSVC × {Debug, Release}
@@ -27,44 +27,24 @@ concurrency:
 
 jobs:
   # ============================================================
-  # 代码格式检查 + 自动修复回推
+  # 代码格式检查（只读门禁）
   # ============================================================
   lint:
     name: Lint (clang-format)
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format
 
       - name: Check formatting
-        id: check
         run: |
-          find coro/include router examples tests Web/src main.cpp \
+          find include router examples tests Web/src main.cpp \
             \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | \
-          xargs clang-format --dry-run --Werror 2>format_errors.txt || true
-          if [ -s format_errors.txt ]; then
-            echo "has_errors=true" >> $GITHUB_OUTPUT
-            cat format_errors.txt
-          else
-            echo "has_errors=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Auto-fix formatting and push
-        if: steps.check.outputs.has_errors == 'true' && github.event_name == 'push'
-        run: |
-          find coro/include router examples tests Web/src main.cpp \
-            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | \
-          xargs clang-format -i
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "style: auto-format code [skip ci]" || true
-          git push
+          xargs -r clang-format --dry-run --Werror
 
   # ============================================================
   # Linux — GCC 13 + Clang 18, Debug + Release
@@ -129,7 +109,26 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 5
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Verify installed package
+        run: |
+          cmake --install build --prefix "$PWD/build/install-root"
+          cmake -S tests/package_smoke -B build/package-smoke \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install-root"
+          cmake --build build/package-smoke -j$(nproc)
+          ./build/package-smoke/coro_package_smoke
+
+      - name: Verify portable core without io_uring
+        if: matrix.label == 'GCC 13' && matrix.build_type == 'Debug'
+        run: |
+          cmake -B build-core \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCORO_ENABLE_URING=OFF \
+            -DCORO_BUILD_EXAMPLES=OFF
+          cmake --build build-core --target coro_tests -j$(nproc)
+          ctest --test-dir build-core --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
@@ -191,6 +190,13 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
+      - name: Verify installed package
+        run: |
+          cmake --install build --config ${{ matrix.build_type }} --prefix "$env:GITHUB_WORKSPACE\build\install-root"
+          cmake -S tests/package_smoke -B build/package-smoke -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-root"
+          cmake --build build/package-smoke --config ${{ matrix.build_type }}
+          & "build\package-smoke\${{ matrix.build_type }}\coro_package_smoke.exe"
+
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
         timeout-minutes: 5
@@ -240,7 +246,7 @@ jobs:
 
       - name: Run tests with sanitizer
         timeout-minutes: 10
-        run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
+        run: ctest --test-dir build --output-on-failure --timeout 120
 
   # ============================================================
   # 静态分析 (cppcheck)
@@ -258,9 +264,9 @@ jobs:
         run: |
           cppcheck --enable=warning,performance,portability \
             --std=c++20 --suppress=missingIncludeSystem \
-            -I coro/include \
+            -I include \
             --error-exitcode=1 \
-            coro/include/ 2>&1 | tee cppcheck.log
+            include/ 2>&1 | tee cppcheck.log
 
       - name: Upload cppcheck report
         if: always()
@@ -297,7 +303,7 @@ jobs:
 
       - name: Run tests
         timeout-minutes: 5
-        run: ctest --test-dir build -C Debug --output-on-failure --timeout 120
+        run: ctest --test-dir build --output-on-failure --timeout 120
 
       - name: Generate coverage report
         run: |

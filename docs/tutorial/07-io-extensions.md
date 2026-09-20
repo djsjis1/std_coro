@@ -199,9 +199,8 @@ coro::Task<> main_flow(web::web_server& s)
 
 平台说明：Windows 没有真信号——库把控制台事件（Ctrl+C /
 Ctrl+Break / 关窗）与 CRT `raise()` 双路桥接成上面的信号语义；
-Linux 用 signalfd + io_uring。注意 Linux 下信号在首次
-`wait`/`handle` 时于当前线程阻塞，之后创建的线程继承该掩码，
-多线程程序应先注册信号再开线程。
+Linux 用 `sigaction + self-pipe + reader 线程`：处理器只做
+async-signal-safe 的管道写入，reader 再把信号路由到注册时的事件循环。
 
 ---
 
@@ -210,6 +209,7 @@ Linux 用 signalfd + io_uring。注意 Linux 下信号在首次
 对标 watchfiles / inotify 工具，监控目录下文件的变化：
 
 ```cpp
+// Windows 和 Linux 都支持递归子目录
 auto w = co_await coro::fs::watch("src", /*recursive=*/true);
 if (!w.valid()) { /* 打开失败 */ }
 

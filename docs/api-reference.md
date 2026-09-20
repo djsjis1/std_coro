@@ -73,7 +73,7 @@ public:
 
 | 类型 | 何时抛出 |
 |---|---|
-| `CancelledError` | 任务被 `cancel()`，在下一个 await 点注入；超时（wait_for 内部先 cancel 后转 TimeoutError，等待者看到的是 TimeoutError）；组/父级取消传播 |
+| `CancelledError` | 任务被 `cancel()`，在下一个 await 点注入；调用方主动取消 `wait_for` 时原样传播；组/父级取消传播 |
 | `TimeoutError` | `wait_for` 超时；`fs::watch` 的 `next()` 等配合 wait_for 使用时同理 |
 | `ExceptionGroup` | `TaskGroup::wait()` 有子任务真实失败（单个也打包；组内取消产生的 CancelledError 不聚合） |
 
@@ -281,7 +281,7 @@ public:
 };
 ```
 
-FIFO 公平、非递归（重复 acquire 死锁）；释放时直接移交队首等待者。
+FIFO 公平、支持递归获取（重复 acquire 需要对应次数 release）；释放时直接移交队首等待者。
 
 ### Semaphore
 
@@ -638,9 +638,8 @@ namespace coro::signal {
   SIGHUP=3 映射"关窗"事件）；其余信号抛 `std::invalid_argument`；
 - Windows 无真信号：控制台事件（Ctrl+C / Ctrl+Break / 关窗）与 CRT
   `raise()` 双路桥接；SIGHUP 无法经 `raise()` 触发；
-- Linux 用 signalfd + io_uring；**信号在首次 wait/handle 时于当前线程
-  阻塞**（pthread_sigmask），之后创建的线程继承掩码——多线程程序
-  应先注册信号再开线程；
+- Linux 用 `sigaction + self-pipe + reader 线程`；信号处理器只做
+  async-signal-safe 的 `write`，再由 reader 把通知路由到各等待者的 loop；
 - `handle` 的 factory 在**注册时的 loop** 上执行，串行不重入
   （上一个协程完成前新信号排队）。
 
@@ -674,8 +673,7 @@ namespace coro::fs {
   应用层需去抖（如同路径 100ms 窗口）；
 - `overflow` = 内核缓冲溢出，可能丢事件（建议全量扫描兜底）；
 - Windows：`ReadDirectoryChangesW` 原生递归；
-  Linux：inotify（v1 递归能力有限，见
-  [已知限制](coro-guide.md#十五已知限制)）。
+  Linux：inotify 通过 wd 到相对路径的映射实现递归，并动态跟踪新目录。
 
 ---
 

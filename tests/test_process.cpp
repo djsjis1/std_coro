@@ -1,5 +1,5 @@
 // test_process.cpp — 子进程: stdout 捕获 / 退出码 / 终止
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -17,14 +17,22 @@ namespace {
 
     // stdout 捕获: cmd /c echo
     coro::Task<> capture_case(int* code, std::string* out) {
+#ifdef _WIN32
         auto [c, o] = co_await coro::process::run_capture({"cmd", "/c", "echo hello-cor"});
+#else
+        auto [c, o] = co_await coro::process::run_capture({"sh", "-c", "echo hello-cor"});
+#endif
         *code = c;
         *out = o;
     }
 
     // 退出码: cmd /c exit 42
     coro::Task<> exitcode_case(int* code) {
+#ifdef _WIN32
         auto p = co_await coro::process::spawn({"cmd", "/c", "exit 42"}, {.capture_stdout = true});
+#else
+        auto p = co_await coro::process::spawn({"sh", "-c", "exit 42"}, {.capture_stdout = true});
+#endif
         if (!p.valid()) {
             *code = -99;
             co_return;
@@ -34,7 +42,11 @@ namespace {
 
     // 终止: 起一个长任务, terminate 后 wait 返回 (不必是 0)
     coro::Task<> terminate_case(int* code, bool* wait_returned) {
+#ifdef _WIN32
         auto p = co_await coro::process::spawn({"cmd", "/c", "timeout /t 30"}, {.capture_stdout = true});
+#else
+        auto p = co_await coro::process::spawn({"sleep", "30"}, {.capture_stdout = true});
+#endif
         if (!p.valid()) {
             *wait_returned = false;
             co_return;
@@ -64,9 +76,20 @@ namespace {
         coro::io::clear_error();
     }
 
+    coro::Task<> empty_args_case(bool* invalid, int* err) {
+        auto p = co_await coro::process::spawn({});
+        *invalid = !p.valid();
+        *err = coro::io::last_error();
+        coro::io::clear_error();
+    }
+
     // 并发多进程
     coro::Task<int> one_exit(int v) {
+#ifdef _WIN32
         auto p = co_await coro::process::spawn({"cmd", "/c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+#else
+        auto p = co_await coro::process::spawn({"sh", "-c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+#endif
         co_return co_await p.wait();
     }
 
@@ -107,9 +130,17 @@ TEST(ProcessTest, SpawnMissingProgram) {
     EXPECT_NE(err, 0);
 }
 
+TEST(ProcessTest, EmptyArgumentsAreRejected) {
+    bool invalid = false;
+    int err = 0;
+    test_util::run_task([&] { return empty_args_case(&invalid, &err); });
+    EXPECT_TRUE(invalid);
+    EXPECT_NE(err, 0);
+}
+
 TEST(ProcessTest, ConcurrentProcesses) {
     bool all_match = false;
     test_util::run_task([&] { return concurrent_case(&all_match); });
     EXPECT_TRUE(all_match);
 }
-#endif // _WIN32
+#endif // _WIN32 || CORO_URING_ENABLED

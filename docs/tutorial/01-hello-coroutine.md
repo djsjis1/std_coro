@@ -32,7 +32,7 @@ ctest --test-dir build -C Debug --output-on-failure
 
 ### 方式 B：把库引入你自己的项目
 
-`coro/` 子目录是**独立可复制的库包**（header-only、零第三方依赖）：
+`include/coro/` 是**可独立复制的核心头文件包**（header-only；平台 IO 组件按系统依赖配置）：
 
 ```bash
 cp -r /path/to/coro your_project/thirdparty/coro
@@ -229,7 +229,7 @@ co_await coro::yield();     // 等价 asyncio.sleep(0): 主动让出, 排到队�
 
 ## 1.5 命名函数 vs lambda 协程体
 
-全教程的协程一律写成命名函数：
+教程主线优先把协程写成命名函数，让生命周期一眼可见：
 
 ```cpp
 // ✅ 教程约定: 命名协程函数, 参数进协程帧, 生命周期由标准保证
@@ -245,19 +245,28 @@ for (int i = 0; i < 3; ++i)
     tasks.push_back(worker(i));
 ```
 
-**为什么不写 lambda？**
+**能不能写 lambda？可以。**
 
 ```cpp
-// ❌ MSVC Debug 下有坑: 捕获的 i 可能没被正确复制进协程帧,
-//    挂起恢复后读到错误值 (数据错乱甚至崩溃)
+// ❌ 临时捕获闭包在语句末尾销毁，稍后恢复时访问 i 会悬空
 for (int i = 0; i < 3; ++i)
-    tasks.push_back([i]() -> coro::Task<int> { co_return i * 10; }());
+    tasks.push_back([i]() -> coro::Task<int> {
+        co_await coro::yield();
+        co_return i * 10;
+    }());
+
+// ✅ 无捕获 lambda，把值作为参数复制进协程帧
+auto worker = [](int i) -> coro::Task<int> {
+    co_await coro::yield();
+    co_return i * 10;
+};
+for (int i = 0; i < 3; ++i)
+    tasks.push_back(worker(i));
 ```
 
-MSVC **Debug** 模式的已知问题：lambda 协程的捕获变量可能不被复制进
-协程帧。Release 无此问题，但代码要在两种配置下都对，所以本库与
-所有示例/教程统一用"命名函数 + 参数传递"。需要携带状态时，
-把状态作为参数传进去（需要共享所有权就用 `shared_ptr` 参数）。
+捕获存放在 lambda 的闭包对象中，不会因为调用运算符成为协程就自动搬进
+协程帧。只要命名闭包本身一直活到任务结束，捕获型协程 lambda 同样正确；
+但任务可能逃逸时，“无捕获 lambda + 按值参数”或命名函数更容易审查。
 
 ---
 

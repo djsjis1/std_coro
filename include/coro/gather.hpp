@@ -6,6 +6,7 @@
 #include <memory>
 #include <tuple>
 #include <type_traits>
+#include <variant>
 
 // ============================================================================
 // coro::gather — 并发等待多个 Task, 返回结果 tuple
@@ -83,8 +84,11 @@ namespace coro {
         //   因为 std::shared_ptr 的引用计数操作本身要求原子性,
         //   这里保持一致以防未来多线程扩展。
         // ==================================================================
+        // 将 void 结果替换为 std::monostate (std::tuple<void> 非法)
+        template <typename T> using storage_t = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+
         template <typename... Ts> struct gather_shared_state {
-            std::tuple<Ts...> results;            // 所有 Task 的结果
+            std::tuple<storage_t<Ts>...> results; // 所有 Task 的结果 (void → monostate)
             std::atomic<size_t> remaining;        // 剩余未完成的 Task 数量
             std::coroutine_handle<> continuation; // 调用方协程句柄
             EventLoop* caller_loop = nullptr;     // 调用方所在的 loop (唤醒路由, 跨 Scheduler 场景)
@@ -122,8 +126,9 @@ namespace coro {
                     // 非 void 类型: co_await 获取结果, 存入共享状态
                     std::get<I>(state->results) = co_await std::move(task);
                 } else {
-                    // void 类型: 只需要等待完成, 不需要存储结果
+                    // void 类型: 只需要等待完成, 存储 monostate
                     co_await std::move(task);
+                    std::get<I>(state->results) = std::monostate{};
                 }
             } catch (...) {
                 // 只保存第一个异常 (后续异常被忽略)
@@ -192,7 +197,7 @@ namespace coro {
                 std::apply([](auto&... m) { (m.start(), ...); }, monitors_);
             }
 
-            std::tuple<Ts...> await_resume() {
+            std::tuple<storage_t<Ts>...> await_resume() {
                 // 如果有异常, 重新抛出
                 if (state_->first_exception) {
                     std::rethrow_exception(state_->first_exception);
@@ -234,6 +239,11 @@ namespace coro {
     // ============================================================================
     template <typename... Ts> auto gather(Task<Ts>... tasks) {
         return detail::gather_awaiter<Ts...>(std::make_tuple(std::move(tasks)...));
+    }
+
+    /// 空参数 gather: 立即返回空 tuple
+    inline Task<std::tuple<>> gather() {
+        co_return std::tuple<>{};
     }
 
 } // namespace coro

@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#include <coro/net.hpp>
+#endif
 
 #include "test_util.h"
 
@@ -18,6 +21,12 @@ namespace {
         int* count;
         explicit DestroyTracker(int* c) : count(c) {}
         ~DestroyTracker() { ++*count; }
+    };
+
+    struct AtomicDestroyTracker {
+        std::atomic<int>* count;
+        explicit AtomicDestroyTracker(std::atomic<int>* c) : count(c) {}
+        ~AtomicDestroyTracker() { count->fetch_add(1); }
     };
 
     // ── Task 在 I/O 挂起时被销毁 ──
@@ -71,15 +80,15 @@ namespace {
     }
 
     // ── 多个 Task 同时销毁 ──
-    coro::Task<> batch_destroy_worker(int id, std::atomic<int>* destroyed) {
-        DestroyTracker tracker(reinterpret_cast<int*>(destroyed));
+    coro::Task<> batch_destroy_worker(std::atomic<int>* destroyed) {
+        AtomicDestroyTracker tracker(destroyed);
         co_await coro::sleep(10s);
     }
 
-    coro::Task<> batch_destroy(int* destroyed_count) {
+    coro::Task<> batch_destroy(std::atomic<int>* destroyed_count) {
         std::vector<coro::Task<>> tasks;
         for (int i = 0; i < 10; ++i)
-            tasks.push_back(batch_destroy_worker(i, reinterpret_cast<std::atomic<int>*>(destroyed_count)));
+            tasks.push_back(batch_destroy_worker(destroyed_count));
 
         for (auto& t : tasks)
             t.start();
@@ -87,6 +96,50 @@ namespace {
         tasks.clear();
         co_await coro::sleep(10ms);
     }
+
+    coro::Task<> tracked_delay(int* destroyed) {
+        DestroyTracker tracker(destroyed);
+        co_await coro::sleep(1ms);
+    }
+
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+    coro::Task<> pending_socket_read(coro::net::TcpListener* listener, bool* entered, int* destroyed) {
+        auto conn = co_await listener->accept();
+        if (!conn.valid())
+            co_return;
+
+        DestroyTracker tracker(destroyed);
+        *entered = true;
+        char byte = 0;
+        (void)co_await conn.read(&byte, 1);
+    }
+
+    coro::Task<> destroy_during_socket_read(bool* bound, bool* connected, bool* entered, int* destroyed) {
+        coro::net::TcpListener listener;
+        unsigned short port = 0;
+        for (unsigned short candidate = 19100; candidate < 19120; ++candidate) {
+            if (listener.bind_listen("127.0.0.1", candidate)) {
+                port = candidate;
+                break;
+            }
+        }
+        if (port == 0)
+            co_return;
+        *bound = true;
+
+        coro::net::TcpStream client;
+        {
+            auto reader = coro::spawn(pending_socket_read(&listener, entered, destroyed));
+            client = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+            *connected = client.valid();
+            for (int i = 0; i < 50 && !*entered; ++i)
+                co_await coro::sleep(1ms);
+        } // 析构仍挂在 read 上的 Task：必须先取消 IO，再延迟销毁帧
+
+        co_await coro::sleep(50ms); // 让取消完成包/CQE 被事件循环消费
+        client.close();
+    }
+#endif
 
     // ── 嵌套 Task 异常清理 ──
     coro::Task<> inner_thrower(int* cleaned) {
@@ -136,14 +189,14 @@ namespace {
 
     // ── 大量 Task 快速创建销毁 (内存泄漏检测) ──
     coro::Task<> rapid_task_lifecycle(int* created, int* destroyed) {
+        std::vector<coro::Task<>> tasks;
+        tasks.reserve(100);
         for (int i = 0; i < 100; ++i) {
-            auto t = coro::spawn([](int* d) -> coro::Task<> {
-                DestroyTracker tracker(d);
-                co_await coro::sleep(1ms);
-            }(destroyed));
+            tasks.push_back(coro::spawn(tracked_delay(destroyed)));
             ++*created;
         }
-        co_await coro::sleep(50ms);
+        for (auto& task : tasks)
+            co_await std::move(task);
     }
 
 } // namespace
@@ -154,6 +207,20 @@ TEST(LifecycleTest, TaskDestroyDuringPendingIO) {
     EXPECT_GE(destroyed, 1);
 }
 
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+TEST(LifecycleTest, TaskDestroyDuringPendingSocketRead) {
+    bool bound = false;
+    bool connected = false;
+    bool entered = false;
+    int destroyed = 0;
+    test_util::run_task([&] { return destroy_during_socket_read(&bound, &connected, &entered, &destroyed); });
+    EXPECT_TRUE(bound);
+    EXPECT_TRUE(connected);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(destroyed, 1);
+}
+#endif
+
 TEST(LifecycleTest, LockReleasedOnException) {
     bool acquired_after = false;
     test_util::run_task([&] { return lock_exception_cleanup(&acquired_after); });
@@ -161,9 +228,9 @@ TEST(LifecycleTest, LockReleasedOnException) {
 }
 
 TEST(LifecycleTest, BatchTaskDestroy) {
-    int destroyed_count = 0;
+    std::atomic<int> destroyed_count{0};
     test_util::run_task([&] { return batch_destroy(&destroyed_count); });
-    EXPECT_GE(destroyed_count, 0);
+    EXPECT_EQ(destroyed_count.load(), 10);
 }
 
 TEST(LifecycleTest, NestedExceptionCleanup) {
@@ -184,5 +251,5 @@ TEST(LifecycleTest, RapidTaskLifecycle) {
     int created = 0, destroyed = 0;
     test_util::run_task([&] { return rapid_task_lifecycle(&created, &destroyed); });
     EXPECT_EQ(created, 100);
-    EXPECT_GE(destroyed, 0);
+    EXPECT_EQ(destroyed, 100);
 }

@@ -14,6 +14,7 @@
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -129,6 +130,12 @@ namespace coro {
 
         /// 替换等待原语 (做网络库时用平台实现替换默认 CVEventSource)
         void set_event_source(std::shared_ptr<EventSource> src) {
+            if (!src)
+                throw std::invalid_argument("EventLoop::set_event_source: null source");
+            if (running_.load(std::memory_order_acquire))
+                throw std::logic_error("EventLoop::set_event_source: loop is running");
+            if (event_source_ && event_source_->has_pending())
+                throw std::logic_error("EventLoop::set_event_source: pending I/O");
             event_source_ = std::move(src);
             install_event_source();
         }
@@ -143,7 +150,7 @@ namespace coro {
         /// 用户安装了非 IOCP 事件源时为 nullptr (调用方需判空)。
         net::IocpEventSource* iocp() const noexcept { return iocp_source_; }
 #endif
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
         /// 当前 loop 的 io_uring 事件源 (构造时缓存, 类型化), 语义同 iocp()
         net::UringEventSource* uring() const noexcept { return uring_source_; }
 #endif
@@ -221,6 +228,15 @@ namespace coro {
             return true; // 已注册废弃: 调用方不要销毁帧
         }
 
+        /// Task 在底层异步 I/O 挂起时析构：帧必须保留到完成包/CQE 被消费。
+        /// I/O 取消完成后句柄会进入就绪队列，run() 看到 abandoned 标记后
+        /// 只销毁帧而不 resume，避免 OVERLAPPED/uring_op 的 use-after-free。
+        /// 与 Task::cancel 一样，当前要求从所属事件循环线程调用。
+        void mark_io_abandoned(std::coroutine_handle<> h) {
+            std::lock_guard lock(queue_mutex_);
+            abandoned_handles_.insert(h.address());
+        }
+
         /// 检查句柄是否已废弃 (仅事件循环线程调用)
         bool is_abandoned(std::coroutine_handle<> h) const { return abandoned_handles_.count(h.address()) > 0; }
 
@@ -254,10 +270,19 @@ namespace coro {
         EventLoop() {
 #ifdef _WIN32
             // Windows: 默认 IOCP (等价 Python ProactorEventLoop)
-            event_source_ = std::make_shared<net::IocpEventSource>();
-#elif defined(__linux__)
-            // Linux: 默认 io_uring (等价 Python ProactorEventLoop)
-            event_source_ = std::make_shared<net::UringEventSource>();
+            auto iocp = std::make_shared<net::IocpEventSource>();
+            if (iocp->valid())
+                event_source_ = std::move(iocp);
+            else
+                event_source_ = std::make_shared<CVEventSource>();
+#elif defined(__linux__) && defined(CORO_URING_ENABLED)
+            // Linux: io_uring 可用时走 Proactor；初始化失败回退到 CV,
+            // 让核心协程/定时器仍可运行，IO awaiter 会返回 ENOTSUP。
+            auto uring = std::make_shared<net::UringEventSource>();
+            if (uring->valid())
+                event_source_ = std::move(uring);
+            else
+                event_source_ = std::make_shared<CVEventSource>();
 #else
             // 其他平台: 默认 condition_variable (纯标准库)
             event_source_ = std::make_shared<CVEventSource>();
@@ -275,7 +300,8 @@ namespace coro {
             // 类型化缓存 (每 loop 一次 dynamic_cast, 取代 IO 层每操作一次)
 #ifdef _WIN32
             iocp_source_ = dynamic_cast<net::IocpEventSource*>(event_source_.get());
-#elif defined(__linux__)
+#endif
+#ifdef CORO_URING_ENABLED
             uring_source_ = dynamic_cast<net::UringEventSource*>(event_source_.get());
 #endif
         }
@@ -335,7 +361,7 @@ namespace coro {
         HandleQueue ready_queue_;                                // 就绪协程 FIFO
         HandleQueue batch_;                                      // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<std::coroutine_handle<>> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
+        mutable std::mutex queue_mutex_;                         // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 
         // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
         // 为什么需要: 同一句柄可能被多个来源同时调度, 例如
@@ -389,7 +415,7 @@ namespace coro {
         // IOCP 事件源类型化缓存 (install_event_source 维护; 零开销访问)
         net::IocpEventSource* iocp_source_ = nullptr;
 #endif
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
         net::UringEventSource* uring_source_ = nullptr;
 #endif
 
@@ -415,9 +441,17 @@ namespace coro {
     /// 时投递唤醒包。循环醒着时这里只是一次原子读, 零系统调用 ——
     /// 消灭旧实现「每个跨线程 schedule 一个 PostQueuedCompletionStatus,
     /// 循环忙碌时积压成假唤醒风暴」的问题。
+    ///
+    /// 线程安全: loop_thread_id_ 用 thread_local 缓存, 避免跨线程直接读
+    /// (signal reader 线程调 schedule() → cross_thread_wake → 读主线程 TLS
+    /// 会被 TSan 报 data race)。thread_local 在首次调用时拷贝一次, 之后
+    /// 只访问本线程 TLS, 零竞争。
     inline void EventLoop::cross_thread_wake_if_asleep() {
-        static thread_local const std::thread::id this_thread_id = std::this_thread::get_id();
-        if (this_thread_id != loop_thread_id_ && running_ && !awake_.exchange(true))
+        // schedule() 经常由另一个线程调用，不能把目标 loop 缓存在
+        // 调用线程的 TLS 中；那会把第一次跨线程投递误判成同线程，
+        // 之后目标 loop 睡眠时就永远收不到唤醒包。
+        const bool same_loop = detail::t_current_loop == this;
+        if (!same_loop && running_.load(std::memory_order_acquire) && !awake_.exchange(true))
             event_source_->wake();
     }
 

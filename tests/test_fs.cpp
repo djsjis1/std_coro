@@ -1,5 +1,5 @@
 // test_fs.cpp — 异步文件 IO: open / read_at / write_at / stat / fsync / 便捷函数
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

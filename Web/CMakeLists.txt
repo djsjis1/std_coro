@@ -11,10 +11,13 @@ project(coro_web LANGUAGES C CXX)
 # ---- 依赖: coro (header-only) 与 http (llhttp + 封装) 与 router (动态路由) ----
 # 根构建已引入则跳过, 保证两种方式都不重复定义目标
 if(NOT TARGET coro::coro)
-    add_subdirectory(../coro ${CMAKE_BINARY_DIR}/coro)
+    add_subdirectory(.. ${CMAKE_BINARY_DIR}/coro)
 endif()
 if(NOT TARGET http::http)
-    add_subdirectory(../thirdparty/http ${CMAKE_BINARY_DIR}/http)
+    # Web 只把 HTTP 层当作内部依赖：不构建它自带的示例，也不让
+    # 子项目的 install() 规则污染 coro 的 header-only 安装包。
+    set(STD_HTTP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    add_subdirectory(../thirdparty/http ${CMAKE_BINARY_DIR}/http EXCLUDE_FROM_ALL)
 endif()
 if(NOT TARGET router::router)
     add_subdirectory(../router ${CMAKE_BINARY_DIR}/router)

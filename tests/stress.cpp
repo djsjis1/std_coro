@@ -58,9 +58,13 @@ namespace {
             *sum += co_await q->get();
     }
 
+    coro::Task<int> roundtrip_value(int value) {
+        co_return value;
+    }
+
     coro::Task<> spawn_roundtrip(int n, int64_t* sum) {
         for (int i = 0; i < n; ++i) {
-            auto t = coro::spawn([](int v) -> coro::Task<int> { co_return v; }(i));
+            auto t = coro::spawn(roundtrip_value(i));
             *sum += co_await std::move(t);
         }
     }

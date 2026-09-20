@@ -25,5 +25,5 @@ target_compile_features(router INTERFACE cxx_std_20)
 
 # ---- 编译器适配 ----
 if(MSVC)
-    target_compile_options(router INTERFACE /utf-8)   # 源码含中文注释
+    target_compile_options(router INTERFACE /utf-8 /EHsc)   # 源码含中文注释
 endif()

@@ -46,7 +46,6 @@ http::http + router::router`）。llhttp 以独立子目录
 ## 2. web_server API
 
 ```cpp
-namespace web {
 class web_server {
 public:
     explicit web_server(size_t workers = 0);   // 0 = 硬件并发数
@@ -55,27 +54,35 @@ public:
     router& routes();                          // 路由表 (注册路由用)
     void set_max_body(size_t);                 // 消息体上限, 默认 8MB, 超限 400
     void set_verbose(bool);                    // 访问日志开关
+    void set_idle_timeout(milliseconds);       // 读空闲超时, 默认 30s
+    void set_request_timeout(milliseconds);    // 单请求总时限, 默认 30s
+    void set_write_timeout(milliseconds);      // 单响应写时限, 默认 30s
 
     coro::Task<> serve();                      // accept 循环 (co_await 驱动)
-    void stop();                               // 线程安全: 关监听, 唤醒 accept
+    void stop();                               // 线程安全: 关监听和活动连接, 唤醒 I/O
     void wait_all();                           // 等全部在途连接协程收尾
     size_t worker_count() const;
 };
-}
 ```
+
+三个超时都可设为 `0ms` 关闭。读空闲超时限制相邻两次数据到达的间隔；
+单请求总时限从首字节开始计时，因此客户端持续慢速发字节也不会无限占用连接。
 
 标准生命周期（含优雅停机）：
 
 ```cpp
-web::web_server server;
+coro::Task<> shutdown_task(web_server& server) {
+    server.stop();
+    co_return;
+}
+
+web_server server;
 server.listen("0.0.0.0", 8080);
 // ... 注册路由 ...
 
-coro::run([&](web::web_server& s) -> coro::Task<> {
+coro::run([&](web_server& s) -> coro::Task<> {
     auto srv = coro::spawn(s.serve());
-    auto h = coro::signal::handle(SIGINT, [&s]() -> coro::Task<> {
-        s.stop(); co_return;
-    });
+    auto h = coro::signal::handle(SIGINT, [&s] { return shutdown_task(s); });
     co_await std::move(srv);    // stop() 后 serve 正常返回
     s.wait_all();               // 等在途请求处理完
 }(server));
@@ -102,7 +109,6 @@ coro::run([&](web::web_server& s) -> coro::Task<> {
 ## 3. router API
 
 ```cpp
-namespace web {
 class router {
 public:
     using handler_fn = std::function<coro::Task<http_response>(const http_request&)>;
@@ -115,7 +121,6 @@ public:
 
     coro::Task<http_response> route(http_request& req); // web_server 内部调用
 };
-}
 ```
 
 ### 路径语法
@@ -228,11 +233,13 @@ if (const int* v = tree.lookup("/api/user/42", &params)) {
 ### 自测
 
 ```bash
-./build/Debug/web_server.exe --selftest
+./build/Debug/web_server.exe --selftest [port]
 ```
 
 内置验证：路由命中（静态/参数/通配）、keep-alive 复用、
 404、405+Allow、路径穿越 403——全部通过后自动退出（可接 CI）。
+默认端口是 8080；如果该端口被其他服务占用，可传入空闲端口，例如
+`web_server.exe --selftest 18081`。Windows 使用独占绑定，不会覆盖已有监听者。
 
 ### 压测
 

@@ -5,7 +5,7 @@
 > 使用层面的问题请看 [API 参考](api-reference.md) 与 [教程](tutorial/README.md)；
 > 语言机制请看 [C++20 协程课程](cpp20-coroutines-course/README.md)。
 >
-> 库本体：`coro/include/coro/` 下 24 个头文件，共约 8900 行，header-only。
+> 库本体：`include/coro/` 下的头文件，共约 8900 行，header-only。
 > 行文自底向上：事件源 → 事件循环 → Task → 取消 → 并发组合 → IO 层 →
 > 多线程模型 → 横切设计模式。
 
@@ -409,7 +409,7 @@ Promise<T> ──get_future──> SharedState(shared_ptr) <──共享── F
 
 ## 8. IO 层：Proactor 统一完成路径
 
-net / fs / pipe / fs_watch / signal(Linux) 共用同一条路径
+net / fs / pipe / fs_watch 共用同一条路径
 （io.hpp 158 行 + 各模块头文件）：
 
 ```
@@ -449,13 +449,12 @@ awaiter (协程帧内) 持有 detail::iocp_op / uring_op
 - 目录监视：Windows `ReadDirectoryChangesW`（一次完成包含
   `FILE_NOTIFY_INFORMATION` 记录链，全部解析进 pending 队列；
   RENAMED_OLD/NEW_NAME 配对；`ERROR_NOTIFY_ENUM_DIR` → overflow）；
-  Linux inotify fd 经 io_uring 持续读，`IN_MOVED_FROM/TO` 用 cookie
-  配对，`IN_Q_OVERFLOW` → overflow；
+  Linux inotify fd 经 io_uring 等待 `POLLIN` 后非阻塞读取，wd 映射维护递归相对路径，
+  `IN_MOVED_FROM/TO` 用 cookie 跨批配对，`IN_Q_OVERFLOW` → overflow；
 - 信号：Windows 进程级单例 manager（`SetConsoleCtrlHandler` +
   CRT `std::signal` 双路桥接，MSVC `raise()` 后复位 SIG_DFL 所以
-  处理器内每次重装）；Linux 每 loop 一个 manager（`pthread_sigmask`
-  阻塞 + signalfd + 常驻读者协程，无等待者时读者被 cancel 不阻 loop
-  退出）。
+  处理器内每次重装）；Linux 用 `sigaction + self-pipe`，进程级
+  reader 线程读取通知，再路由到每个事件循环的 manager。
 
 ### 取消挂钩（cancel_op）
 
@@ -539,7 +538,7 @@ Linux 部分直接引用 `net::UringEventSource`（经 event_loop.hpp 条件
 5. **命名协程 + `start()+detach()` 自持有**：所有 fire-and-forget
    （schedule/wait/signal reader/handle loop）用命名协程函数
    （参数进协程帧，生命周期由帧保证）+ detach——协程帧自持有运行
-   到完成，无需堆上 Task 对象，也规避了 MSVC Debug lambda 帧捕获问题。
+   到完成，无需堆上 Task 对象，也避免了临时捕获闭包的生命周期问题。
 6. **逐等待者 loop 路由**：Future / signal(Win) / process 退出通知，
    每个等待者记录挂起时所在 loop，唤醒路由回"家"。
 7. **入睡协议**：`awake_` seq_cst exchange，跨线程唤醒只投递给
@@ -632,8 +631,8 @@ final_suspend 路径）, 收益/风险比暂不划算。代码内留有注释锚
 给热路径加常数开销; 轮询只发生在关停/测试边界。已从固定 1ms 改为
 50µs 起步指数退避, 上限 1ms。
 
-### 13.5 Linux 路径未实测
+### 13.5 Linux 路径验证边界
 
-io_uring 分支（含 fs/pipe/signal/fs_watch/process 的 Linux 段）按
-net.hpp 模式对称编写, 无 Linux 构建环境验证。头文件注释均标注。
-上线 Linux 前的先决条件: CI 加 ubuntu runner 编译 + 跑测试。
+Linux 分支（含 io_uring 的 net/fs/pipe/fs_watch/process，以及 self-pipe signal）已接入 Ubuntu 的
+GCC/Clang Debug/Release 与 sanitizer CI；Windows 本机结果不能代替这些任务的
+实际状态。发布 Linux 产物前仍需确认对应提交的 CI 全绿，并在目标内核做压力验证。

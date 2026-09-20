@@ -60,7 +60,7 @@ ctest --test-dir build --output-on-failure
 
 | # | 领域 | 现状 | 代码/文档锚点 |
 |---|---|---|---|
-| 1 | 网络 | 仅 TCP + IPv4；`sockaddr_in` + `inet_addr` 全程，无域名 | `coro/include/coro/net.hpp`（875 行，双平台对称） |
+| 1 | 网络 | 仅 TCP + IPv4；`sockaddr_in` + `inet_addr` 全程，无域名 | `include/coro/net.hpp`（双平台实现） |
 | 2 | Web 层 | 无中间件、无 chunked 生成、响应体全量缓存 | `docs/web-framework.md` §已知限制（~251-261） |
 | 3 | 平台 | Linux 禁用 process（GCC 12 ICE，注释写明待 GCC 13+） | `CMakeLists.txt:46`；macOS 预留 `ci.yml:141`（已注释） |
 | 4 | 性能 | 网络吞吐/延迟、每连接内存无基准 | `docs/performance.md` §3「未覆盖」清单（95-99） |
@@ -173,7 +173,7 @@ Windows 版（`net.hpp:127-173`）结构完全相同，只有三处平台差异�
 
 ### 3.3 新增一个 IO 模块的标准 7 步（ checklist ）
 
-1. **头文件**：`coro/include/coro/xxx.hpp`，进 `namespace coro`；
+1. **头文件**：`include/coro/xxx.hpp`，进 `namespace coro`；
    net 的扩展直接加在 `net.hpp` 的 `namespace coro::net` 内部则免新建。
 2. **能力开关**：根 `CMakeLists.txt:26-47` 增 `CORO_HAS_XXX` + 平台条件，
    目标（examples/tests）用它门控。
@@ -220,7 +220,7 @@ Windows 版（`net.hpp:127-173`）结构完全相同，只有三处平台差异�
   `#if 1` 存盘，单独编译该翻译单元：
 
   ```bash
-  g++ -std=c++20 -fsyntax-only -Icoro/include -Ithirdparty/googletest-main/googletest/include tests/test_process.cpp
+  g++ -std=c++20 -fsyntax-only -Iinclude -Ithirdparty/googletest-main/googletest/include tests/test_process.cpp
   ```
 
   能过语法检查 → 继续步骤 3；仍报 internal compiler error → **本任务整体挂起**，
@@ -1000,13 +1000,13 @@ M4  阶段 4 逐项决策   →  每项先出决策记录(依赖选型/API 兼�
 
 | 文件 | 在本计划中的角色 |
 |---|---|
-| `coro/include/coro/net.hpp` | 1.1 UDP / 1.2 DNS / 阶段 4 IPv6 主战场（875 行，双平台对称）；§3.2 范本所在地 |
-| `coro/include/coro/task.hpp` | 3.1 对称转移实验点（搜「对称转移」三处注释） |
+| `include/coro/net.hpp` | 1.1 UDP / 1.2 DNS / 阶段 4 IPv6 主战场（双平台实现）；§3.2 范本所在地 |
+| `include/coro/task.hpp` | 3.1 对称转移实验点（搜「对称转移」三处注释） |
 | `Web/src/http_types.h/.cpp` | 2.2 chunk_producer / file_async / build_head |
 | `Web/src/router.h` | 2.1 use / dispatch_core / run_chain；2.2 静态文件异步读的现成范本（:142） |
 | `Web/src/web_server.cpp` | 2.2 写回分叉（:92 handle_connection, :148 build 处）；2.3 stats 计数 |
-| `coro/include/coro/uring_event_source.hpp` | 3.2 ring 参数化（:~73 硬编码 256） |
-| `coro/include/coro/thread.hpp` | 1.2 to_thread 桥接（resolve 的执行引擎） |
+| `include/coro/uring_event_source.hpp` | 3.2 ring 参数化（当前队列深度 256） |
+| `include/coro/thread.hpp` | 1.2 to_thread 桥接（resolve 的执行引擎） |
 | `tests/test_net.cpp` | 平台守卫与回环测试的抄写范本（:2 守卫、io_cancel_scenario） |
 | `tests/stress.cpp` | bench_net 的风格母版（Timer/命名协程/run 驱动） |
 | `CMakeLists.txt:26-47` | 平台/编译器能力开关（0.1 改造点）；:124 测试 GLOB |

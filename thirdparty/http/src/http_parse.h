@@ -49,6 +49,12 @@ public:
     // 消息体上限(字节),超出则中止解析;0 表示不限制(参考 cpp-httplib 的做法)
     size_t body_limit = 8 * 1024 * 1024;
 
+    // 请求目标和头部上限。HTTP 头部在 message_complete 之前持续累积,
+    // 因此必须在回调阶段拒绝, 不能等整条请求解析完再检查。
+    size_t url_limit = 8 * 1024;
+    size_t header_bytes_limit = 64 * 1024;
+    size_t header_count_limit = 100;
+
     // ---- 可选的用户回调,按需赋值 ----
     void_callback message_begin;                       // 消息开始(结果已清空)
     void_callback message_complete;                    // 消息完整结束
@@ -66,6 +72,8 @@ private:
     llhttp_type_t type_;
     std::string current_field_;   // 正在接收的头部字段名
     std::string current_value_;   // 正在接收的头部值
+    size_t header_bytes_ = 0;     // 当前消息已接收的字段名和值字节数
     std::string error_;
     static const std::string empty_string_;
+    size_t header_count_ = 0; // 当前消息已完成的头部字段数 (包含重复字段)
 };

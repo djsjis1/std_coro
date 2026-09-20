@@ -4,9 +4,13 @@
 #include <coro/net.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 #include "http_types.h"
 #include "router.h"
@@ -52,11 +56,19 @@ class web_server {
     /// 访问日志开关(默认开; 压测等高频场景可关闭, 错误日志始终打印)
     void set_verbose(bool v) { verbose_ = v; }
 
+    /// 连续两次读取之间的最长空闲时间(默认 30s; <=0 关闭)
+    void set_idle_timeout(std::chrono::milliseconds timeout) { idle_timeout_ms_.store(timeout.count()); }
+
+    /// 从首字节开始接收完整请求的总时限(默认 30s; <=0 关闭)
+    void set_request_timeout(std::chrono::milliseconds timeout) { request_timeout_ms_.store(timeout.count()); }
+
+    /// 写完一份响应的总时限(默认 30s; <=0 关闭)
+    void set_write_timeout(std::chrono::milliseconds timeout) { write_timeout_ms_.store(timeout.count()); }
+
     /// accept 循环(常驻, 直到 stop())。在事件循环线程运行。
     coro::Task<> serve();
 
-    /// 请求停止(线程安全): 置停止标志并关闭监听 socket,
-    /// 挂起的 accept 以错误完成包立即返回, 循环随之退出
+    /// 请求停止(线程安全): 关闭监听和全部活动连接，唤醒 accept/read/write。
     void stop();
 
     /// 阻塞等待所有连接协程完成(析构前调用, 防止挂起帧泄漏)
@@ -67,7 +79,11 @@ class web_server {
   private:
     /// 单连接处理: 增量解析请求并逐个响应, 直到连接关闭或 keep-alive 结束。
     /// 注意: 在 worker 线程上运行 (Scheduler 分发)。
-    coro::Task<> handle_connection(coro::net::TcpStream conn);
+    coro::Task<> handle_connection(std::shared_ptr<coro::net::TcpStream> conn);
+    coro::Task<> process_connection(coro::net::TcpStream& conn);
+
+    bool register_connection(const std::shared_ptr<coro::net::TcpStream>& conn);
+    void unregister_connection(const std::shared_ptr<coro::net::TcpStream>& conn);
 
     /// 路由分发 + 异常兑底(handler 抛异常 → 500)。
     /// req 为非 const 引用: 动态路由捕获的参数由 router 写入 req.params
@@ -77,6 +93,11 @@ class web_server {
     coro::net::TcpListener listener_;
     router router_;
     std::atomic<bool> running_ = false;
+    std::mutex connections_mutex_;
+    std::unordered_set<std::shared_ptr<coro::net::TcpStream>> connections_;
+    std::atomic<long long> idle_timeout_ms_{30000};
+    std::atomic<long long> request_timeout_ms_{30000};
+    std::atomic<long long> write_timeout_ms_{30000};
     size_t max_body_ = 8 * 1024 * 1024;
     bool verbose_ = true;
 };

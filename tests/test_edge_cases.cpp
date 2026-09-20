@@ -185,6 +185,10 @@ TEST(EdgeCaseTest, ZeroDurationSleep) {
     EXPECT_EQ(out, 42);
 }
 
+TEST(EdgeCaseTest, EventLoopRejectsNullEventSource) {
+    EXPECT_THROW(coro::EventLoop::get().set_event_source(nullptr), std::invalid_argument);
+}
+
 // ── 嵌套 wait_for ──
 TEST(EdgeCaseTest, NestedWaitFor) {
     int result = 0;

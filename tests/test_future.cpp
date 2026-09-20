@@ -11,6 +11,16 @@ using namespace std::chrono_literals;
 
 namespace {
 
+    struct MoveConstructOnly {
+        explicit MoveConstructOnly(int v) : value(v) {}
+        MoveConstructOnly() = delete;
+        MoveConstructOnly(const MoveConstructOnly&) = delete;
+        MoveConstructOnly& operator=(const MoveConstructOnly&) = delete;
+        MoveConstructOnly(MoveConstructOnly&&) noexcept = default;
+        MoveConstructOnly& operator=(MoveConstructOnly&&) = delete;
+        int value;
+    };
+
     // ── 命名协程函数 ──
 
     // 两个协程等待同一个 Future, 必须都被唤醒 (回归: 旧实现单 continuation 覆盖)
@@ -83,6 +93,52 @@ namespace {
         (void)co_await f;
     }
 
+    coro::Task<> broken_promise_scenario(bool* caught) {
+        coro::Future<int> f;
+        {
+            coro::Promise<int> p;
+            f = p.get_future();
+        }
+        try {
+            (void)co_await f;
+        } catch (const coro::BrokenPromiseError&) {
+            *caught = true;
+        }
+    }
+
+    coro::Task<> broken_void_promise_scenario(bool* caught) {
+        coro::Future<void> f;
+        {
+            coro::Promise<void> p;
+            f = p.get_future();
+        }
+        try {
+            co_await f;
+        } catch (const coro::BrokenPromiseError&) {
+            *caught = true;
+        }
+    }
+
+    coro::Task<> move_construct_only_scenario(int* result) {
+        coro::Promise<MoveConstructOnly> p;
+        auto future = p.get_future();
+        p.set_value(MoveConstructOnly{23});
+        auto value = co_await future;
+        *result = value.value;
+    }
+
+    coro::Task<> null_exception_scenario(bool* rejected, int* result) {
+        coro::Promise<int> p;
+        auto future = p.get_future();
+        try {
+            p.set_exception(nullptr);
+        } catch (const std::invalid_argument&) {
+            *rejected = true;
+        }
+        p.set_value(31);
+        *result = co_await future;
+    }
+
 } // namespace
 
 TEST(FutureTest, MultipleWaitersAllWoken) {
@@ -114,4 +170,30 @@ TEST(FutureTest, DoubleSetThrows) {
     bool threw = false;
     test_util::run_task([&] { return double_set_scenario(&threw); });
     EXPECT_TRUE(threw);
+}
+
+TEST(FutureTest, DestroyedPendingPromiseFailsFuture) {
+    bool caught = false;
+    test_util::run_task([&] { return broken_promise_scenario(&caught); });
+    EXPECT_TRUE(caught);
+}
+
+TEST(FutureTest, DestroyedPendingVoidPromiseFailsFuture) {
+    bool caught = false;
+    test_util::run_task([&] { return broken_void_promise_scenario(&caught); });
+    EXPECT_TRUE(caught);
+}
+
+TEST(FutureTest, SupportsMoveConstructOnlyValue) {
+    int result = 0;
+    test_util::run_task([&] { return move_construct_only_scenario(&result); });
+    EXPECT_EQ(result, 23);
+}
+
+TEST(FutureTest, RejectsNullExceptionWithoutCompleting) {
+    bool rejected = false;
+    int result = 0;
+    test_util::run_task([&] { return null_exception_scenario(&rejected, &result); });
+    EXPECT_TRUE(rejected);
+    EXPECT_EQ(result, 31);
 }

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 // ============================================================================
@@ -50,11 +51,72 @@ namespace coro {
         // task_group_state — TaskGroup 与所有 monitor 协程的共享状态
         // ==================================================================
         struct task_group_state {
-            std::atomic<size_t> remaining{0};                  // 未完成子任务数
-            std::coroutine_handle<> waiter;                    // wait() 的调用协程
+            mutable std::mutex mutex;
+            size_t remaining = 0;           // 未完成子任务数
+            std::coroutine_handle<> waiter; // wait() 的调用协程
+            EventLoop* waiter_loop = nullptr;
             std::vector<std::exception_ptr> exceptions;        // 子任务失败集合 (事件循环线程)
             std::vector<std::shared_ptr<Task<void>>> monitors; // 用于组取消
             bool cancel_requested = false;                     // 已有失败, 正在取消其余
+
+            bool waiter_ready() const noexcept {
+                std::lock_guard lock(mutex);
+                return remaining == 0;
+            }
+
+            void install_waiter(std::coroutine_handle<> h, EventLoop* loop) {
+                std::lock_guard lock(mutex);
+                if (remaining == 0)
+                    loop->schedule(h);
+                else {
+                    waiter = h;
+                    waiter_loop = loop;
+                }
+            }
+
+            void abandon_waiter() noexcept {
+                std::lock_guard lock(mutex);
+                waiter = nullptr;
+                waiter_loop = nullptr;
+            }
+
+            std::vector<std::shared_ptr<Task<void>>> record_failure(std::exception_ptr error,
+                                                                    const std::shared_ptr<Task<void>>& self) {
+                std::vector<std::shared_ptr<Task<void>>> to_cancel;
+                std::lock_guard lock(mutex);
+                exceptions.push_back(std::move(error));
+                if (!cancel_requested) {
+                    cancel_requested = true;
+                    for (auto& m : monitors) {
+                        if (m && m != self && !m->is_ready())
+                            to_cancel.push_back(m);
+                    }
+                }
+                return to_cancel;
+            }
+
+            void record_exception(std::exception_ptr error) {
+                std::lock_guard lock(mutex);
+                exceptions.push_back(std::move(error));
+            }
+
+            void complete() {
+                std::coroutine_handle<> h;
+                EventLoop* loop = nullptr;
+                std::lock_guard lock(mutex);
+                if (--remaining == 0 && waiter) {
+                    h = waiter;
+                    loop = waiter_loop;
+                    waiter = nullptr;
+                    waiter_loop = nullptr;
+                    loop->schedule(h);
+                }
+            }
+
+            size_t pending() const noexcept {
+                std::lock_guard lock(mutex);
+                return remaining;
+            }
         };
 
         template <typename T>
@@ -68,15 +130,21 @@ namespace coro {
             std::shared_ptr<task_group_state> st;
 
             bool await_ready() const noexcept {
-                return st->remaining == 0; // 全部完成 (含空组): 不挂起
+                return st->waiter_ready(); // 全部完成 (含空组): 不挂起
             }
 
-            void await_suspend(std::coroutine_handle<> h) { st->waiter = h; }
+            void await_suspend(std::coroutine_handle<> h) { st->install_waiter(h, &EventLoop::get()); }
 
             void await_resume() {
+                st->abandon_waiter();
+                std::vector<std::exception_ptr> exceptions;
+                {
+                    std::lock_guard lock(st->mutex);
+                    exceptions = std::move(st->exceptions);
+                }
                 // 有失败 → 抛聚合异常 (单个异常也打包, 与 Python 一致)
-                if (!st->exceptions.empty()) {
-                    throw ExceptionGroup(std::move(st->exceptions));
+                if (!exceptions.empty()) {
+                    throw ExceptionGroup(std::move(exceptions));
                 }
             }
         };
@@ -89,11 +157,14 @@ namespace coro {
 
         /// 析构兜底: 取消所有未完成的子任务 (用户忘记 wait() 时防孤儿)
         ~TaskGroup() {
-            if (state_->remaining > 0) {
-                for (auto& m : state_->monitors) {
-                    if (m && !m->is_ready())
-                        m->cancel();
-                }
+            std::vector<std::shared_ptr<Task<void>>> monitors;
+            {
+                std::lock_guard lock(state_->mutex);
+                monitors = state_->monitors;
+            }
+            for (auto& m : monitors) {
+                if (m && !m->is_ready())
+                    m->cancel();
             }
         }
 
@@ -108,8 +179,11 @@ namespace coro {
             // monitor 协程: 包装原任务, 记录异常 / 响应组取消
             auto mon = std::make_shared<Task<void>>();
             *mon = detail::task_group_monitor(mon, task_ptr, state_);
-            state_->monitors.push_back(mon);
-            ++state_->remaining;
+            {
+                std::lock_guard lock(state_->mutex);
+                state_->monitors.push_back(mon);
+                ++state_->remaining;
+            }
             mon->start();
         }
 
@@ -118,10 +192,10 @@ namespace coro {
         auto wait() { return detail::task_group_wait_awaiter{state_}; }
 
         /// 尚未完成的子任务数
-        size_t pending_count() const noexcept { return state_->remaining.load(); }
+        size_t pending_count() const noexcept { return state_->pending(); }
 
         /// 组是否已进入终态 (所有子任务结束)
-        bool done() const noexcept { return state_->remaining == 0; }
+        bool done() const noexcept { return state_->pending() == 0; }
 
       private:
         std::shared_ptr<detail::task_group_state> state_ = std::make_shared<detail::task_group_state>();
@@ -150,16 +224,11 @@ namespace coro {
                 forward_cancel = true;
             } catch (...) {
                 // 原任务真实失败: 记录 + 触发组取消
-                state->exceptions.push_back(std::current_exception());
-                if (!state->cancel_requested) {
-                    state->cancel_requested = true;
-                    for (auto& m : state->monitors) {
-                        // 注意: 必须跳过自己 (m != self)!
-                        // 若取消自己 → 自己完成后帧销毁, 随后被 resume 已销毁帧 → UB
-                        if (m && m != self && !m->is_ready())
-                            m->cancel(); // 取消其余子任务
-                    }
-                }
+                auto to_cancel = state->record_failure(std::current_exception(), self);
+                // 注意: 必须跳过自己 (record_failure 已过滤)。取消动作放在
+                // mutex 外执行, 避免 cancel 路径回调状态时形成锁反转。
+                for (auto& m : to_cancel)
+                    m->cancel();
             }
 
             if (forward_cancel) {
@@ -172,15 +241,12 @@ namespace coro {
                 } catch (...) {
                     // 任务在取消生效前已自行失败: 它的异常仍然聚合
                     // (对标 Python: 已失败任务的异常不会被取消抹掉)
-                    state->exceptions.push_back(std::current_exception());
+                    state->record_exception(std::current_exception());
                 }
             }
 
-            if (--state->remaining == 0) {
-                // 全部结束: 唤醒 wait() 调用者
-                if (state->waiter)
-                    EventLoop::get().schedule(state->waiter);
-            }
+            // 全部结束: 唤醒 wait() 调用者
+            state->complete();
             co_return;
         }
 

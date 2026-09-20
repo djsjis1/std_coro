@@ -1,5 +1,5 @@
 // test_pipe.cpp — 异步管道: 回环 / 背压 / 对端关闭唤醒
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

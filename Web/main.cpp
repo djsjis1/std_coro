@@ -38,6 +38,8 @@
 
 using namespace std::chrono_literals;
 
+static unsigned short g_port = 8080;
+
 // ---- 路由示例 ----
 
 // GET / — 返回一个 HTML 页面
@@ -166,10 +168,16 @@ void register_routes(web_server &server)
 coro::Task<std::pair<int, std::string>> one_request(const std::string &raw)
 {
     std::pair<int, std::string> result{0, ""};
-    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
-    if (!conn.valid())
+    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
+    if (!conn.valid()) {
+        std::cerr << "[selftest] connect failed: " << coro::io::last_error() << std::endl;
         co_return result;
-    co_await conn.write(raw.data(), raw.size());
+    }
+    int sent = co_await conn.write(raw.data(), raw.size());
+    if (sent != (int)raw.size()) {
+        std::cerr << "[selftest] write failed: " << sent << "/" << raw.size() << std::endl;
+        co_return result;
+    }
 
     http_parse parser(HTTP_RESPONSE);
     bool done = false;
@@ -179,9 +187,14 @@ coro::Task<std::pair<int, std::string>> one_request(const std::string &raw)
     while (!done)
     {
         int n = co_await conn.read(buf, sizeof(buf));
-        if (n <= 0)
+        if (n <= 0) {
+            std::cerr << "[selftest] read failed: " << n << " error=" << coro::io::last_error() << std::endl;
             break;
-        parser.feed(buf, (size_t)n);
+        }
+        if (!parser.feed(buf, (size_t)n)) {
+            std::cerr << "[selftest] response parse failed: " << parser.error() << std::endl;
+            break;
+        }
     }
     result.first = parser.status_code;
     result.second = parser.http_body;
@@ -206,7 +219,7 @@ coro::Task<> selftest_client(web_server &server)
     {
         std::string wire = http_protocol::request("GET", "/", {{"Host", "127.0.0.1"}}) +
                            http_protocol::request("GET", "/greet?name=coro", {{"Host", "127.0.0.1"}});
-        auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
+        auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
         if (!conn.valid())
         {
             check("connect refused", false);
@@ -326,13 +339,13 @@ coro::Task<> stress_client(int rounds, std::atomic<long long> &ok,
                            std::atomic<long long> &conn_fail,
                            std::atomic<long long> &io_fail)
 {
-    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
+    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
     // 高并发 connect 风暴可能撞上 TCP backlog 上限被拒绝 (正常拥塞控制),
     // 真实客户端会重试 → 压测工具同样重试几次
     for (int retry = 0; !conn.valid() && retry < 3; ++retry)
     {
         co_await coro::sleep(5ms);
-        conn = co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
+        conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
     }
     if (!conn.valid())
     {
@@ -414,10 +427,18 @@ int main(int argc, char **argv)
 {
     bool selftest = argc > 1 && std::string(argv[1]) == "--selftest";
     bool stress = argc > 1 && std::string(argv[1]) == "--stress";
+    if (selftest && argc > 2) {
+        const int requested_port = std::atoi(argv[2]);
+        if (requested_port <= 0 || requested_port > 65535) {
+            std::cerr << "usage: web_server [--selftest|--stress] [port]" << std::endl;
+            return 2;
+        }
+        g_port = static_cast<unsigned short>(requested_port);
+    }
 
     web_server server;
     register_routes(server);
-    if (!server.listen("127.0.0.1", 8080))
+    if (!server.listen("127.0.0.1", g_port))
         return 1;
 
     if (selftest)

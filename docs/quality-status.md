@@ -1,0 +1,73 @@
+# 质量基线与发布说明
+
+本文记录当前代码库的可验证基线，避免把“本机 Debug 通过”误写成跨平台或
+生产环境保证。
+
+## 当前基线
+
+- Windows / MSVC：`coro_tests` 全部通过；测试覆盖取消、Future、跨线程调度、
+  TCP、管道、文件、进程、信号、路由和等待组合器。
+- 构建目标是 C++20；核心 `coro::coro` 仍为 header-only，Web/llhttp 是可选的
+  独立子项目。
+- Future 的等待者按所属事件循环路由；Task 收尾、移动和析构按目标 loop 处理。
+- 未完成的 Promise 析构会以 `BrokenPromiseError` 完成 Future；动态等待组合器支持
+  仅可移动构造、不可默认构造/不可赋值的结果类型。
+- `wait_any`、`gather_all`、`gather_void`、`wait_tasks` 的后台 monitor 自持有
+  任务容器，调用方取消后不会继续解引用调用方协程帧。
+- HTTP 解析器默认限制 URL 8 KiB、头部总量 64 KiB、头部数量 100、请求体 8 MiB；
+  超限在增量回调阶段拒绝，而不是先把数据读入内存。
+- 静态目录同时做路径段边界检查、`..`/编码点检查和 canonical path 校验，避免
+  `/static-secret` 前缀误匹配以及 symlink 逃逸。
+
+## 构建、测试、安装
+
+```powershell
+cmake -S . -B build -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
+cmake --build build --config Debug --target coro_tests
+ctest --test-dir build -C Debug --output-on-failure
+
+cmake --install build --config Release --prefix <install-prefix>
+```
+
+安装后消费者可以使用：
+
+```cmake
+find_package(coro CONFIG REQUIRED)
+target_link_libraries(app PRIVATE coro::coro)
+```
+
+`router::router`、Web/llhttp 和测试依赖仍属于源码树组件；如果应用需要它们，
+应按项目文档显式加入相应子目录或单独安装。
+
+## 尚未宣称的能力
+
+Linux 的 io_uring、macOS/其他 Unix、TLS、HTTP/2、流式响应和 sanitizer/TSAN
+结果不能由 Windows 构建推断。发布前应在目标平台重新配置、编译和执行测试；尤其
+需要验证 liburing 不可用时的配置行为、IOCP/取消竞态以及静态文件权限策略。
+Linux inotify 递归实现会初始遍历子目录，维护 wd 到相对路径的映射，
+并跟踪新建、移入和重命名的子目录；发布前仍需在 Linux 目标内核上做高频变更与
+`IN_Q_OVERFLOW` 压力验证。
+
+Web 示例的 `stop()` 会关闭监听并对全部活动连接执行双向 shutdown，唤醒挂起的
+accept/read/write；`wait_all()` 随后等待连接协程在各自 worker 上安全释放句柄。
+
+## 下一批修复路线
+
+1. 现有 Linux CI 配置已安装 liburing，测试源码覆盖 net/fs/pipe/process/fs_watch；
+   CI 另有 `CORO_ENABLE_URING=OFF` 的 portable-core 构建；仍需确认每个提交的
+   GCC/Clang 与 sanitizer 实际结果。
+2. inotify 已具备递归目录表、移动 cookie 跨批次关联和新目录动态 watch；
+   下一步用 Linux 压力测覆盖 watch 上限、队列溢出与目录树高频移动。
+3. Web 已有活动连接注册表并能在 shutdown 时取消挂起 I/O；可配置超时
+   已覆盖读空闲、单请求总时限和响应写入；后续可增加每路由的 handler 执行超时。
+4. 增加 TLS/HTTP2/WebSocket/大文件流式响应前，先建立基准、ASan/UBSan/TSan 和
+   跨平台兼容性门禁；不要把单机吞吐数字当作发布保证。
+
+## 与 Yalantinglibs 的定位差异
+
+本项目目前是一个聚焦协程调度、取消和平台 I/O 的轻量框架；与
+[Yalantinglibs](https://github.com/alibaba/yalantinglibs) 的差距主要在生态和
+产品化，而不是单个 awaiter 的 API 数量：YLT 还提供 struct_pack/json/xml/yaml/pb、
+easylog、coro_rpc、coro_http、coro_io、async_simple，以及完整安装/版本/CI/示例
+体系。下一阶段若要接近它，应优先补齐跨平台 CI 与发布包、TLS/HTTP/2/WebSocket、
+可观测性/日志、基准门禁和稳定的 Linux io_uring 验证，再扩展协议和序列化组件。

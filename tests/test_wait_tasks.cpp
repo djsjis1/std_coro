@@ -11,6 +11,17 @@ using namespace std::chrono_literals;
 
 namespace {
 
+    struct NonDefault {
+        explicit NonDefault(int v) : value(v) {}
+        NonDefault() = delete;
+        NonDefault(const NonDefault&) = delete;
+        NonDefault& operator=(const NonDefault&) = delete;
+        NonDefault(NonDefault&&) noexcept = default;
+        NonDefault& operator=(NonDefault&&) = delete;
+
+        int value;
+    };
+
     // ── 命名协程函数 ──
 
     coro::Task<int> num_after(int value, int ms) {
@@ -22,6 +33,19 @@ namespace {
         co_await coro::sleep(std::chrono::milliseconds(ms));
         throw std::runtime_error("wait task failed");
         co_return 0;
+    }
+
+    coro::Task<int> fail_immediately() {
+        throw std::runtime_error("late failure");
+        co_return 0;
+    }
+
+    coro::Task<int> succeed_immediately(int value) {
+        co_return value;
+    }
+
+    coro::Task<NonDefault> non_default_value(int value) {
+        co_return NonDefault{value};
     }
 
     std::vector<coro::Task<int>> make_nums() {
@@ -106,6 +130,39 @@ namespace {
         *size = results.size();
     }
 
+    coro::Task<> first_completed_success_is_stable(int* result, bool* threw) {
+        std::vector<coro::Task<int>> tasks;
+        tasks.push_back(succeed_immediately(17));
+        tasks.push_back(fail_immediately());
+        try {
+            auto results = co_await coro::wait_tasks(std::move(tasks), coro::WaitMode::FirstCompleted);
+            *result = results.front();
+        } catch (...) {
+            *threw = true;
+        }
+    }
+
+    coro::Task<> non_default_results_scenario(int* gather_sum, int* wait_sum, int* any_value) {
+        // 显式走 Task 的移动赋值路径；结果类型本身不可赋值。
+        auto reassigned = non_default_value(1);
+        reassigned = non_default_value(2);
+
+        std::vector<coro::Task<NonDefault>> gathered;
+        gathered.push_back(non_default_value(3));
+        gathered.push_back(non_default_value(4));
+        auto gather_results = co_await coro::gather_all(std::move(gathered));
+        *gather_sum = gather_results[0].value + gather_results[1].value;
+
+        std::vector<coro::Task<NonDefault>> waited;
+        waited.push_back(non_default_value(5));
+        waited.push_back(non_default_value(6));
+        auto wait_results = co_await coro::wait_tasks(std::move(waited), coro::WaitMode::AllCompleted);
+        *wait_sum = wait_results[0].value + wait_results[1].value;
+
+        auto first = co_await coro::wait_any(non_default_value(7), non_default_value(8));
+        *any_value = first.value;
+    }
+
 } // namespace
 
 TEST(WaitTasksTest, FirstCompletedReturnsFastest) {
@@ -153,4 +210,22 @@ TEST(WaitTasksTest, EmptyTaskList) {
     size_t size = 1;
     test_util::run_task([&] { return empty_scenario(&size); });
     EXPECT_EQ(size, 0u);
+}
+
+TEST(WaitTasksTest, FirstCompletedIgnoresLaterFailure) {
+    int result = 0;
+    bool threw = false;
+    test_util::run_task([&] { return first_completed_success_is_stable(&result, &threw); });
+    EXPECT_FALSE(threw);
+    EXPECT_EQ(result, 17);
+}
+
+TEST(WaitTasksTest, SupportsMoveConstructOnlyResults) {
+    int gather_sum = 0;
+    int wait_sum = 0;
+    int any_value = 0;
+    test_util::run_task([&] { return non_default_results_scenario(&gather_sum, &wait_sum, &any_value); });
+    EXPECT_EQ(gather_sum, 7);
+    EXPECT_EQ(wait_sum, 11);
+    EXPECT_TRUE(any_value == 7 || any_value == 8);
 }

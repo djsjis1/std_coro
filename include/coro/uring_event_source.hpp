@@ -2,7 +2,8 @@
 
 #include "event_source.hpp"
 
-#ifdef __linux__
+#if defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING)
+#define CORO_URING_ENABLED 1
 #include <liburing.h>
 #include <sys/eventfd.h>
 #include <poll.h>
@@ -45,7 +46,7 @@
 namespace coro {
     namespace detail {
 
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
 
         // ---- 每个异步 I/O 操作的状态 ----
         // user_data 字段保存此指针, CQE 到达时通过它找回协程。
@@ -62,13 +63,18 @@ namespace coro {
 
     namespace net {
 
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
 
         class UringEventSource : public EventSource {
           public:
             // 完成队列深度 256: 同时挂起的异步操作上限 (可按需调大)
             UringEventSource() {
-                io_uring_queue_init(256, &ring_, 0);
+                int ret = io_uring_queue_init(256, &ring_, 0);
+                if (ret < 0) {
+                    valid_ = false;
+                    return; // 初始化失败, 后续操作检查 valid()
+                }
+                valid_ = true;
                 // 创建 eventfd 用于跨线程唤醒
                 wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
                 if (wake_fd_ >= 0) {
@@ -82,6 +88,9 @@ namespace coro {
                     close(wake_fd_);
                 io_uring_queue_exit(&ring_);
             }
+
+            /// 底层 ring 是否有效 (初始化失败时返回 false)
+            bool valid() const { return valid_; }
 
             /// 获取底层 ring (网络层提交 SQE 用)
             io_uring* handle() { return &ring_; }
@@ -118,7 +127,7 @@ namespace coro {
                     return 1;
 
                 // 没有就绪的 CQE, 带超时等待 (定时器到点 / 新 CQE / 被唤醒)
-                struct __kernel_timespec ts {};
+                struct __kernel_timespec ts{};
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 
@@ -179,13 +188,14 @@ namespace coro {
             }
 
             io_uring ring_;
+            bool valid_ = false;              // io_uring 初始化是否成功
             int wake_fd_ = -1;                // eventfd 用于跨线程唤醒
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数
             std::mutex tracked_mutex_;
             std::unordered_set<detail::uring_op*> tracked_ops_; // 存活的 op (帧未销毁)
         };
 
-#endif // __linux__
+#endif // CORO_URING_ENABLED
 
     } // namespace net
 } // namespace coro

@@ -1,16 +1,64 @@
 # ============================================================================
-# coro 开发仓库根 CMake — examples / 单元测试 (库本体见 coro/ 子目录)
+# coro — C++20 协程事件循环框架 (header-only)
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
-project(coro_dev LANGUAGES CXX)
+project(coro VERSION 0.1.0 LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+option(CORO_BUILD_EXAMPLES "构建示例与压力程序" ON)
+option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
 
 # 单配置生成器 (Ninja/Makefile) 默认 Release; 多配置 (VS) 由 --config 决定
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# 库: header-only, 目标名 coro::coro (含 include 路径 + 平台链接库)
-add_subdirectory(coro)
+# ---- 库 target: header-only INTERFACE 库 ----
+add_library(coro INTERFACE)
+add_library(coro::coro ALIAS coro)
+
+target_include_directories(coro INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_features(coro INTERFACE cxx_std_20)
+
+if(MSVC)
+    target_compile_options(coro INTERFACE /utf-8 /EHsc)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+    target_compile_options(coro INTERFACE -fcoroutines)
+endif()
+
+# 平台链接库
+set(CORO_HAS_URING OFF)
+if(WIN32)
+    target_link_libraries(coro INTERFACE ws2_32)
+endif()
+if(UNIX)
+    target_link_libraries(coro INTERFACE pthread)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_URING)
+    find_path(URING_INCLUDE_DIR liburing.h)
+    find_library(URING_LIB uring)
+    if(URING_INCLUDE_DIR AND URING_LIB)
+        set(CORO_HAS_URING ON)
+        if(NOT TARGET uring::uring)
+            add_library(uring::uring UNKNOWN IMPORTED)
+            set_target_properties(uring::uring PROPERTIES
+                IMPORTED_LOCATION "${URING_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${URING_INCLUDE_DIR}")
+        endif()
+        target_link_libraries(coro INTERFACE uring::uring)
+    else()
+        set(CORO_HAS_URING OFF)
+        message(WARNING "liburing headers/library not found: Linux I/O modules are disabled; core timers/tasks use CVEventSource.")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(STATUS "io_uring disabled by CORO_ENABLE_URING=OFF; building portable core only.")
+endif()
+target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router
 add_subdirectory(router)
@@ -38,17 +86,18 @@ if(WIN32)
     set(CORO_HAS_FSWATCH ON)
     set(CORO_HAS_PROCESS ON)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(CORO_HAS_NET ON)
-    set(CORO_HAS_FS ON)
-    set(CORO_HAS_PIPE ON)
+    set(CORO_HAS_NET ${CORO_HAS_URING})
+    set(CORO_HAS_FS ${CORO_HAS_URING})
+    set(CORO_HAS_PIPE ${CORO_HAS_URING})
     set(CORO_HAS_SIGNAL ON)
-    set(CORO_HAS_FSWATCH ON)
-    # process: GCC 12 coroutine ICE (structured bindings + co_await), 待 GCC 13+ 后启用
+    set(CORO_HAS_FSWATCH ${CORO_HAS_URING})
+    set(CORO_HAS_PROCESS ${CORO_HAS_URING})
 endif()
 
 # ============================================================================
 # 示例
 # ============================================================================
+if(CORO_BUILD_EXAMPLES)
 add_executable(example_basic examples/basic.cpp)
 target_link_libraries(example_basic PRIVATE coro::coro)
 
@@ -96,6 +145,7 @@ endif()
 # Web 服务器示例 (coro 网络层 + llhttp 协议解析, 独立子项目)
 if(CORO_HAS_NET)
     add_subdirectory(Web)
+    add_subdirectory(tcp_udp)
 endif()
 
 # 协程练习场 (main.cpp 用于练习写协程代码)
@@ -105,6 +155,7 @@ target_link_libraries(coro_practice PRIVATE coro::coro)
 # 高并发压力测试 (独立程序, 不计入常规 ctest)
 add_executable(coro_stress tests/stress.cpp)
 target_link_libraries(coro_stress PRIVATE coro::coro)
+endif()
 
 # ============================================================================
 # 单元测试 (googletest, 集成于 thirdparty/googletest-main)
@@ -117,12 +168,37 @@ if(CORO_BUILD_TESTS)
     set(gtest_build_samples OFF CACHE BOOL "" FORCE)
     set(gtest_build_tests OFF CACHE BOOL "" FORCE)
     set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     # gtest 用与项目一致的动态 CRT (避免 MTd/MDd 链接冲突)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    add_subdirectory(thirdparty/googletest-main)
+    add_subdirectory(thirdparty/googletest-main EXCLUDE_FROM_ALL)
 
     file(GLOB CORO_TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.cpp)
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
     add_test(NAME coro_tests COMMAND coro_tests)
 endif()
+
+# ============================================================================
+# 安装与 find_package(coro CONFIG REQUIRED)
+# ============================================================================
+install(TARGETS coro EXPORT coroTargets)
+install(DIRECTORY include/coro DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT coroTargets
+    FILE coroTargets.cmake
+    NAMESPACE coro::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/coro)
+
+configure_package_config_file(
+    cmake/coroConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/coroConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/coro)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/coroConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/coroConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/coroConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/coro)

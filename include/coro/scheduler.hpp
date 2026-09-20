@@ -62,10 +62,12 @@ namespace coro {
             }
         }
 
-        /// 停止并 join 所有 worker (等待正在跑的任务自然结束)
+        /// 停止并 join 所有 worker (先等待已分发任务完成)
         ~Scheduler() {
-            // 逐个 stop+join: 确保每个 worker 的 EventLoop 完全析构后
-            // 再处理下一个, 防止主线程 stop() 访问正在销毁的 EventLoop
+            // 1. 等待所有已投递任务完成 (带自适应退避, 同 wait_all)
+            wait_all();
+            // 2. 逐个 stop+join: 确保每个 worker 的 EventLoop 完全析构后
+            //    再处理下一个, 防止主线程 stop() 访问正在销毁的 EventLoop
             for (auto& w : workers_) {
                 auto* lp = w.loop.load(std::memory_order_acquire);
                 if (lp)
@@ -96,11 +98,15 @@ namespace coro {
             workers_[best]
                 .loop.load(std::memory_order_acquire)
                 ->dispatch([this, factory = std::move(factory)]() mutable {
-                    // 在 worker 线程: 创建帧 → 启动 → 自持有
-                    auto t = factory();
-                    t.start();
-                    t.detach();            // 协程自持有到完成 (帧在 worker 线程销毁)
-                    --pending_dispatches_; // start 已登记活跃计数 → 放行 wait_all
+                    try {
+                        // 在 worker 线程: 创建帧 → 启动 → 自持有
+                        auto t = factory();
+                        t.start();
+                        t.detach(); // 协程自持有到完成 (帧在 worker 线程销毁)
+                    } catch (...) {
+                        // factory 抛异常: 记录但不传播 (防止 std::terminate)
+                    }
+                    --pending_dispatches_; // 放行 wait_all
                 });
         }
 

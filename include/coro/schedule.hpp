@@ -18,8 +18,8 @@
 // 生命周期: 所有调度均使用"命名协程函数 + detach 自持有"模式,
 //   monitor 协程启动后即 detach, 协程帧自持有运行到完成
 //   (final_suspend 时自动销毁), 调用者无需管理生命周期。
-//   (不用 self-referencing lambda: MSVC Debug 下 lambda 捕获变量
-//    可能不被正确复制进协程帧, 见 README/14 讲)
+//   (不用 self-referencing 临时 lambda: 捕获属于闭包对象，闭包可能先析构，
+//    见 README/14 讲)
 // ============================================================================
 
 namespace coro {
@@ -27,7 +27,7 @@ namespace coro {
     namespace detail {
 
         // ==================================================================
-        // call_soon 的执行协程: 命名函数, 参数进帧 (规避 MSVC Debug 问题)
+        // call_soon 的执行协程: 命名函数, 参数进帧 (避免闭包生命周期依赖)
         // ==================================================================
         template <typename F> Task<void> call_soon_impl(F func) {
             if constexpr (std::is_invocable_v<F>) {

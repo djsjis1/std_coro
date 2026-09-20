@@ -6,7 +6,7 @@
 
 #ifdef _WIN32
 // windows.h / winsock2.h 已由 io.hpp 引入
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -105,9 +105,13 @@ namespace coro {
             /// 接管已打开的 OVERLAPPED 句柄并关联当前 loop 的 IOCP
             /// (正常用法是 co_await fs::open(), 手动构造用于接管外部句柄)
             explicit File(HANDLE h) : handle_(h) {
-                if (valid())
-                    if (auto* iocp = EventLoop::get().iocp())
-                        iocp->associate(handle_);
+                if (valid()) {
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp || !iocp->associate(handle_)) {
+                        io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
+                        close();
+                    }
+                }
             }
 
             ~File() { close(); }
@@ -150,6 +154,12 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp) {
+                        op.error = ERROR_NOT_SUPPORTED;
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     // OVERLAPPED 的 64 位偏移 = Offset (低32) + OffsetHigh (高32)
                     op.ov.Offset = (DWORD)(offset & 0xFFFFFFFFull);
                     op.ov.OffsetHigh = (DWORD)(offset >> 32);
@@ -163,8 +173,7 @@ namespace coro {
                         EventLoop::get().schedule(h);
                     } else {
                         // IO_PENDING 或同步完成: 关联 IOCP 的句柄都会投递完成包
-                        if (auto* iocp = EventLoop::get().iocp())
-                            iocp->op_start();
+                        iocp->op_start();
                     }
                 }
 
@@ -205,6 +214,12 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp) {
+                        op.error = ERROR_NOT_SUPPORTED;
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     op.ov.Offset = (DWORD)(offset & 0xFFFFFFFFull);
                     op.ov.OffsetHigh = (DWORD)(offset >> 32);
                     DWORD written = 0;
@@ -213,8 +228,7 @@ namespace coro {
                         op.error = GetLastError();
                         EventLoop::get().schedule(h);
                     } else {
-                        if (auto* iocp = EventLoop::get().iocp())
-                            iocp->op_start();
+                        iocp->op_start();
                     }
                 }
 
@@ -318,7 +332,7 @@ namespace coro {
             return st;
         }
 
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
 
         // ==================================================================
         // Linux 实现 — io_uring 文件 IO (结构与 Windows 层对称)
@@ -557,6 +571,9 @@ namespace coro {
                 ~open_awaiter() {
                     if (uring_)
                         uring_->untrack_op(&op);
+                    // open 成功与取消竞态时 await_resume 可能被跳过。
+                    if (uring_ && !op.error && op.result >= 0)
+                        ::close(op.result);
                 }
 
                 bool await_ready() const noexcept { return false; }
@@ -595,7 +612,7 @@ namespace coro {
                 File await_resume() {
                     if (op.error)
                         io::set_error(op.error);
-                    return File(op.result); // cqe->res 即新 fd (失败为负)
+                    return File(std::exchange(op.result, -1)); // cqe->res 即新 fd (失败为负)
                 }
             };
 
@@ -637,6 +654,7 @@ namespace coro {
 
 #endif
 
+#if defined(_WIN32) || defined(CORO_URING_ENABLED)
         // ==================================================================
         // 便捷函数 (跨平台)
         // ==================================================================
@@ -672,6 +690,8 @@ namespace coro {
                     break; // EOF (文件被并发截断): 返回已读部分
                 off += (uint64_t)n;
             }
+            if (off < out.size())
+                out.resize((size_t)off); // 并发截断: 缩到实际大小 (消除尾部 NUL)
             co_return out;
         }
 
@@ -690,6 +710,7 @@ namespace coro {
             }
             co_return true;
         }
+#endif
 
     } // namespace fs
 } // namespace coro

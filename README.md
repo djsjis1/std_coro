@@ -11,7 +11,8 @@
 >   ⚡ 性能: [docs/performance.md](docs/performance.md) ·
 >   🛠 FAQ: [docs/faq.md](docs/faq.md)
 
-类似 Python **asyncio** 的 C++20 协程库，header-only、零依赖。核心能力：
+类似 Python **asyncio** 的 C++20 协程库，核心部分 header-only；平台 IO 使用系统库，
+Linux 的 io_uring 为可选依赖。核心能力：
 
 - **asyncio 完整对标**:`sleep`/`spawn`/`gather`/`wait_for`/`wait_tasks`/`TaskGroup`(结构化并发)/`ExceptionGroup`/`Future`/`Lock`/`Semaphore`/`Event`/`Condition`/`Queue`(含 join)/`to_thread`
 - **多核并行**:每线程独立事件循环(对标 asyncio 的 loop-per-thread),跨线程唤醒自动路由
@@ -52,6 +53,23 @@ int main() {
 计算完成!
 结果: 42
 ```
+
+## 安装为 CMake 包
+
+核心库提供 `coro::coro` 的安装导出，应用侧可直接使用：
+
+```powershell
+cmake -S . -B build -DCORO_BUILD_TESTS=OFF -DCORO_BUILD_EXAMPLES=OFF
+cmake --build build --config Release
+cmake --install build --config Release --prefix <install-prefix>
+```
+
+```cmake
+find_package(coro CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE coro::coro)
+```
+
+安装与平台验证边界见 [质量基线与发布说明](docs/quality-status.md)。
 
 ## Python asyncio → C++20 映射速查
 
@@ -292,6 +310,7 @@ coro::signal::handler h = coro::signal::handle(SIGINT, [] { return shutdown_task
 co_await coro::signal::wait(SIGTERM);         // 单次等待
 
 // 目录监视
+// Windows 和 Linux 都支持递归子目录
 auto w = co_await coro::fs::watch("src", /*recursive=*/true);
 coro::fs::watch_event ev = co_await w.next(); // created/removed/modified/renamed
 
@@ -418,32 +437,48 @@ cmake --build build --config Release --target coro_stress
 |---|---|
 | **线程模型** | 每线程一个事件循环 (对标 asyncio loop-per-thread): 同线程内单线程语义, 多线程各跑各的 loop 即多核并行; 协程不能跨线程迁移 |
 | **跨线程 set_value** | `Promise::set_value()` 可从任意线程调用 (自动路由唤醒到等待者所在的 loop) |
-| **Task 生命周期** | `Task` 对象必须保持存活直到协程完成（否则 UB）；spawn 的返回值必须保存 |
+| **Task 生命周期** | 析构未完成的 `Task` 会安全放弃/销毁该任务；若希望任务继续运行，必须保存 `spawn` 返回值，或明确调用 `detach()` |
 | **取消语义** | `Task::cancel()` 对标 Python：协程在下一个 await 点收到 `CancelledError`（可 catch 做清理），循环任务也能终止。请在事件循环线程调用；挂起在 I/O 上的任务会先取消底层 I/O（CancelIoEx / ASYNC_CANCEL），由完成包唤醒 |
 | **嵌套 run()** | 不支持（检测到嵌套调用会直接返回） |
 | **协作式调度** | 无栈协作式: 协程体内不要写不含 co_await 的死循环, 否则阻塞整个事件循环 (与 Python asyncio 相同, Go 无此限制) |
-| **lambda 协程 (MSVC Debug)** | 见下方说明 |
+| **lambda 协程** | 支持；捕获存放在闭包对象中，闭包必须活到协程结束，或改用无捕获 lambda + 参数 |
 
-### MSVC Debug 下避免 lambda 协程捕获
+### lambda 协程：支持，但要管理闭包生命周期
 
-在 MSVC **Debug** 模式下，**lambda 协程的捕获变量可能不会被正确复制进协程帧**，
-导致协程挂起后恢复时读取到错误值（表现为数据错乱或恢复点损坏）。Release 模式无此问题。
-
-库内部的 `wait_for` / `wait_any` / `gather_all` / `gather_void` 已全部改用
-**命名协程函数**（参数进协程帧，生命周期由标准保证）规避此问题。
-
-编写自己的协程时，**建议用命名函数 + 参数传递**代替 lambda 捕获：
+lambda 当然可以作为协程。容易踩坑的是**捕获型协程 lambda 的临时闭包**：
+捕获属于 lambda 闭包对象，不会自动复制进协程帧；协程挂起后若闭包已经析构，
+再次访问捕获就是 use-after-free。这个规则与 Debug/Release、MSVC/GCC/Clang 无关。
 
 ```cpp
-// ❌ 不推荐 (MSVC Debug 下捕获的 i 可能出错)
-for (int i = 0; i < 3; i++)
-    tasks.push_back([i]() -> coro::Task<int> { co_return i * 10; }());
+// ❌ 临时捕获闭包在本语句结束时析构，Task 之后恢复会访问悬空的闭包
+for (int i = 0; i < 3; ++i)
+    tasks.push_back([i]() -> coro::Task<int> {
+        co_await coro::yield();
+        co_return i * 10;
+    }());
 
-// ✅ 推荐 (参数进协程帧, 标准保证生命周期)
+// ✅ 无捕获 lambda；i 是按值参数，复制进协程帧
+auto worker = [](int i) -> coro::Task<int> {
+    co_await coro::yield();
+    co_return i * 10;
+};
+for (int i = 0; i < 3; ++i)
+    tasks.push_back(worker(i));
+
+// ✅ 捕获也可以，只要 worker 闭包确定活到 task 完成
+int result = 0;
+auto captured_worker = [&result]() -> coro::Task<> {
+    co_await coro::yield();
+    result = 42;
+};
+auto task = captured_worker();
+co_await task; // worker 此时仍然存活
+
+// ✅ 复杂/逃逸任务优先用命名函数，生命周期最直观
 coro::Task<int> make_task(int i) { co_return i * 10; }
-for (int i = 0; i < 3; i++)
+for (int i = 0; i < 3; ++i)
     tasks.push_back(make_task(i));
 ```
 
-同样，需要“自持有”（fire-and-forget）的后台协程，应用命名函数 + `shared_ptr` 参数
-自引用，而非 lambda 捕获自身（参考 `wait.hpp` 中 `wait_for_timer_impl` 的写法）。
+需要 fire-and-forget 时优先使用命名函数或无捕获 lambda，把所有权对象作为
+按值参数传入协程帧；不要指望捕获 `shared_ptr` 能延长临时闭包自身的生命周期。

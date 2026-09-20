@@ -1,5 +1,5 @@
 // test_net_advanced.cpp — 网络高级场景: 多连接/大数据/拒绝/多轮读写
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -36,7 +36,7 @@ namespace {
         }
     }
 
-    coro::Task<> multi_client_worker(int id, bool* ok) {
+    coro::Task<> multi_client_worker(int id, int* ok) {
         auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 19001);
         if (!conn.valid())
             co_return;
@@ -48,7 +48,7 @@ namespace {
         char buf[64];
         int n = co_await conn.read(buf, sizeof(buf));
         if (n == len && memcmp(buf, msg, (size_t)len) == 0)
-            *ok = true;
+            *ok = 1;
         conn.close();
     }
 
@@ -66,7 +66,7 @@ namespace {
         std::vector<coro::Task<>> clients;
         for (int i = 0; i < n_clients; ++i) {
             results->push_back(0);
-            clients.push_back(multi_client_worker(i, reinterpret_cast<bool*>(&results->back())));
+            clients.push_back(multi_client_worker(i, &results->back()));
         }
         for (auto& c : clients)
             c.start();
@@ -192,17 +192,19 @@ namespace {
     }
 
     // ── 快速连接/断开循环: 检测资源泄漏 ──
+    // acceptor 用命名函数协程 (临时 lambda 闭包销毁后 use-after-return)
+    coro::Task<> quick_accept(coro::net::TcpListener* listener) {
+        auto conn = co_await listener->accept();
+        // 立即关闭 (conn 析构)
+    }
+
     coro::Task<> rapid_connect_loop(int iterations, int* success_count) {
         for (int i = 0; i < iterations; ++i) {
             coro::net::TcpListener listener;
             if (!listener.bind_listen("127.0.0.1", 19010 + (i % 10)))
                 continue;
 
-            auto acceptor_task = ([&listener]() -> coro::Task<> {
-                auto conn = co_await listener.accept();
-                // 立即关闭
-            })();
-            auto acceptor = coro::spawn(std::move(acceptor_task));
+            auto acceptor = coro::spawn(quick_accept(&listener));
 
             co_await coro::sleep(5ms);
             auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", 19010 + (i % 10));

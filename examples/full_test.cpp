@@ -1,15 +1,45 @@
 // full_test.cpp — 综合功能验证
 #include <coro/coro.hpp>
+#include <algorithm>
 #include <iostream>
 #include <vector>
 using namespace std::chrono_literals;
 
+coro::Task<int> delayed_value(int value, std::chrono::milliseconds delay) {
+    co_await coro::sleep(delay);
+    co_return value;
+}
+
+coro::Task<> lock_worker(coro::Lock* lock, int* counter) {
+    auto guard = co_await lock->guard();
+    ++*counter;
+}
+
+coro::Task<> semaphore_worker(coro::Semaphore* sem, int* current, int* max_seen) {
+    auto guard = co_await sem->guard();
+    ++*current;
+    *max_seen = std::max(*max_seen, *current);
+    co_await coro::yield();
+    --*current;
+}
+
+coro::Task<> event_waiter(coro::Event* event) {
+    co_await event->wait();
+}
+
+coro::Task<> queue_producer(coro::Queue<int>* queue) {
+    co_await queue->put(10);
+    co_await queue->put(20);
+}
+
+coro::Task<> set_flag_later(bool* flag) {
+    co_await coro::sleep(50ms);
+    *flag = true;
+}
+
 // 1. cancel
 coro::Task<> t1_cancel() {
-    auto t = coro::spawn([]() -> coro::Task<int> {
-        co_await coro::sleep(10s);
-        co_return 42;
-    }());
+    auto t = coro::spawn(delayed_value(42, 10s));
     t.cancel();
     try {
         co_await std::move(t);
@@ -22,12 +52,7 @@ coro::Task<> t1_cancel() {
 // 2. wait_for timeout
 coro::Task<> t2_wait_for_timeout() {
     try {
-        co_await coro::wait_for(
-            []() -> coro::Task<int> {
-                co_await coro::sleep(10s);
-                co_return 1;
-            }(),
-            100ms);
+        co_await coro::wait_for(delayed_value(1, 10s), 100ms);
         std::cout << "  FAIL" << std::endl;
     } catch (const coro::TimeoutError&) {
         std::cout << "  OK: timeout" << std::endl;
@@ -36,12 +61,7 @@ coro::Task<> t2_wait_for_timeout() {
 
 // 3. wait_for success
 coro::Task<> t3_wait_for_ok() {
-    auto r = co_await coro::wait_for(
-        []() -> coro::Task<int> {
-            co_await coro::sleep(50ms);
-            co_return 42;
-        }(),
-        200ms);
+    auto r = co_await coro::wait_for(delayed_value(42, 50ms), 200ms);
     std::cout << "  OK: result=" << r << std::endl;
 }
 
@@ -49,12 +69,9 @@ coro::Task<> t3_wait_for_ok() {
 coro::Task<> t4_lock() {
     coro::Lock lock;
     int c = 0;
-    auto w = [&](int) -> coro::Task<> {
-        co_await lock.acquire();
-        c++;
-        lock.release();
-    };
-    auto a = coro::spawn(w(1)), b = coro::spawn(w(2)), d = coro::spawn(w(3));
+    auto a = coro::spawn(lock_worker(&lock, &c));
+    auto b = coro::spawn(lock_worker(&lock, &c));
+    auto d = coro::spawn(lock_worker(&lock, &c));
     co_await std::move(a);
     co_await std::move(b);
     co_await std::move(d);
@@ -65,16 +82,10 @@ coro::Task<> t4_lock() {
 coro::Task<> t5_sem() {
     coro::Semaphore sem(2);
     int max = 0, cur = 0;
-    auto w = [&](int) -> coro::Task<> {
-        co_await sem.acquire();
-        cur++;
-        if (cur > max)
-            max = cur;
-        co_await coro::yield();
-        cur--;
-        sem.release();
-    };
-    auto a = coro::spawn(w(1)), b = coro::spawn(w(2)), c = coro::spawn(w(3)), d = coro::spawn(w(4));
+    auto a = coro::spawn(semaphore_worker(&sem, &cur, &max));
+    auto b = coro::spawn(semaphore_worker(&sem, &cur, &max));
+    auto c = coro::spawn(semaphore_worker(&sem, &cur, &max));
+    auto d = coro::spawn(semaphore_worker(&sem, &cur, &max));
     co_await std::move(a);
     co_await std::move(b);
     co_await std::move(c);
@@ -85,7 +96,7 @@ coro::Task<> t5_sem() {
 // 6. Event
 coro::Task<> t6_event() {
     coro::Event ev;
-    auto waiter = coro::spawn([&]() -> coro::Task<> { co_await ev.wait(); }());
+    auto waiter = coro::spawn(event_waiter(&ev));
     co_await coro::sleep(50ms);
     ev.set();
     co_await std::move(waiter);
@@ -95,10 +106,7 @@ coro::Task<> t6_event() {
 // 7. Queue
 coro::Task<> t7_queue() {
     coro::Queue<int> q;
-    auto prod = coro::spawn([&]() -> coro::Task<> {
-        co_await q.put(10);
-        co_await q.put(20);
-    }());
+    auto prod = coro::spawn(queue_producer(&q));
     int a = co_await q.get(), b = co_await q.get();
     co_await std::move(prod);
     std::cout << "  OK: " << a << ", " << b << std::endl;
@@ -107,18 +115,14 @@ coro::Task<> t7_queue() {
 // 8. call_later (spawn + 保存模式, 验证 self-referencing 是否问题根源)
 coro::Task<> t8_call_later() {
     bool ok = false;
-    // 不用 self-referencing: 用 spawn + 保存返回值
-    auto inner = coro::spawn([&ok]() -> coro::Task<void> {
-        co_await coro::sleep(50ms);
-        ok = true;
-    }());
+    auto inner = coro::spawn(set_flag_later(&ok));
     co_await coro::sleep(100ms);
     co_await std::move(inner);
     std::cout << "  OK: " << (ok ? "fired" : "MISS") << std::endl;
 }
 
 // 9. gather_all (用库函数, 命名协程函数实现)
-// 注意: 任务用命名函数 (参数进帧), 避免 MSVC Debug 下 lambda 捕获问题
+// 任务用命名函数按值传参，避免临时捕获闭包先于 Task 析构
 coro::Task<int> gather_task_impl(int i) {
     co_await coro::sleep(30ms);
     co_return i * 10;

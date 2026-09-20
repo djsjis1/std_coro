@@ -2,18 +2,28 @@
 
 #include "io.hpp"
 #include "task.hpp"
+#if defined(CORO_URING_ENABLED)
+#include "wait.hpp"
+#endif
 
 #ifdef _WIN32
 // windows.h 已由 io.hpp 引入
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
+#include <cerrno>
+#include <poll.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <deque>
+#include <filesystem>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 // ============================================================================
 // coro::fs::watch — 目录监视 (对标 Python watchfiles / inotify)
@@ -30,8 +40,8 @@
 // 平台实现 (与 net/fs/pipe 同一条完成路径):
 //   Windows → ReadDirectoryChangesW (目录句柄 FILE_FLAG_BACKUP_SEMANTICS |
 //             FILE_FLAG_OVERLAPPED, 关联 IOCP; 原生支持递归)
-//   Linux   → inotify_init1 + inotify_add_watch, inotify fd 经 io_uring 读;
-//             递归 = 遍历子目录逐个加 watch + 动态跟踪新子目录
+//   Linux   → inotify_init1 + inotify_add_watch, io_uring 等 POLLIN 后非阻塞读 fd;
+//             递归模式维护 wd→相对路径映射，并动态跟踪新增/移入的子目录。
 //
 // 事件语义:
 //   - 一次完成可能携带多条事件, next() 逐条返回 (内部有 pending 队列)
@@ -86,9 +96,13 @@ namespace coro {
 
             /// 接管已打开的目录句柄 (正常用法: co_await fs::watch(...))
             explicit DirectoryWatcher(HANDLE dir, bool recursive) : dir_(dir), recursive_(recursive) {
-                if (valid())
-                    if (auto* iocp = EventLoop::get().iocp())
-                        iocp->associate(dir_);
+                if (valid()) {
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp || !iocp->associate(dir_)) {
+                        io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
+                        close();
+                    }
+                }
             }
 
             ~DirectoryWatcher() { close(); }
@@ -128,6 +142,12 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    auto* iocp = EventLoop::get().iocp();
+                    if (!iocp) {
+                        op.error = ERROR_NOT_SUPPORTED;
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     op.ov.Offset = 0;
                     op.ov.OffsetHigh = 0;
                     DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME |  // 创建/删除/重命名
@@ -143,8 +163,7 @@ namespace coro {
                         op.error = GetLastError();
                         EventLoop::get().schedule(h);
                     } else {
-                        if (auto* iocp = EventLoop::get().iocp())
-                            iocp->op_start();
+                        iocp->op_start();
                     }
                 }
 
@@ -205,6 +224,7 @@ namespace coro {
                 while (true) {
                     auto* ni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(p);
                     std::string name = detail_watch::wide_to_utf8(ni->FileName, ni->FileNameLength / sizeof(WCHAR));
+                    std::replace(name.begin(), name.end(), '\\', '/');
                     watch_event ev;
                     bool has_event = true;
                     switch (ni->Action) {
@@ -267,7 +287,7 @@ namespace coro {
             co_return DirectoryWatcher(dir, recursive);
         }
 
-#elif defined(__linux__)
+#elif defined(CORO_URING_ENABLED)
 
         // ==================================================================
         // Linux 实现 — inotify + io_uring (结构对称于 Windows 层)
@@ -277,19 +297,33 @@ namespace coro {
         class DirectoryWatcher {
           public:
             DirectoryWatcher() = default;
-            explicit DirectoryWatcher(int fd, bool recursive) : fd_(fd), recursive_(recursive) {}
+            explicit DirectoryWatcher(int fd, std::string root, bool recursive) : fd_(fd), recursive_(recursive) {
+                std::error_code ec;
+                root_path_ = std::filesystem::absolute(std::filesystem::path(std::move(root)), ec).lexically_normal();
+                if (ec) {
+                    io::set_error(ec.value());
+                    close();
+                    return;
+                }
+                if (!add_watch_tree(""))
+                    close();
+            }
             ~DirectoryWatcher() { close(); }
 
             DirectoryWatcher(DirectoryWatcher&& other) noexcept
-                : fd_(std::exchange(other.fd_, -1)), recursive_(other.recursive_), pending_(std::move(other.pending_)) {
-            }
+                : fd_(std::exchange(other.fd_, -1)), recursive_(other.recursive_),
+                  root_path_(std::move(other.root_path_)), pending_(std::move(other.pending_)),
+                  wd_paths_(std::move(other.wd_paths_)), pending_moves_(std::move(other.pending_moves_)) {}
 
             DirectoryWatcher& operator=(DirectoryWatcher&& other) noexcept {
                 if (this != &other) {
                     close();
                     fd_ = std::exchange(other.fd_, -1);
                     recursive_ = other.recursive_;
+                    root_path_ = std::move(other.root_path_);
                     pending_ = std::move(other.pending_);
+                    wd_paths_ = std::move(other.wd_paths_);
+                    pending_moves_ = std::move(other.pending_moves_);
                 }
                 return *this;
             }
@@ -301,7 +335,7 @@ namespace coro {
 
             struct read_awaiter {
                 DirectoryWatcher* w;
-                char buf[4096];
+                alignas(struct inotify_event) char buf[64 * 1024];
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
@@ -337,27 +371,52 @@ namespace coro {
                         EventLoop::get().schedule(h);
                         return;
                     }
-                    io_uring_prep_read(sqe, w->fd_, buf, sizeof(buf), -1);
+                    // inotify fd 必须保持 O_NONBLOCK，而直接 IORING_OP_READ 在
+                    // 部分内核上会立即返回 EAGAIN。先用 poll 等就绪，
+                    // 完成时再在 loop 线程做一次不阻塞 read。
+                    io_uring_prep_poll_add(sqe, w->fd_, POLLIN);
                     detail::uring_submit(u, sqe, &op);
                     uring_ = u;
                     u->track_op(&op);
                 }
 
-                void await_resume() { w->parse_records(buf, op.result); }
+                void await_resume() {
+                    if (op.result < 0) {
+                        w->parse_records(buf, op.result);
+                        return;
+                    }
+
+                    ssize_t bytes;
+                    do {
+                        bytes = ::read(w->fd_, buf, sizeof(buf));
+                    } while (bytes < 0 && errno == EINTR);
+                    if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                        return; // 就绪到 read 之间被消费：重新等 poll
+                    w->parse_records(buf, bytes < 0 ? -errno : static_cast<int>(bytes));
+                }
             };
 
             Task<watch_event> next() {
-                if (!pending_.empty())
-                    co_return pop_pending();
-                if (!valid()) {
-                    io::set_error(EBADF);
-                    co_return watch_event{};
+                while (true) {
+                    if (!pending_.empty())
+                        co_return pop_pending();
+                    if (!valid()) {
+                        io::set_error(EBADF);
+                        co_return watch_event{};
+                    }
+
+                    if (pending_moves_.empty()) {
+                        co_await read_batch();
+                    } else {
+                        // MOVED_FROM/MOVED_TO 可能被拆到两次 read。短暂等待
+                        // 下一批；超时则把未配对项当作移出/删除。
+                        try {
+                            co_await coro::wait_for(read_batch(), std::chrono::milliseconds(20));
+                        } catch (const TimeoutError&) {
+                            flush_pending_moves();
+                        }
+                    }
                 }
-                read_awaiter aw{this, {}, {}};
-                co_await aw;
-                if (pending_.empty())
-                    co_return co_await next();
-                co_return pop_pending();
             }
 
             void close() {
@@ -365,12 +424,25 @@ namespace coro {
                     ::close(fd_);
                     fd_ = -1;
                 }
+                wd_paths_.clear();
+                pending_moves_.clear();
             }
 
           private:
+            struct pending_move {
+                std::string path;
+                bool is_dir = false;
+            };
+
             int fd_ = -1;
             bool recursive_ = true;
+            std::filesystem::path root_path_;
             std::deque<watch_event> pending_;
+            std::unordered_map<int, std::string> wd_paths_;
+            std::unordered_map<uint32_t, pending_move> pending_moves_;
+
+            static constexpr uint32_t watch_mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM |
+                                                   IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF;
 
             watch_event pop_pending() {
                 watch_event ev = std::move(pending_.front());
@@ -378,86 +450,213 @@ namespace coro {
                 return ev;
             }
 
+            Task<> read_batch() {
+                read_awaiter aw{this, {}, {}};
+                co_await aw;
+            }
+
+            static std::string join_relative(const std::string& parent, std::string_view name) {
+                if (parent.empty())
+                    return std::string(name);
+                if (name.empty())
+                    return parent;
+                return parent + "/" + std::string(name);
+            }
+
+            static bool is_same_or_child(std::string_view path, std::string_view prefix) {
+                return path == prefix ||
+                       (path.size() > prefix.size() && path.starts_with(prefix) && path[prefix.size()] == '/');
+            }
+
+            std::filesystem::path full_path(std::string_view relative) const {
+                if (relative.empty())
+                    return root_path_;
+                return root_path_ / std::filesystem::path(relative);
+            }
+
+            bool add_watch(std::string relative) {
+                const std::string native = full_path(relative).string();
+                const int wd = ::inotify_add_watch(fd_, native.c_str(), watch_mask);
+                if (wd < 0) {
+                    io::set_error(errno);
+                    return false;
+                }
+                std::replace(relative.begin(), relative.end(), '\\', '/');
+                wd_paths_[wd] = std::move(relative);
+                return true;
+            }
+
+            bool add_watch_tree(const std::string& relative) {
+                if (!add_watch(relative))
+                    return false;
+                if (!recursive_)
+                    return true;
+
+                std::error_code ec;
+                std::filesystem::recursive_directory_iterator it(full_path(relative), ec), end;
+                if (ec) {
+                    io::set_error(ec.value());
+                    return false;
+                }
+                while (it != end) {
+                    const bool symlink = it->is_symlink(ec);
+                    if (ec) {
+                        io::set_error(ec.value());
+                        return false;
+                    }
+                    if (symlink) {
+                        it.disable_recursion_pending();
+                    } else {
+                        const bool directory = it->is_directory(ec);
+                        if (ec) {
+                            io::set_error(ec.value());
+                            return false;
+                        }
+                        if (directory) {
+                            auto rel = it->path().lexically_relative(root_path_).generic_string();
+                            if (!add_watch(std::move(rel)))
+                                return false;
+                        }
+                    }
+                    it.increment(ec);
+                    if (ec) {
+                        io::set_error(ec.value());
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            void update_watch_paths(const std::string& old_path, const std::string& new_path) {
+                for (auto& [wd, path] : wd_paths_) {
+                    (void)wd;
+                    if (is_same_or_child(path, old_path))
+                        path = new_path + path.substr(old_path.size());
+                }
+            }
+
+            void remove_watch_tree(const std::string& path) {
+                std::vector<int> removed;
+                for (const auto& [wd, watched_path] : wd_paths_)
+                    if (is_same_or_child(watched_path, path))
+                        removed.push_back(wd);
+                for (int wd : removed) {
+                    wd_paths_.erase(wd);
+                    (void)::inotify_rm_watch(fd_, wd);
+                }
+            }
+
+            void flush_pending_moves() {
+                for (auto& [cookie, move] : pending_moves_) {
+                    (void)cookie;
+                    pending_.push_back(watch_event{watch_event_type::removed, move.path, "", move.is_dir});
+                    if (move.is_dir)
+                        remove_watch_tree(move.path);
+                }
+                pending_moves_.clear();
+            }
+
             void parse_records(const char* buf, int bytes) {
                 if (bytes <= 0) {
-                    if (bytes < 0)
+                    if (bytes < 0) {
                         io::set_error(-bytes);
+                        close();
+                    }
                     return;
                 }
-                uint32_t rename_cookie = 0;
-                std::string rename_old;
                 const char* p = buf;
                 const char* end = buf + bytes;
                 while (p + sizeof(struct inotify_event) <= end) {
                     auto* ie = reinterpret_cast<const struct inotify_event*>(p);
-                    p += sizeof(struct inotify_event) + ie->len;
-                    if (p > end)
+                    const size_t record_size = sizeof(struct inotify_event) + ie->len;
+                    if ((size_t)(end - p) < record_size)
                         break;
+                    p += record_size;
 
-                    std::string name(ie->len ? ie->name : "");
-                    bool is_dir = ie->mask & IN_ISDIR;
+                    const std::string name(ie->len ? ie->name : "");
+                    const bool is_dir = (ie->mask & IN_ISDIR) != 0;
 
                     if (ie->mask & IN_Q_OVERFLOW) {
+                        pending_moves_.clear();
                         pending_.push_back(watch_event{watch_event_type::overflow, "", "", false});
                         continue;
                     }
-                    if (ie->mask & IN_CREATE) {
-                        pending_.push_back(watch_event{watch_event_type::created, std::move(name), "", is_dir});
-                        // 递归: 新子目录 → 追加 watch
-                        if (recursive_ && is_dir)
-                            add_sub_watch(name);
+                    if (ie->mask & IN_IGNORED) {
+                        wd_paths_.erase(ie->wd);
                         continue;
                     }
-                    if (ie->mask & IN_DELETE || ie->mask & IN_DELETE_SELF) {
-                        pending_.push_back(watch_event{watch_event_type::removed, std::move(name), "", is_dir});
+
+                    auto parent = wd_paths_.find(ie->wd);
+                    if (parent == wd_paths_.end())
                         continue;
-                    }
-                    if (ie->mask & IN_MODIFY || ie->mask & IN_ATTRIB) {
-                        pending_.push_back(watch_event{watch_event_type::modified, std::move(name), "", is_dir});
-                        continue;
-                    }
-                    if (ie->mask & IN_MOVED_FROM) {
-                        rename_cookie = ie->cookie;
-                        rename_old = std::move(name);
-                        continue;
-                    }
-                    if (ie->mask & IN_MOVED_TO) {
-                        if (ie->cookie != 0 && ie->cookie == rename_cookie && !rename_old.empty()) {
-                            pending_.push_back(
-                                watch_event{watch_event_type::renamed, std::move(name), std::move(rename_old), is_dir});
-                            rename_cookie = 0;
-                        } else {
-                            // 未配对 (移入自监视区外): 按创建上报
-                            pending_.push_back(watch_event{watch_event_type::created, std::move(name), "", is_dir});
+                    const std::string path = join_relative(parent->second, name);
+
+                    if (ie->mask & IN_MOVE_SELF) {
+                        // 子目录由其父目录的 cookie 事件处理；根目录移动时
+                        // 无法知道新路径，按移除上报并结束监视。
+                        if (parent->second.empty()) {
+                            pending_.push_back(watch_event{watch_event_type::removed, "", "", true});
+                            close();
                         }
                         continue;
                     }
+                    if (ie->mask & IN_MOVED_FROM) {
+                        if (ie->cookie != 0)
+                            pending_moves_[ie->cookie] = pending_move{path, is_dir};
+                        else
+                            pending_.push_back(watch_event{watch_event_type::removed, path, "", is_dir});
+                        continue;
+                    }
+                    if (ie->mask & IN_MOVED_TO) {
+                        auto old = pending_moves_.find(ie->cookie);
+                        if (ie->cookie != 0 && old != pending_moves_.end()) {
+                            const std::string old_path = std::move(old->second.path);
+                            const bool moved_dir = is_dir || old->second.is_dir;
+                            pending_moves_.erase(old);
+                            pending_.push_back(watch_event{watch_event_type::renamed, path, old_path, moved_dir});
+                            if (recursive_ && moved_dir)
+                                update_watch_paths(old_path, path);
+                        } else {
+                            pending_.push_back(watch_event{watch_event_type::created, path, "", is_dir});
+                            if (recursive_ && is_dir && !add_watch_tree(path))
+                                pending_.push_back(watch_event{watch_event_type::overflow, "", "", false});
+                        }
+                        continue;
+                    }
+                    if (ie->mask & IN_CREATE) {
+                        pending_.push_back(watch_event{watch_event_type::created, path, "", is_dir});
+                        if (recursive_ && is_dir && !add_watch_tree(path))
+                            pending_.push_back(watch_event{watch_event_type::overflow, "", "", false});
+                        continue;
+                    }
+                    if (ie->mask & IN_DELETE_SELF) {
+                        // 子目录的删除已由父 wd 上的 IN_DELETE 上报。
+                        if (parent->second.empty()) {
+                            pending_.push_back(watch_event{watch_event_type::removed, "", "", true});
+                            close();
+                        }
+                        continue;
+                    }
+                    if (ie->mask & IN_DELETE) {
+                        pending_.push_back(watch_event{watch_event_type::removed, path, "", is_dir});
+                        continue;
+                    }
+                    if (ie->mask & IN_MODIFY || ie->mask & IN_ATTRIB) {
+                        pending_.push_back(watch_event{watch_event_type::modified, path, "", is_dir});
+                        continue;
+                    }
                 }
-                if (!rename_old.empty())
-                    pending_.push_back(watch_event{watch_event_type::removed, std::move(rename_old), "", false});
             }
-
-            void add_sub_watch(const std::string& rel) { (void)rel; /* io_uring 时代补: 记录 wd→路径 */ }
-
-            int wd_root_ = -1;
         };
 
-        /// 打开目录监视: inotify_init1 + add_watch (递归需遍历子目录)
+        /// 打开目录监视: inotify_init1 + add_watch
         inline Task<DirectoryWatcher> watch(std::string_view path, bool recursive = true) {
-            (void)recursive; // v1: 根目录 watch; 递归跟踪见 add_sub_watch
             int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
             if (fd < 0) {
                 io::set_error(errno);
                 co_return DirectoryWatcher{};
             }
-            uint32_t mask =
-                IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF;
-            if (inotify_add_watch(fd, std::string(path).c_str(), mask) < 0) {
-                io::set_error(errno);
-                ::close(fd);
-                co_return DirectoryWatcher{};
-            }
-            co_return DirectoryWatcher(fd, recursive);
+            co_return DirectoryWatcher(fd, std::string(path), recursive);
         }
 
 #endif

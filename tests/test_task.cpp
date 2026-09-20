@@ -11,7 +11,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-    // ── 命名协程函数 (参数进帧, MSVC Debug 安全) ──
+    // ── 命名协程函数 (参数进帧，不依赖外部闭包生命周期) ──
 
     coro::Task<int> compute_42() {
         co_await coro::yield();
@@ -25,7 +25,7 @@ namespace {
 
     coro::Task<> thrower() {
         throw std::runtime_error("boom");
-        co_return; // MSVC Debug: throw 后必须补 co_return
+        co_return; // 本函数没有其他协程关键字；用它声明这是协程
     }
 
     coro::Task<> catch_from(std::string* out) {
@@ -132,6 +132,22 @@ TEST(TaskTest, VoidTask) {
     bool done = false;
     test_util::run_task([&]() -> coro::Task<> { return flag_setter(&done); });
     EXPECT_TRUE(done);
+}
+
+// 捕获型协程 lambda 是受支持的；关键是闭包必须比它创建的 Task 活得更久。
+TEST(TaskTest, CoroutineLambdaWithLiveClosure) {
+    int result = 0;
+    auto worker = [&result](int value) -> coro::Task<> {
+        co_await coro::yield();
+        result = value;
+    };
+
+    auto task = worker(42);
+    task.start();
+    coro::EventLoop::get().run();
+    task.take_result();
+
+    EXPECT_EQ(result, 42);
 }
 
 // ── coro::run 返回主协程结果 (对标 asyncio.run) ──

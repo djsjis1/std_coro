@@ -9,7 +9,7 @@
 - [程序行为不对](#程序行为不对)
 - [挂死 / 卡住](#挂死--卡住)
 - [崩溃 / UB](#崩溃--ub)
-- [MSVC Debug 特有](#msvc-debug-特有)
+- [协程与编译器注意事项](#协程与编译器注意事项)
 - [多线程相关](#多线程相关)
 - [IO（网络/文件/子进程）相关](#io相关)
 - [从 Python asyncio 迁来的心智差异](#从-python-asyncio-迁来的心智差异)
@@ -141,17 +141,18 @@ sudo apt install liburing-dev    # Debian/Ubuntu
 
 ## 崩溃 / UB
 
-### spawn 返回值没保存导致崩溃
+### spawn 返回值没保存，任务没有执行完
 
-`coro::spawn(t());` 丢弃返回值 → Task 析构 → 协程帧被销毁 →
-后台 resume 已销毁帧 → UB。永远保存返回值，或用
-`call_soon`/`call_later`（它们内部正确自持有）。
+`coro::spawn(t());` 丢弃返回值后，临时 `Task` 会安全终止该任务；它不会
+自动变成后台任务。保存返回值并稍后 `co_await`，或明确 `detach()`；定时
+回调可用 `call_soon`/`call_later`（它们内部自持有）。
 
 ### "coroutine frame destroyed while suspended" 类崩溃
 
-协程帧还挂着，外壳 Task 已析构（生命周期经典坑）。检查 Task
-的所有权链：谁持有、持有到什么时候。fire-and-forget 用
-`shared_ptr<Task<>>` 自持有或 `Task::detach()`。
+公共 `Task` 析构会撤销定时器/等待队列登记；挂起的底层 I/O 会先请求取消，
+等完成包被消费后才释放帧。若仍出现此类问题，优先检查自定义 awaiter 是否在
+帧销毁时撤销外部登记，以及协程参数/缓冲区指向的外部对象是否已经析构。
+fire-and-forget 使用 `Task::detach()`。
 
 ### 同一个 Task 被 co_await 两次
 
@@ -171,30 +172,45 @@ Task 只能被等待一次。需要多个等待者：把结果放进 `Future`，
 
 ---
 
-## MSVC Debug 特有
+## 协程与编译器注意事项
 
-### lambda 协程的捕获变量错乱
+### lambda 协程能不能捕获变量
 
-MSVC **Debug** 的已知问题：lambda 协程的捕获可能没被正确复制进
-协程帧，挂起恢复后读到错值。全库与所有示例的对策：
+能，但捕获仍属于 lambda 闭包对象，而不是协程帧。若从临时捕获闭包创建
+任务，语句结束后闭包析构，任务恢复时访问捕获会 use-after-free：
 
 ```cpp
-// ❌ 避免
-tasks.push_back([i]() -> coro::Task<int> { co_return i * 10; }());
+// ❌ 临时捕获闭包先于任务析构
+for (int i = 0; i < 3; ++i)
+    tasks.push_back([i]() -> coro::Task<int> {
+        co_await coro::yield();
+        co_return i * 10;
+    }());
 
-// ✅ 命名协程函数, 参数进帧
+// ✅ 无捕获 lambda + 按值参数
+auto worker = [](int i) -> coro::Task<int> {
+    co_await coro::yield();
+    co_return i * 10;
+};
+for (int i = 0; i < 3; ++i)
+    tasks.push_back(worker(i));
+
+// ✅ 命名协程函数
 coro::Task<int> make(int i) { co_return i * 10; }
-tasks.push_back(make(i));
+for (int i = 0; i < 3; ++i)
+    tasks.push_back(make(i));
 ```
 
-需要自引用（fire-and-forget）时用 `shared_ptr` **参数**传递，
-不要 lambda 捕获自身。
+命名的捕获闭包只要确定活到任务结束也完全合法。需要 fire-and-forget 时，
+用 `shared_ptr` **按值参数**传入协程帧，不要让临时 lambda 捕获自身。
 
-### throw 之后协程"继续往下执行了"
+### 只有 throw 的 Task 函数为什么同步抛异常
 
-MSVC 的坑：协程体内 `throw` 后若没有 `co_return`，控制流可能
-绕过 `unhandled_exception` 继续走。在每个 `throw` 后补
-`co_return`（协程的 throw 不会自动结束函数体）。
+函数只有在函数体中出现 `co_await`、`co_yield` 或 `co_return` 时才是协程。
+如果一个返回 `Task` 的函数只有 `throw`，它其实是普通函数，因此异常在调用时
+同步抛出，不会进入 promise 的 `unhandled_exception`。加不可达的 `co_return`
+只是为了让该函数被识别为协程；若函数其他路径已有协程关键字，就无需在每个
+`throw` 后机械补写 `co_return`。
 
 ### Debug 崩溃但 Release 正常
 
@@ -270,8 +286,8 @@ read/write/fsync 全异步。Linux 上 open 也走 io_uring 全异步。
 
 ### Ctrl+C 直接杀掉了进程，优雅停机没触发
 
-确认注册发生在**任何 wait 之前**（Linux 下信号在首次
-`signal::wait/handle` 时才被阻塞，注册晚了信号可能已走默认处理）；
+确认在发出信号前已创建 `signal::wait/handle`；Linux 的 `sigaction`
+处理器在首个等待者注册时安装，更早的信号仍会走系统默认处理；
 Windows 下确认用的是 `coro::signal::handle/wait`（库内桥接），
 而不是混用 CRT `signal()`。
 
@@ -281,7 +297,7 @@ Windows 下确认用的是 `coro::signal::handle/wait`（库内桥接），
 
 | asyncio 习惯 | coro 中的对应/差异 |
 |---|---|
-| `async def` | 返回 `coro::Task<T>` 的**命名函数**（lambda 捕获在 MSVC Debug 有坑） |
+| `async def` | 返回 `coro::Task<T>` 的函数；lambda 也支持，但捕获闭包必须活到任务结束 |
 | 协程对象即 async 函数调用 | 相同：`my_task()` 惰性创建 |
 | `asyncio.create_task` | `coro::spawn`，但**必须保存返回值**（Python 有事件循环帮你持有，C++ 没有 GC） |
 | `async with lock:` | `auto g = co_await lock.guard();`（RAII 作用域） |

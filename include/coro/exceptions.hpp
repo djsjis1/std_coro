@@ -25,6 +25,13 @@
 
 namespace coro {
 
+    /// Promise producer disappeared before publishing a value/exception.
+    /// Waiting Futures receive this instead of remaining suspended forever.
+    class BrokenPromiseError : public std::runtime_error {
+      public:
+        BrokenPromiseError() : std::runtime_error("promise destroyed before completion") {}
+    };
+
     class ExceptionGroup : public std::runtime_error {
       public:
         explicit ExceptionGroup(std::vector<std::exception_ptr> exceptions)

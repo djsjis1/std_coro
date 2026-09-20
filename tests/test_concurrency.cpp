@@ -93,6 +93,11 @@ namespace {
         }
     }
 
+    coro::Task<> gather_void_empty(bool* returned) {
+        co_await coro::gather_void();
+        *returned = true;
+    }
+
     coro::Task<int> slow_count() {
         co_await coro::sleep(200ms);
         co_return 1;
@@ -118,6 +123,17 @@ namespace {
         }
     }
 
+    coro::Task<> wait_for_caller_cancel(bool* cancelled) {
+        auto wrapped = coro::spawn(coro::wait_for(slow_count(), 1s));
+        co_await coro::sleep(10ms);
+        wrapped.cancel();
+        try {
+            (void)co_await std::move(wrapped);
+        } catch (const coro::CancelledError&) {
+            *cancelled = true;
+        }
+    }
+
     coro::Task<int> fast_num(int v, int ms) {
         co_await coro::sleep(std::chrono::milliseconds(ms));
         co_return v;
@@ -125,6 +141,17 @@ namespace {
 
     coro::Task<> wait_any_fast(int* result) {
         *result = co_await coro::wait_any(fast_num(100, 20), fast_num(200, 100));
+    }
+
+    coro::Task<> cancel_wait_any(bool* caught) {
+        auto pending = coro::spawn(coro::wait_any(fast_num(1, 80), fast_num(2, 100)));
+        co_await coro::sleep(10ms);
+        pending.cancel();
+        try {
+            (void)co_await std::move(pending);
+        } catch (const coro::CancelledError&) {
+            *caught = true;
+        }
     }
 
 } // namespace
@@ -167,6 +194,12 @@ TEST(ConcurrencyTest, GatherVoidPropagatesException) {
     EXPECT_TRUE(caught);
 }
 
+TEST(ConcurrencyTest, GatherVoidEmptyCompletesImmediately) {
+    bool returned = false;
+    test_util::run_task([&] { return gather_void_empty(&returned); });
+    EXPECT_TRUE(returned);
+}
+
 TEST(ConcurrencyTest, WaitForTimeout) {
     bool caught = false;
     test_util::run_task([&] { return wait_for_timeout(&caught); });
@@ -185,8 +218,20 @@ TEST(ConcurrencyTest, WaitForVoidTask) {
     EXPECT_TRUE(caught);
 }
 
+TEST(ConcurrencyTest, WaitForPropagatesCallerCancellation) {
+    bool cancelled = false;
+    test_util::run_task([&] { return wait_for_caller_cancel(&cancelled); });
+    EXPECT_TRUE(cancelled);
+}
+
 TEST(ConcurrencyTest, WaitAnyFirstWins) {
     int result = 0;
     test_util::run_task([&] { return wait_any_fast(&result); });
     EXPECT_EQ(result, 100); // 快者胜
+}
+
+TEST(ConcurrencyTest, WaitAnyCancellationKeepsMonitorsSafe) {
+    bool caught = false;
+    test_util::run_task([&] { return cancel_wait_any(&caught); });
+    EXPECT_TRUE(caught);
 }

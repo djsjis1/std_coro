@@ -30,9 +30,10 @@
   任何能编译 C++20 的环境都能跑。
 - **第 6-7 讲涉及平台 IO**：Windows 开箱即用（IOCP）；
   Linux 需要先 `sudo apt install liburing-dev`。
-- **贯穿全课程的约定**：示例里的协程一律用**命名函数**（而不是 lambda 捕获），
-  原因见 [第 1 讲的说明](01-hello-coroutine.md#命名函数-vs-lambda协程体)与
-  [FAQ](../faq.md)。这不是风格偏好，是 MSVC Debug 下的正确性要求。
+- **贯穿全课程的约定**：逃逸当前语句的任务优先使用**命名函数**或
+  “无捕获 lambda + 按值参数”。捕获型协程 lambda 也受支持，但闭包必须
+  活到任务结束。详见[第 1 讲](01-hello-coroutine.md#命名函数-vs-lambda协程体)与
+  [FAQ](../faq.md)。
 
 ## 预备知识
 

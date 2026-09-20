@@ -65,6 +65,11 @@ void http_parse::setup_callbacks()
 
     settings_.on_url = [](llhttp_t *parser, const char *at, size_t length) -> int {
         http_parse *p = self(parser);
+        if (p->url_limit && p->http_url.size() + length > p->url_limit)
+        {
+            llhttp_set_error_reason(parser, "url limit exceeded");
+            return -1;
+        }
         p->http_url.append(at, length);
         if (p->url)
         {
@@ -77,6 +82,12 @@ void http_parse::setup_callbacks()
     // 在 *_complete 回调中才提交到 http_headers
     settings_.on_header_field = [](llhttp_t *parser, const char *at, size_t length) -> int {
         http_parse *p = self(parser);
+        if (p->header_bytes_limit && p->header_bytes_ + length > p->header_bytes_limit)
+        {
+            llhttp_set_error_reason(parser, "header bytes limit exceeded");
+            return -1;
+        }
+        p->header_bytes_ += length;
         p->current_field_.append(at, length);
         if (p->header_field)
         {
@@ -87,6 +98,12 @@ void http_parse::setup_callbacks()
 
     settings_.on_header_value = [](llhttp_t *parser, const char *at, size_t length) -> int {
         http_parse *p = self(parser);
+        if (p->header_bytes_limit && p->header_bytes_ + length > p->header_bytes_limit)
+        {
+            llhttp_set_error_reason(parser, "header bytes limit exceeded");
+            return -1;
+        }
+        p->header_bytes_ += length;
         p->current_value_.append(at, length);
         if (p->header_value)
         {
@@ -97,6 +114,12 @@ void http_parse::setup_callbacks()
 
     settings_.on_header_value_complete = [](llhttp_t *parser) -> int {
         http_parse *p = self(parser);
+        if (p->header_count_limit && p->header_count_ >= p->header_count_limit)
+        {
+            llhttp_set_error_reason(parser, "header count limit exceeded");
+            return -1;
+        }
+        ++p->header_count_;
         p->http_headers[p->current_field_] = p->current_value_;
         p->current_field_.clear();
         p->current_value_.clear();
@@ -145,6 +168,8 @@ void http_parse::reset()
     error_.clear();
     current_field_.clear();
     current_value_.clear();
+    header_bytes_ = 0;
+    header_count_ = 0;
     llhttp_init(&parser_, type_, &settings_);
     parser_.data = this;
 }

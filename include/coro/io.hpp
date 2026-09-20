@@ -33,12 +33,19 @@
 // ============================================================================
 
 namespace coro {
-#ifdef __linux__
+#ifdef CORO_URING_ENABLED
     namespace detail {
         /// SQE 提交 + 挂起计数 (所有 io_uring IO 模块共用: net/fs/pipe/process)
         inline void uring_submit(net::UringEventSource* u, io_uring_sqe* sqe, detail::uring_op* op) {
             io_uring_sqe_set_data(sqe, op);
-            io_uring_submit(u->handle());
+            int ret = io_uring_submit(u->handle());
+            if (ret < 0) {
+                // 提交失败: 不增加挂起计数, 立即报错并恢复协程
+                op->result = ret;
+                op->error = -ret;
+                EventLoop::get().schedule(op->continuation);
+                return;
+            }
             if (u)
                 u->op_start();
         }
