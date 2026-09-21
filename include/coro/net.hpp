@@ -1239,6 +1239,10 @@ namespace coro {
                 net::UringEventSource* uring_ = nullptr;
                 sockaddr_in from_addr{};
                 socklen_t from_len = sizeof(sockaddr_in);
+#ifndef CORO_HAS_URING_RECVFROM_SENDTO
+                struct iovec iov_ {};
+                struct msghdr msg_ {};
+#endif
 
                 ~recvfrom_awaiter() {
                     if (uring_)
@@ -1268,7 +1272,18 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+#ifdef CORO_HAS_URING_RECVFROM_SENDTO
                         io_uring_prep_recvfrom(sqe, socket->fd_, buf, len, (sockaddr*)&from_addr, &from_len);
+#else
+                        iov_.iov_base = buf;
+                        iov_.iov_len = len;
+                        std::memset(&msg_, 0, sizeof(msg_));
+                        msg_.msg_name = &from_addr;
+                        msg_.msg_namelen = from_len;
+                        msg_.msg_iov = &iov_;
+                        msg_.msg_iovlen = 1;
+                        io_uring_prep_recvmsg(sqe, socket->fd_, &msg_, 0);
+#endif
                         uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
@@ -1302,6 +1317,10 @@ namespace coro {
                 sockaddr_in dest;
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
+#ifndef CORO_HAS_URING_RECVFROM_SENDTO
+                struct iovec iov_ {};
+                struct msghdr msg_ {};
+#endif
 
                 ~sendto_awaiter() {
                     if (uring_)
@@ -1330,7 +1349,18 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+#ifdef CORO_HAS_URING_RECVFROM_SENDTO
                         io_uring_prep_sendto(sqe, socket->fd_, buf, len, 0, (sockaddr*)&dest, sizeof(dest));
+#else
+                        iov_.iov_base = const_cast<char*>(buf);
+                        iov_.iov_len = len;
+                        std::memset(&msg_, 0, sizeof(msg_));
+                        msg_.msg_name = &dest;
+                        msg_.msg_namelen = sizeof(dest);
+                        msg_.msg_iov = &iov_;
+                        msg_.msg_iovlen = 1;
+                        io_uring_prep_sendmsg(sqe, socket->fd_, &msg_, 0);
+#endif
                         uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);

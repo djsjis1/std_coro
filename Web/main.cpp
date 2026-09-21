@@ -165,40 +165,132 @@ void register_routes(web_server &server)
 // ---- 内置 selftest 客户端 ----
 
 // 发送一个完整请求并解析响应, 返回 (状态码, 响应体)
+// 注: conn 放在独立块作用域, 避免 GCC 13 协程变换中
+// move-only 非平凡析构类型与 co_return 共存时触发 ICE
 coro::Task<std::pair<int, std::string>> one_request(const std::string &raw)
 {
     std::pair<int, std::string> result{0, ""};
-    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
-    if (!conn.valid()) {
-        std::cerr << "[selftest] connect failed: " << coro::io::last_error() << std::endl;
-        co_return result;
-    }
-    int sent = co_await conn.write(raw.data(), raw.size());
-    if (sent != (int)raw.size()) {
-        std::cerr << "[selftest] write failed: " << sent << "/" << raw.size() << std::endl;
-        co_return result;
-    }
+    {
+        auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
+        if (!conn.valid()) {
+            std::cerr << "[selftest] connect failed: " << coro::io::last_error() << std::endl;
+        } else {
+            int sent = co_await conn.write(raw.data(), raw.size());
+            if (sent != (int)raw.size()) {
+                std::cerr << "[selftest] write failed: " << sent << "/" << raw.size() << std::endl;
+            } else {
+                http_parse parser(HTTP_RESPONSE);
+                bool done = false;
+                parser.message_complete = [&]()
+                { done = true; };
+                char buf[4096];
+                while (!done)
+                {
+                    int n = co_await conn.read(buf, sizeof(buf));
+                    if (n <= 0) {
+                        std::cerr << "[selftest] read failed: " << n << " error=" << coro::io::last_error() << std::endl;
+                        break;
+                    }
+                    if (!parser.feed(buf, (size_t)n)) {
+                        std::cerr << "[selftest] response parse failed: " << parser.error() << std::endl;
+                        break;
+                    }
+                }
+                result.first = parser.status_code;
+                result.second = parser.http_body;
+            }
+        }
+    } // conn 在此析构
+    co_return result;
+}
 
+// 提取 pipelining 测试到独立协程, 避免 GCC 13 协程变换 ICE
+// (模板协程 + lambda 捕获 + move-only 类型的组合触发 ICE)
+static coro::Task<> pipeline_test(int port, int* pass, int* fail)
+{
+    auto check = [&](const char* name, bool ok) {
+        std::cout << "[selftest] " << (ok ? "PASS" : "FAIL") << ": " << name << std::endl;
+        if (ok) ++*pass; else ++*fail;
+    };
+    std::string wire = http_protocol::request("GET", "/", {{"Host", "127.0.0.1"}}) +
+                       http_protocol::request("GET", "/greet?name=coro", {{"Host", "127.0.0.1"}});
+    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+    if (!conn.valid())
+    {
+        check("connect refused", false);
+        co_return;
+    }
+    co_await conn.write(wire.data(), wire.size());
     http_parse parser(HTTP_RESPONSE);
-    bool done = false;
+    int completed = 0;
+    std::string last_body;
     parser.message_complete = [&]()
-    { done = true; };
+    { ++completed; last_body = parser.http_body; };
     char buf[4096];
-    while (!done)
+    while (completed < 2)
     {
         int n = co_await conn.read(buf, sizeof(buf));
-        if (n <= 0) {
-            std::cerr << "[selftest] read failed: " << n << " error=" << coro::io::last_error() << std::endl;
+        if (n <= 0)
             break;
-        }
-        if (!parser.feed(buf, (size_t)n)) {
-            std::cerr << "[selftest] response parse failed: " << parser.error() << std::endl;
-            break;
-        }
+        parser.feed(buf, (size_t)n);
     }
-    result.first = parser.status_code;
-    result.second = parser.http_body;
-    co_return result;
+    check("pipelined 2 requests -> 2 responses", completed == 2);
+    check("greet body echoes query", last_body == "hello, coro!\n");
+}
+
+// 路由测试辅助: 自由函数协程, 避免 lambda 协程触发 GCC 13 ICE
+static coro::Task<> check_one_request(
+    const std::string& req, const char* label,
+    std::function<bool(int, const std::string&)> pred,
+    int* pass, int* fail)
+{
+    auto resp = co_await one_request(req);
+    bool ok = pred(resp.first, resp.second);
+    std::cout << "[selftest] " << (ok ? "PASS" : "FAIL") << ": " << label << std::endl;
+    if (ok) ++*pass; else ++*fail;
+}
+
+// 路由测试: 数据驱动, 单个 await 点, 避免 GCC 13 协程变换 ICE
+static coro::Task<> route_tests(int* pass, int* fail)
+{
+    struct tc { std::string req; const char* label;
+                std::function<bool(int, const std::string&)> pred; };
+    std::vector<tc> cases = {
+        {http_protocol::request("GET", "/nope", {{"Host","127.0.0.1"}}),
+         "unknown path -> 404", [](int s, const std::string&){ return s==404; }},
+        {http_protocol::json("POST", "/echo", "{\"x\":1}", {{"Host","127.0.0.1"}}),
+         "POST /echo -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::json("POST", "/echo", "{\"x\":1}", {{"Host","127.0.0.1"}}),
+         "POST body echoed", [](int, const std::string& b){ return b.find("{\"x\":1}")!=std::string::npos; }},
+        {http_protocol::request("GET", "/static/hello.txt", {{"Host","127.0.0.1"}}),
+         "static file -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::request("GET", "/static/hello.txt", {{"Host","127.0.0.1"}}),
+         "static content", [](int, const std::string& b){ return b.find("hello from www")!=std::string::npos; }},
+        {http_protocol::request("GET", "/boom", {{"Host","127.0.0.1"}}),
+         "handler exception -> 500", [](int s, const std::string&){ return s==500; }},
+        {http_protocol::request("GET", "/user/42", {{"Host","127.0.0.1"}}),
+         "dynamic route :id -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::request("GET", "/user/42", {{"Host","127.0.0.1"}}),
+         "param id captured", [](int, const std::string& b){ return b.find("\"user_id\": \"42\"")!=std::string::npos; }},
+        {http_protocol::request("GET", "/user/7/posts/99", {{"Host","127.0.0.1"}}),
+         "multi-param route -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::request("GET", "/user/7/posts/99", {{"Host","127.0.0.1"}}),
+         "param post_id captured", [](int, const std::string& b){ return b.find("\"post\": \"99\"")!=std::string::npos; }},
+        {http_protocol::request("GET", "/user/admin", {{"Host","127.0.0.1"}}),
+         "static wins over param", [](int s, const std::string& b){ return s==200 && b=="admin console\n"; }},
+        {http_protocol::request("GET", "/download/a/b/c.txt", {{"Host","127.0.0.1"}}),
+         "wildcard route -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::request("GET", "/download/a/b/c.txt", {{"Host","127.0.0.1"}}),
+         "wildcard captured", [](int, const std::string& b){ return b.find("a/b/c.txt")!=std::string::npos; }},
+        {http_protocol::request("POST", "/greet", {{"Host","127.0.0.1"}}),
+         "wrong method -> 405", [](int s, const std::string&){ return s==405; }},
+        {http_protocol::request("OPTIONS", "/user/42", {{"Host","127.0.0.1"}}),
+         "OPTIONS -> 200", [](int s, const std::string&){ return s==200; }},
+        {http_protocol::request("POST", "/static/hello.txt", {{"Host","127.0.0.1"}}),
+         "static dir POST -> 405", [](int s, const std::string&){ return s==405; }},
+    };
+    for (auto& c : cases)
+        co_await check_one_request(c.req, c.label, c.pred, pass, fail);
 }
 
 coro::Task<> selftest_client(web_server &server)
@@ -215,117 +307,11 @@ coro::Task<> selftest_client(web_server &server)
 
     co_await coro::sleep(50ms); // 等 accept 循环就绪
 
-    // 1. pipelining + keep-alive: 一条连接连发两个请求, 期望两条 200
-    {
-        std::string wire = http_protocol::request("GET", "/", {{"Host", "127.0.0.1"}}) +
-                           http_protocol::request("GET", "/greet?name=coro", {{"Host", "127.0.0.1"}});
-        auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
-        if (!conn.valid())
-        {
-            check("connect refused", false);
-        }
-        else
-        {
-            co_await conn.write(wire.data(), wire.size());
-            http_parse parser(HTTP_RESPONSE);
-            int completed = 0;
-            std::string last_body;
-            parser.message_complete = [&]()
-            { ++completed; last_body = parser.http_body; };
-            char buf[4096];
-            while (completed < 2)
-            {
-                int n = co_await conn.read(buf, sizeof(buf));
-                if (n <= 0)
-                    break;
-                parser.feed(buf, (size_t)n);
-            }
-            check("pipelined 2 requests -> 2 responses", completed == 2);
-            check("greet body echoes query", last_body == "hello, coro!\n");
-        }
-    }
+    // 1. pipelining + keep-alive
+    co_await pipeline_test(g_port, &pass, &fail);
 
-    // 2. 未知路径 → 404
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/nope", {{"Host", "127.0.0.1"}}));
-        check("unknown path -> 404", status == 404);
-    }
-
-    // 3. POST body 回显
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::json("POST", "/echo", "{\"x\":1}", {{"Host", "127.0.0.1"}}));
-        check("POST /echo -> 200", status == 200);
-        check("POST body echoed", body.find("{\"x\":1}") != std::string::npos);
-    }
-
-    // 4. 静态文件
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/static/hello.txt", {{"Host", "127.0.0.1"}}));
-        check("static file -> 200", status == 200);
-        check("static content", body.find("hello from www") != std::string::npos);
-    }
-
-    // 5. handler 异常 → 500
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/boom", {{"Host", "127.0.0.1"}}));
-        check("handler exception -> 500", status == 500);
-    }
-
-    // 6. 动态路由: 参数捕获
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/user/42", {{"Host", "127.0.0.1"}}));
-        check("dynamic route :id -> 200", status == 200);
-        check("param id captured", body.find("\"user_id\": \"42\"") != std::string::npos);
-    }
-
-    // 7. 动态路由: 多参数
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/user/7/posts/99", {{"Host", "127.0.0.1"}}));
-        check("multi-param route -> 200", status == 200);
-        check("param post_id captured", body.find("\"post\": \"99\"") != std::string::npos);
-    }
-
-    // 8. 静态优先: /user/admin 命中静态路由 (而非被 :id 捕获)
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/user/admin", {{"Host", "127.0.0.1"}}));
-        check("static wins over param", status == 200 && body == "admin console\n");
-    }
-
-    // 9. 通配路由: 吞掉剩余全部路径
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("GET", "/download/a/b/c.txt", {{"Host", "127.0.0.1"}}));
-        check("wildcard route -> 200", status == 200);
-        check("wildcard captured", body.find("a/b/c.txt") != std::string::npos);
-    }
-
-    // 10. 405: 路径存在但方法不允许 (POST /greet 只注册了 GET)
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("POST", "/greet", {{"Host", "127.0.0.1"}}));
-        check("wrong method -> 405", status == 405);
-    }
-
-    // 11. OPTIONS: 自动应答允许的方法 (RFC 7231)
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("OPTIONS", "/user/42", {{"Host", "127.0.0.1"}}));
-        check("OPTIONS -> 200", status == 200);
-    }
-
-    // 12. 静态文件目录拒绝非 GET (POST /static/hello.txt → 405)
-    {
-        auto [status, body] = co_await one_request(
-            http_protocol::request("POST", "/static/hello.txt", {{"Host", "127.0.0.1"}}));
-        check("static dir POST -> 405", status == 405);
-    }
+    // 2-12. 路由测试
+    co_await route_tests(&pass, &fail);
 
     std::cout << "[selftest] " << pass << " passed, " << fail << " failed" << std::endl;
     server.stop(); // 优雅停止: serve() 随之退出

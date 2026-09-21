@@ -20,13 +20,22 @@ coro::Task<> run_and_capture() {
 }
 
 // ── 2. 退出码 ──
+// 注: 拆分为 helper + exit_code, 避免 GCC 13 协程变换中
+// move-only 类型与 co_return <value> 共存时触发 ICE
+static coro::Task<int> spawn_wait_exit(std::vector<std::string> args) {
+    auto p = co_await coro::process::spawn(std::move(args), {.capture_stdout = true});
+    if (!p.valid())
+        co_return -1;
+    int rc = co_await p.wait();
+    co_return rc;
+}
+
 coro::Task<int> exit_code(int v) {
 #ifdef _WIN32
-    auto p = co_await coro::process::spawn({"cmd", "/c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+    return spawn_wait_exit({"cmd", "/c", "exit " + std::to_string(v)});
 #else
-    auto p = co_await coro::process::spawn({"sh", "-c", "exit " + std::to_string(v)}, {.capture_stdout = true});
+    return spawn_wait_exit({"sh", "-c", "exit " + std::to_string(v)});
 #endif
-    co_return co_await p.wait();
 }
 
 // ── 3. stdin 交互: 管道写入 + 读取回显 ──
