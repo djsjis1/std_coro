@@ -181,6 +181,8 @@ namespace coro {
 
         /// 启动实现 (Process 的静态成员, 填充私有状态)。
         /// 任何失败路径: 清理已建资源 + io::set_error + 返回无效 Process。
+        // 惰性协程必须按值持有参数，引用可能在首次恢复前失效。
+        // cppcheck-suppress passedByValue
         inline Task<Process> Process::create(std::vector<std::string> args, options opt) {
             using namespace detail_proc;
             Process out;

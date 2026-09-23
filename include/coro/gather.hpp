@@ -146,6 +146,7 @@ namespace coro {
                 EventLoop* loop = state->caller_loop ? state->caller_loop : &EventLoop::get();
                 loop->schedule(state->continuation);
             }
+            co_return;
         }
 
         // ==================================================================

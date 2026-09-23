@@ -46,8 +46,7 @@ namespace coro {
                 EventLoop::get().schedule(op->continuation);
                 return;
             }
-            if (u)
-                u->op_start();
+            u->op_start();
         }
     } // namespace detail
 #endif

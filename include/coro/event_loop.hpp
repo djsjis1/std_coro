@@ -267,27 +267,23 @@ namespace coro {
 
       private:
         // 构造时: 按平台选择默认事件源 (像 Python 一样零配置)
-        EventLoop() {
+        EventLoop() : event_source_(make_default_event_source()) { install_event_source(); }
+
+        static std::shared_ptr<EventSource> make_default_event_source() {
 #ifdef _WIN32
             // Windows: 默认 IOCP (等价 Python ProactorEventLoop)
             auto iocp = std::make_shared<net::IocpEventSource>();
             if (iocp->valid())
-                event_source_ = std::move(iocp);
-            else
-                event_source_ = std::make_shared<CVEventSource>();
+                return iocp;
 #elif defined(__linux__) && defined(CORO_URING_ENABLED)
             // Linux: io_uring 可用时走 Proactor；初始化失败回退到 CV,
             // 让核心协程/定时器仍可运行，IO awaiter 会返回 ENOTSUP。
             auto uring = std::make_shared<net::UringEventSource>();
             if (uring->valid())
-                event_source_ = std::move(uring);
-            else
-                event_source_ = std::make_shared<CVEventSource>();
-#else
-            // 其他平台: 默认 condition_variable (纯标准库)
-            event_source_ = std::make_shared<CVEventSource>();
+                return uring;
 #endif
-            install_event_source();
+            // 其他平台或原生事件源初始化失败: 使用 condition_variable。
+            return std::make_shared<CVEventSource>();
         }
 
         // 安装/重装事件源: 注册完成回调 + 缓存类型化指针

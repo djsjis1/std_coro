@@ -469,6 +469,7 @@ namespace coro {
             // 所有任务结束后: 传播第一个异常 (对标 asyncio.gather 语义)
             if (state->first_exception)
                 std::rethrow_exception(state->first_exception);
+            co_return;
         }
     } // namespace detail
 

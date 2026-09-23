@@ -299,6 +299,8 @@ namespace coro {
             DirectoryWatcher() = default;
             explicit DirectoryWatcher(int fd, std::string root, bool recursive) : fd_(fd), recursive_(recursive) {
                 std::error_code ec;
+                // 保留局部错误码检查，失败时设置 I/O 错误并关闭已接管的 fd。
+                // cppcheck-suppress useInitializationList
                 root_path_ = std::filesystem::absolute(std::filesystem::path(std::move(root)), ec).lexically_normal();
                 if (ec) {
                     io::set_error(ec.value());
