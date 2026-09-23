@@ -288,11 +288,15 @@ jobs:
 
       - name: Run cppcheck (core library)
         run: |
+          # header-only 库必须显式传入头文件；目录扫描会跳过 .hpp。
+          headers=(include/coro/*.hpp)
+          test -f "${headers[0]}"
+          cppcheck --version
           cppcheck --enable=warning,performance,portability \
-            --std=c++20 --suppress=missingIncludeSystem \
+            --language=c++ --std=c++20 --suppress=missingIncludeSystem \
             -I include \
             --error-exitcode=1 \
-            include/ 2>&1 | tee cppcheck.log
+            "${headers[@]}" 2>&1 | tee cppcheck.log
 
       - name: Upload cppcheck report
         if: always()

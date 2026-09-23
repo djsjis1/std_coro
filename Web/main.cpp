@@ -354,8 +354,8 @@ coro::Task<> stress_main(web_server& server, int clients, int rounds) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
     long long expected = (long long)clients * rounds;
-    std::cout << "[stress] completed=" << ok << "/" << expected << " elapsed=" << ms << "ms"
-              << " (" << (ms ? expected * 1000 / ms : 0) << " req/s)" << std::endl;
+    std::cout << "[stress] completed=" << ok << "/" << expected << " elapsed=" << ms << "ms ("
+              << (ms ? expected * 1000 / ms : 0) << " req/s)" << std::endl;
     std::cout << "[stress] conn_fail=" << conn_fail << " io_fail=" << io_fail << std::endl;
     std::cout << "[stress] " << (ok == expected ? "ALL OK" : "MISSING RESPONSES") << std::endl;
     server.stop(); // 优雅停止

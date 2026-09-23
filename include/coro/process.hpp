@@ -469,7 +469,7 @@ namespace coro {
                 if (opt.capture_stderr && dup2(err_pipe[1], STDERR_FILENO) < 0)
                     goto exec_failed;
                 execvp(argv[0], argv.data());
-            exec_failed : {
+            exec_failed: {
                 const int error = errno;
                 (void)::write(exec_status[1], &error, sizeof(error));
                 _exit(127);
