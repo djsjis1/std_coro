@@ -9,6 +9,10 @@ include(CMakePackageConfigHelpers)
 
 option(CORO_BUILD_EXAMPLES "构建示例与压力程序" ON)
 option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
+option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止静默回退" OFF)
+if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING))
+    message(FATAL_ERROR "CORO_REQUIRE_URING requires Linux and CORO_ENABLE_URING=ON")
+endif()
 
 # 单配置生成器 (Ninja/Makefile) 默认 Release; 多配置 (VS) 由 --config 决定
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -29,6 +33,14 @@ if(MSVC)
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
     target_compile_options(coro INTERFACE -fcoroutines)
+endif()
+
+# GCC 13 的 SLP 优化可能让协程帧函数指针引用已被丢弃的 COMDAT section。
+# 保留其余优化；通过生成器表达式让安装包按消费者的编译器版本应用规避。
+option(CORO_GCC13_COROUTINE_WORKAROUND "规避 GCC 13 协程链接错误（禁用 SLP 向量化）" ON)
+if(CORO_GCC13_COROUTINE_WORKAROUND)
+    target_compile_options(coro INTERFACE
+        "$<$<AND:$<COMPILE_LANG_AND_ID:CXX,GNU>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,13>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,14>>:-fno-tree-slp-vectorize>")
 endif()
 
 # 平台链接库
@@ -52,29 +64,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_URING)
         endif()
         target_link_libraries(coro INTERFACE uring::uring)
 
-        # 检测 liburing 是否提供 io_uring_prep_recvfrom/sendto (2.6+)
-        include(CheckSymbolExists)
-        set(CMAKE_REQUIRED_INCLUDES ${URING_INCLUDE_DIR})
-        check_symbol_exists(io_uring_prep_recvfrom "liburing.h" CORO_HAS_URING_RECVFROM_SENDTO)
-        unset(CMAKE_REQUIRED_INCLUDES)
     else()
         set(CORO_HAS_URING OFF)
+        if(CORO_REQUIRE_URING)
+            message(FATAL_ERROR "liburing headers/library not found; install liburing-dev or liburing-devel")
+        endif()
         message(WARNING "liburing headers/library not found: Linux I/O modules are disabled; core timers/tasks use CVEventSource.")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(STATUS "io_uring disabled by CORO_ENABLE_URING=OFF; building portable core only.")
 endif()
 target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
-if(CORO_HAS_URING_RECVFROM_SENDTO)
-    target_compile_definitions(coro INTERFACE CORO_HAS_URING_RECVFROM_SENDTO=1)
-endif()
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router
 add_subdirectory(router)
 
-# MSVC: 多处理器并行编译 (纯构建加速, 不影响产物)
+# MSVC: 限制单个项目内的编译并行度，避免与 MSBuild 并行叠加耗尽内存。
 if(MSVC)
-    add_compile_options(/MP)
+    add_compile_options(/MP2)
 endif()
 
 # ============================================================================
@@ -186,6 +193,21 @@ if(CORO_BUILD_TESTS)
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
     add_test(NAME coro_tests COMMAND coro_tests)
+    set_tests_properties(coro_tests PROPERTIES TIMEOUT 120)
+    if(TARGET web_server)
+        add_test(NAME web_selftest COMMAND web_server --selftest 18081)
+        set_tests_properties(web_selftest PROPERTIES
+            TIMEOUT 30 LABELS integration
+            FAIL_REGULAR_EXPRESSION "\\[selftest\\] FAIL:")
+        add_test(NAME web_selftest_invalid_port COMMAND web_server --selftest 0)
+        add_test(NAME web_selftest_malformed_port COMMAND web_server --selftest 18081junk)
+        set_tests_properties(web_selftest_invalid_port web_selftest_malformed_port PROPERTIES
+            TIMEOUT 5 WILL_FAIL TRUE LABELS integration)
+    endif()
+    if(TARGET web_shutdown_check)
+        add_test(NAME web_shutdown_check COMMAND web_shutdown_check)
+        set_tests_properties(web_shutdown_check PROPERTIES TIMEOUT 30 LABELS integration)
+    endif()
 endif()
 
 # ============================================================================

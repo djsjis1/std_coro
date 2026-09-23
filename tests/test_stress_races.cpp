@@ -6,6 +6,8 @@
 #include "test_util.h"
 
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -16,18 +18,6 @@ namespace {
     // ── 多线程同时 wake 同一个 EventLoop ──
     // 回归: 旧实现 wake() 访问 io_uring ring, 多线程并发导致 data race
     // 修复: wake() 使用 eventfd, 不访问 ring
-    coro::Task<> multi_wake_worker(coro::Promise<int>* p, int id) {
-        // 每个 worker 从不同线程 set_value → 触发 cross_thread_wake
-        std::thread([p, id]() mutable {
-            std::this_thread::sleep_for(std::chrono::milliseconds(id % 5));
-            try {
-                p->set_value(id);
-            } catch (...) {
-                // 重复 set 会抛 logic_error, 忽略
-            }
-        }).detach();
-    }
-
     coro::Task<> multi_wake_scenario(int* result, int n_threads) {
         coro::Promise<int> p;
         auto f = p.get_future();
@@ -51,13 +41,22 @@ namespace {
     }
 
     // ── 大量跨线程 dispatch + cancel 竞争 ──
-    coro::Task<> cancel_race_worker(std::atomic<int>* completed) {
+    coro::Task<> cancel_race_worker(std::atomic<int>* completed, bool* cancelled) {
         try {
             co_await coro::sleep(5s); // 长 sleep, 等待被取消
         } catch (const coro::CancelledError&) {
-            // 正常取消路径
+            *cancelled = true;
         }
         ++*completed;
+    }
+
+    coro::Task<> cancel_sleep_scenario(std::atomic<int>* completed, bool* cancelled) {
+        auto* loop = &coro::EventLoop::get();
+        auto worker = std::make_shared<coro::Task<>>(coro::spawn(cancel_race_worker(completed, cancelled)));
+        co_await coro::yield(); // 让 worker 先进入 sleep，不能先 run() 等它自然完成。
+        // cancel 必须在所属循环调用；回调持有 Task，避免延迟投递时引用失效。
+        std::jthread canceler([loop, worker] { loop->dispatch([worker] { worker->cancel(); }); });
+        co_await *worker;
     }
 
     // ── 快速创建/销毁 Scheduler ──
@@ -155,21 +154,13 @@ TEST(StressRaceTest, MultiWaiterCrossThread) {
 // ── 高并发 cancel + sleep 竞争 ──
 TEST(StressRaceTest, CancelDuringSleep) {
     std::atomic<int> completed{0};
-    auto worker = cancel_race_worker(&completed);
-    worker.start();
-    // 让 worker 挂到 sleep 上
-    std::this_thread::sleep_for(20ms);
-    coro::EventLoop::get().run(); // 驱动一下
-
-    // 从另一个线程 cancel
-    std::thread canceler([&worker] {
-        std::this_thread::sleep_for(10ms);
-        worker.cancel();
-    });
-
-    coro::EventLoop::get().run(); // 驱动到完成
-    canceler.join();
+    bool cancelled = false;
+    const auto started = std::chrono::steady_clock::now();
+    test_util::run_task([&] { return cancel_sleep_scenario(&completed, &cancelled); });
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_TRUE(cancelled);
     EXPECT_EQ(completed.load(), 1); // 取消后协程正常结束
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 2000);
 }
 
 // ── 大量并发 Promise/Future 跨线程 ──

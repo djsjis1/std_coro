@@ -14,6 +14,16 @@
 
 name: CI
 
+# 控制编译和测试并行度；显式 Bash 保证管道中的失败不会被 tee 掩盖。
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  CTEST_PARALLEL_LEVEL: "1"
+defaults:
+  run:
+    shell: bash
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -38,13 +48,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
 
       - name: Check formatting
         run: |
-          find include router examples tests Web/src main.cpp \
-            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) | \
-          xargs -r clang-format --dry-run --Werror
+          find include router examples tests Web/src Web/main.cpp main.cpp \
+            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print0 | \
+          xargs -0 -r clang-format-18 --dry-run --Werror
 
   # ============================================================
   # Linux — GCC 13 + Clang 18, Debug + Release
@@ -85,7 +95,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }} liburing-dev
+          sudo apt-get install -y ${{ matrix.install }} liburing-dev pkg-config
+          "$CXX" --version
+          pkg-config --modversion liburing
+          uname -sr
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -96,16 +109,13 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCORO_REQUIRE_URING=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build all targets
         run: |
-          cmake --build build -j$(nproc) 2>&1 | tee build.log || {
-            echo "=== BUILD FAILED ==="
-            grep -E "error:|fatal error:" build.log | head -20
-            exit 1
-          }
+          cmake --build build 2>&1 | tee build.log
 
       - name: Run unit tests
         timeout-minutes: 5
@@ -117,7 +127,7 @@ jobs:
           cmake -S tests/package_smoke -B build/package-smoke \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_PREFIX_PATH="$PWD/build/install-root"
-          cmake --build build/package-smoke -j$(nproc)
+          cmake --build build/package-smoke
           ./build/package-smoke/coro_package_smoke
 
       - name: Verify portable core without io_uring
@@ -127,13 +137,23 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCORO_ENABLE_URING=OFF \
             -DCORO_BUILD_EXAMPLES=OFF
-          cmake --build build-core --target coro_tests -j$(nproc)
+          cmake --build build-core --target coro_tests
           ctest --test-dir build-core --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
         timeout-minutes: 5
         run: ./build/coro_stress
+
+      - name: Upload build and test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.compiler }}-${{ matrix.build_type }}-logs
+          path: |
+            build.log
+            build/Testing/Temporary/
+            build-core/Testing/Temporary/
 
   # ============================================================
   # macOS — Apple Clang, Debug + Release
@@ -173,6 +193,9 @@ jobs:
   build-windows:
     name: Windows (${{ matrix.build_type }})
     runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
     strategy:
       fail-fast: false
       matrix:
@@ -184,7 +207,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build all targets
-        run: cmake --build build --config ${{ matrix.build_type }} -j
+        run: cmake --build build --config ${{ matrix.build_type }}
 
       - name: Run unit tests
         timeout-minutes: 5
@@ -236,13 +259,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }} liburing-dev
+          sudo apt-get install -y ${{ matrix.install }} liburing-dev pkg-config
+          "$CXX" --version
+          pkg-config --modversion liburing
+          uname -sr
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_BUILD_EXAMPLES=OFF
 
       - name: Build (tests only)
-        run: cmake --build build --target coro_tests -j$(nproc)
+        run: cmake --build build --target coro_tests
 
       - name: Run tests with sanitizer
         timeout-minutes: 10
@@ -290,16 +316,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 liburing-dev lcov
+          sudo apt-get install -y g++-13 liburing-dev pkg-config lcov
+          "$CXX" --version
+          pkg-config --modversion liburing
+          uname -sr
 
       - name: Configure CMake (coverage flags)
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCORO_REQUIRE_URING=ON \
+            -DCORO_BUILD_EXAMPLES=OFF \
             -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
 
       - name: Build tests
-        run: cmake --build build --target coro_tests -j$(nproc)
+        run: cmake --build build --target coro_tests
 
       - name: Run tests
         timeout-minutes: 5

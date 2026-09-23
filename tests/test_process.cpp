@@ -84,14 +84,13 @@ namespace {
     }
 
     // 并发多进程
-    // 注: 拆分为 helper + one_exit, 避免 GCC 13 协程变换中
-    // move-only 类型与 co_return <value> 共存时触发 ICE
+    // 参数在非协程包装函数中构造后按值传入，避开 await 内的临时初始化列表。
     static coro::Task<int> spawn_wait_exit(std::vector<std::string> args) {
         auto p = co_await coro::process::spawn(std::move(args), {.capture_stdout = true});
         if (!p.valid())
             co_return -1;
         int rc = co_await p.wait();
-        co_return rc;  // p 在 co_return 前已离开作用域并析构
+        co_return rc;
     }
 
     // 非协程包装: 直接返回 Task, 避免 GCC 13 协程变换 ICE

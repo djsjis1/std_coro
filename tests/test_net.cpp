@@ -237,4 +237,99 @@ TEST(NetTest, CancelPendingAcceptDoesNotLeakHandles) {
     EXPECT_LE(after, before + 2); // 允许测试进程内部极小的瞬态波动
 }
 #endif
+
+#ifdef CORO_URING_ENABLED
+namespace {
+    coro::Task<bool> accept_closed_listener(coro::net::TcpListener* listener) {
+        auto stream = co_await listener->accept();
+        co_return !stream.valid();
+    }
+
+    coro::Task<> close_pending_accept(bool* bound, bool* completed) {
+        coro::net::TcpListener listener;
+        *bound = listener.bind_listen("127.0.0.1", 0);
+        if (!*bound)
+            co_return;
+        auto pending = coro::spawn(accept_closed_listener(&listener));
+        co_await coro::yield(); // 确保 accept 已提交且没有连接到达。
+        listener.close();
+        listener.close(); // 重复关闭不应影响正在收尾的操作。
+        try {
+            *completed = co_await coro::wait_for(std::move(pending), 500ms);
+        } catch (const coro::TimeoutError&) {
+            // 超时会取消挂起操作，断言在测试函数中报告关停失败。
+        }
+    }
+
+    // 使用系统分配的端口，避免与其他网络测试或本机服务冲突。
+    coro::net::UdpSocket bound_udp_socket(sockaddr_in* address) {
+        int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        coro::net::UdpSocket socket(fd);
+        if (!socket.valid())
+            return socket;
+        *address = {};
+        address->sin_family = AF_INET;
+        address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t size = sizeof(*address);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(address), size) < 0 ||
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(address), &size) < 0)
+            socket.close();
+        return socket;
+    }
+
+    struct udp_result {
+        int sent = -1, received = -1, replied = -1, echoed = -1;
+        sockaddr_in sender{};
+        char data[32]{};
+        char echo[32]{};
+    };
+
+    coro::Task<int> receive_udp(coro::net::UdpSocket* socket, udp_result* result) {
+        co_return co_await socket->recvfrom(result->data, sizeof(result->data), &result->sender);
+    }
+
+    coro::Task<> udp_roundtrip(coro::net::UdpSocket* server, coro::net::UdpSocket* client, sockaddr_in destination,
+                               const char* data, size_t size, udp_result* result) {
+        auto pending = coro::spawn(receive_udp(server, result));
+        co_await coro::yield(); // 接收先挂起，验证 msghdr/iovec 在挂起期间仍有效。
+        result->sent = co_await client->sendto(data, size, destination);
+        result->received = co_await std::move(pending);
+        if (result->received < 0)
+            co_return;
+        result->replied = co_await server->sendto(result->data, result->received, result->sender);
+        result->echoed = co_await client->recvfrom(result->echo, sizeof(result->echo));
+    }
+} // namespace
+
+TEST(NetTest, ListenerCloseCompletesPendingAccept) {
+    bool bound = false, completed = false;
+    test_util::run_task([&] { return close_pending_accept(&bound, &completed); });
+    ASSERT_TRUE(bound);
+    EXPECT_TRUE(completed);
+}
+
+TEST(NetTest, UdpDatagramsPreservePayloadAndSender) {
+    const char payload[] = {'a', '\0', 'b', '\x7f'};
+    for (size_t size : {size_t{0}, sizeof(payload)}) {
+        SCOPED_TRACE(size);
+        sockaddr_in server_addr{}, client_addr{};
+        auto server = bound_udp_socket(&server_addr);
+        auto client = bound_udp_socket(&client_addr);
+        ASSERT_TRUE(server.valid());
+        ASSERT_TRUE(client.valid());
+        udp_result result;
+        test_util::run_task(
+            [&] { return coro::wait_for(udp_roundtrip(&server, &client, server_addr, payload, size, &result), 2s); });
+        EXPECT_EQ(result.sent, static_cast<int>(size));
+        EXPECT_EQ(result.received, static_cast<int>(size));
+        EXPECT_EQ(result.replied, static_cast<int>(size));
+        EXPECT_EQ(result.echoed, static_cast<int>(size));
+        EXPECT_EQ(result.sender.sin_family, AF_INET);
+        EXPECT_EQ(result.sender.sin_port, client_addr.sin_port);
+        EXPECT_EQ(result.sender.sin_addr.s_addr, client_addr.sin_addr.s_addr);
+        EXPECT_EQ(std::memcmp(result.data, payload, size), 0);
+        EXPECT_EQ(std::memcmp(result.echo, payload, size), 0);
+    }
+}
+#endif
 #endif // _WIN32 || __linux__

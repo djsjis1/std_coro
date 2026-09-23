@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -1169,10 +1170,12 @@ namespace coro {
             /// 方便多线程服务器按平台无差异地调用)。
             auto accept_noattach() { return accept_awaiter{this}; }
 
-            /// 同步关闭监听 (服务器停止用)。
-            /// 挂起的 accept 会以 -ECANCELED 完成, accept() 立即返回无效流。
+            /// 同步关闭监听 (服务器停止用)，唤醒挂起的 accept 并返回无效流。
             void close() {
                 if (fd_ >= 0) {
+                    // io_uring 的 accept 持有文件引用，仅 close 不会使其完成。
+                    // 先 shutdown 解除监听，再释放描述符，避免服务停止时永久挂起。
+                    ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
                 }
@@ -1239,10 +1242,9 @@ namespace coro {
                 net::UringEventSource* uring_ = nullptr;
                 sockaddr_in from_addr{};
                 socklen_t from_len = sizeof(sockaddr_in);
-#ifndef CORO_HAS_URING_RECVFROM_SENDTO
-                struct iovec iov_ {};
-                struct msghdr msg_ {};
-#endif
+                // 描述符随 awaiter 存活，直到异步操作完成。
+                iovec iov_{};
+                msghdr msg_{};
 
                 ~recvfrom_awaiter() {
                     if (uring_)
@@ -1272,9 +1274,6 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
-#ifdef CORO_HAS_URING_RECVFROM_SENDTO
-                        io_uring_prep_recvfrom(sqe, socket->fd_, buf, len, (sockaddr*)&from_addr, &from_len);
-#else
                         iov_.iov_base = buf;
                         iov_.iov_len = len;
                         std::memset(&msg_, 0, sizeof(msg_));
@@ -1283,7 +1282,6 @@ namespace coro {
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
                         io_uring_prep_recvmsg(sqe, socket->fd_, &msg_, 0);
-#endif
                         uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
@@ -1317,10 +1315,9 @@ namespace coro {
                 sockaddr_in dest;
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
-#ifndef CORO_HAS_URING_RECVFROM_SENDTO
-                struct iovec iov_ {};
-                struct msghdr msg_ {};
-#endif
+                // 描述符随 awaiter 存活，直到异步操作完成。
+                iovec iov_{};
+                msghdr msg_{};
 
                 ~sendto_awaiter() {
                     if (uring_)
@@ -1349,9 +1346,6 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
-#ifdef CORO_HAS_URING_RECVFROM_SENDTO
-                        io_uring_prep_sendto(sqe, socket->fd_, buf, len, 0, (sockaddr*)&dest, sizeof(dest));
-#else
                         iov_.iov_base = const_cast<char*>(buf);
                         iov_.iov_len = len;
                         std::memset(&msg_, 0, sizeof(msg_));
@@ -1360,7 +1354,6 @@ namespace coro {
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
                         io_uring_prep_sendmsg(sqe, socket->fd_, &msg_, 0);
-#endif
                         uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
