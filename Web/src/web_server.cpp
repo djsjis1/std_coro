@@ -92,9 +92,42 @@ void web_server::stop() {
         conn->shutdown();
 }
 
+void web_server::register_stats_route() {
+    if (stats_route_registered_)
+        return;
+    // 普通 lambda 返回成员协程, 不依赖临时协程闭包的生命周期。
+    router_.get("/__stats", [this](const http_request&) { return stats_response(); });
+    stats_route_registered_ = true;
+}
+
+coro::Task<http_response> web_server::stats_response() const {
+    // 各字段是独立原子快照, 并非同一时刻的事务性快照。
+    // 本次统计请求在响应完整写出后才计数, 因此不包含在自身快照里。
+    std::string body = "{\"requests\":" + std::to_string(stats_.requests.load(std::memory_order_relaxed)) +
+                       ",\"errors\":" + std::to_string(stats_.errors.load(std::memory_order_relaxed)) +
+                       ",\"in_flight\":" + std::to_string(stats_.in_flight.load(std::memory_order_relaxed)) +
+                       ",\"peak\":" + std::to_string(stats_.peak.load(std::memory_order_relaxed)) + ",\"workers\":[";
+    for (size_t i = 0; i < scheduler_.worker_count(); ++i) {
+        if (i != 0)
+            body += ',';
+        // active_task_count 始终使用原子计数, 不依赖 CORO_TASK_REGISTRY 的帧地址注册表。
+        auto* loop = scheduler_.loop_at(i);
+        body += loop ? std::to_string(loop->active_task_count()) : "-1";
+    }
+    body += "]}";
+    co_return http_response::json(std::move(body));
+}
+
+void web_server::record_response(int status) {
+    if (status >= 400 && status < 600)
+        stats_.errors.fetch_add(1, std::memory_order_relaxed);
+    stats_.requests.fetch_add(1, std::memory_order_relaxed);
+}
+
 coro::Task<> web_server::serve() {
     // 冻结顺序: 注册 → freeze() → 发布运行状态/开始 accept。
     // 保证 worker 看到的是只读且完整的路由表; 冻结后再注册会抛 logic_error。
+    register_stats_route();
     router_.freeze();
     running_.store(true, std::memory_order_release);
     while (running_.load(std::memory_order_acquire)) {
@@ -154,13 +187,19 @@ bool web_server::register_connection(const std::shared_ptr<coro::net::TcpStream>
     std::lock_guard lock(connections_mutex_);
     if (!running_.load(std::memory_order_acquire))
         return false;
-    connections_.insert(conn);
+    if (connections_.insert(conn).second) {
+        auto active = stats_.in_flight.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto peak = stats_.peak.load(std::memory_order_relaxed);
+        while (active > peak && !stats_.peak.compare_exchange_weak(peak, active, std::memory_order_relaxed)) {
+        }
+    }
     return true;
 }
 
 void web_server::unregister_connection(const std::shared_ptr<coro::net::TcpStream>& conn) {
     std::lock_guard lock(connections_mutex_);
-    connections_.erase(conn);
+    if (connections_.erase(conn) != 0)
+        stats_.in_flight.fetch_sub(1, std::memory_order_relaxed);
 }
 
 coro::Task<> web_server::handle_connection(std::shared_ptr<coro::net::TcpStream> conn) {
@@ -246,6 +285,7 @@ coro::Task<> web_server::process_connection(coro::net::TcpStream& conn) {
                 const auto timeout = std::chrono::milliseconds(write_timeout_ms_.load(std::memory_order_relaxed));
                 if (!co_await write_with_timeout(conn, wire, timeout))
                     co_return; // 对端已关闭/写错误时不要继续读取同一连接
+                record_response(resp.status);
             } catch (const coro::TimeoutError&) {
                 co_return;
             }
@@ -294,7 +334,8 @@ coro::Task<> web_server::process_connection(coro::net::TcpStream& conn) {
             std::string wire = resp.build();
             try {
                 const auto write_timeout = std::chrono::milliseconds(write_timeout_ms_.load(std::memory_order_relaxed));
-                (void)co_await write_with_timeout(conn, wire, write_timeout);
+                if (co_await write_with_timeout(conn, wire, write_timeout))
+                    record_response(resp.status);
             } catch (const coro::TimeoutError&) {
             }
             co_return; // 解析错误后连接状态不可信, 直接关闭

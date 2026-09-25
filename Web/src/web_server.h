@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -66,6 +67,8 @@ class web_server {
     void set_write_timeout(std::chrono::milliseconds timeout) { write_timeout_ms_.store(timeout.count()); }
 
     /// accept 循环(常驻, 直到 stop())。在事件循环线程运行。
+    /// 启动前注册内建 GET /__stats (保留路径), 再冻结路由表。
+    /// 统计端点同样经过全局中间件, 可通过中间件限制访问。
     coro::Task<> serve();
 
     /// 请求停止(线程安全): 关闭监听和全部活动连接，唤醒 accept/read/write。
@@ -88,6 +91,18 @@ class web_server {
     /// 路由分发 + 异常兑底(handler 抛异常 → 500)。
     /// req 为非 const 引用: 动态路由捕获的参数由 router 写入 req.params
     coro::Task<http_response> dispatch(http_request& req);
+
+    void register_stats_route();
+    coro::Task<http_response> stats_response() const;
+    void record_response(int status);
+
+    struct stats_t {
+        std::atomic<std::uint64_t> requests{0};  // 完整写出的响应数, 包括错误与统计请求
+        std::atomic<std::uint64_t> errors{0};    // 其中 4xx/5xx 响应数
+        std::atomic<std::uint64_t> in_flight{0}; // 当前已接受且未结束的连接数 (含空闲连接)
+        std::atomic<std::uint64_t> peak{0};      // 连接数峰值
+    } stats_;
+    bool stats_route_registered_ = false; // 只在启动线程访问, 重启时不重复注册冻结的路由
 
     coro::Scheduler scheduler_; // worker 池 (构造即启动, 析构自动 join)
     coro::net::TcpListener listener_;

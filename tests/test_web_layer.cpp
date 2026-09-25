@@ -2,7 +2,7 @@
 //
 // 门控: router.h 依赖 coro/fs.hpp (route_core 静态文件分支), 仅在
 // I/O 后端可用的平台上编译 (与 test_net 系列一致)。
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -139,6 +140,49 @@ namespace {
         if (do_throw)
             throw std::runtime_error("boom");
         co_return http_response::text("");
+    }
+
+    unsigned short listen_for_test(web_server& server) {
+        for (auto port : kServerPorts) {
+            if (server.listen("127.0.0.1", port))
+                return port;
+        }
+        return 0;
+    }
+
+    // 同一 keep-alive 连接串行收发, 完整读取响应体后才发送下一请求。
+    coro::Task<std::string> fetch_response(coro::net::TcpStream& conn, std::string path) {
+        const std::string request = "GET " + path + " HTTP/1.1\r\nHost: t\r\n\r\n";
+        size_t sent = 0;
+        while (sent < request.size()) {
+            int n = co_await conn.write(request.data() + sent, request.size() - sent);
+            if (n <= 0)
+                throw std::runtime_error("test request write failed");
+            sent += static_cast<size_t>(n);
+        }
+        std::string response;
+        char buf[512];
+        while (true) {
+            int n = co_await conn.read(buf, sizeof(buf));
+            if (n <= 0)
+                throw std::runtime_error("test response incomplete");
+            response.append(buf, static_cast<size_t>(n));
+            auto end = response.find("\r\n\r\n");
+            if (end == std::string::npos)
+                continue;
+            auto length = response.find("\r\nContent-Length: ");
+            if (length == std::string::npos || length > end)
+                throw std::runtime_error("test response missing Content-Length");
+            auto size = std::stoull(response.substr(length + 18));
+            if (response.size() >= end + 4 + size)
+                co_return response;
+        }
+    }
+
+    coro::Task<http_response> mw_deny_stats(http_request& req, router::next_fn next) {
+        if (req.path_view() == "/__stats")
+            co_return http_response::error(403, "forbidden");
+        co_return co_await next();
     }
 
     coro::Task<> fetch_status(unsigned short port, int* status, bool* connected) {
@@ -439,6 +483,108 @@ TEST(WebLayerTest, RealServerUnhandledExceptionBecomes500) {
     });
     EXPECT_TRUE(connected);
     EXPECT_EQ(status, 500);
+}
+
+// 真实请求验证注册早于冻结、全局链覆盖统计路由、成功/错误响应累计与连接计数。
+TEST(WebLayerTest, StatsRouteRegisteredBeforeFreezeAndCountsResponses) {
+    web_server server(2);
+    server.set_verbose(false);
+    server.routes().use(mw_mark);
+    server.routes().get("/ok", echo_handler);
+    server.routes().get("/boom", boom_handler_fn);
+    const auto port = listen_for_test(server);
+    if (!port)
+        GTEST_SKIP() << "no test port available";
+
+    bool frozen = false;
+    std::vector<std::string> responses;
+    test_util::run_task([&]() -> coro::Task<> {
+        auto serve = coro::spawn(server.serve());
+        std::exception_ptr error;
+        try {
+            co_await coro::sleep(50ms);
+            try {
+                server.routes().get("/late", echo_handler);
+            } catch (const std::logic_error&) {
+                frozen = true;
+            }
+            // 空闲连接也应计入 in_flight; 第二个连接串行处理请求。
+            auto idle = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+            auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+            if (!idle.valid() || !conn.valid())
+                throw std::runtime_error("test connect failed");
+            const char* paths[] = {"/ok", "/missing", "/boom", "/__stats", "/__stats"};
+            for (const auto* path : paths)
+                responses.push_back(co_await fetch_response(conn, path));
+        } catch (...) {
+            error = std::current_exception();
+        }
+        server.stop();
+        co_await std::move(serve);
+        if (error)
+            std::rethrow_exception(error);
+    });
+    server.wait_all();
+
+    EXPECT_TRUE(frozen);
+    ASSERT_EQ(responses.size(), 5u);
+    EXPECT_EQ(responses[0].find("HTTP/1.1 200"), 0u);
+    EXPECT_EQ(responses[1].find("HTTP/1.1 404"), 0u);
+    EXPECT_EQ(responses[2].find("HTTP/1.1 500"), 0u);
+    EXPECT_EQ(responses[3].find("HTTP/1.1 200"), 0u);
+    EXPECT_NE(responses[3].find("Content-Type: application/json"), std::string::npos);
+    EXPECT_NE(responses[3].find("X-Mark: 1\r\n"), std::string::npos);
+    EXPECT_NE(responses[3].find("\"requests\":3,"), std::string::npos);
+    EXPECT_NE(responses[3].find("\"errors\":2,"), std::string::npos);
+    EXPECT_NE(responses[3].find("\"in_flight\":2,"), std::string::npos);
+    EXPECT_NE(responses[3].find("\"peak\":2,"), std::string::npos);
+    EXPECT_NE(responses[3].find("\"workers\":["), std::string::npos);
+    EXPECT_NE(responses[4].find("\"requests\":4,"), std::string::npos);
+    EXPECT_NE(responses[4].find("\"errors\":2,"), std::string::npos);
+
+    // 停止并清空 worker 后直接读取快照, 所有连接计数必须归零。
+    std::string body;
+    test_util::run_task([&]() -> coro::Task<> {
+        auto req = make_req("GET", "/__stats");
+        auto resp = co_await server.routes().route(req);
+        body = std::move(resp.body);
+    });
+    EXPECT_NE(body.find("\"requests\":5,"), std::string::npos);
+    EXPECT_NE(body.find("\"errors\":2,"), std::string::npos);
+    EXPECT_NE(body.find("\"in_flight\":0,"), std::string::npos);
+    EXPECT_NE(body.find("\"peak\":2,"), std::string::npos);
+    EXPECT_NE(body.find("\"workers\":[0,0]"), std::string::npos);
+}
+
+TEST(WebLayerTest, StatsRouteCanBeShortCircuitedByGlobalMiddleware) {
+    web_server server(1);
+    server.set_verbose(false);
+    server.routes().use(mw_deny_stats);
+    const auto port = listen_for_test(server);
+    if (!port)
+        GTEST_SKIP() << "no test port available";
+
+    std::string response;
+    test_util::run_task([&]() -> coro::Task<> {
+        auto serve = coro::spawn(server.serve());
+        std::exception_ptr error;
+        try {
+            co_await coro::sleep(50ms);
+            auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+            if (!conn.valid())
+                throw std::runtime_error("test connect failed");
+            response = co_await fetch_response(conn, "/__stats");
+        } catch (...) {
+            error = std::current_exception();
+        }
+        server.stop();
+        co_await std::move(serve);
+        if (error)
+            std::rethrow_exception(error);
+    });
+    server.wait_all();
+    EXPECT_EQ(response.find("HTTP/1.1 403"), 0u);
+    EXPECT_EQ(response.find("\"requests\":"), std::string::npos);
 }
 #endif // CORO_WEB_LAYER_HAS_SERVER
 

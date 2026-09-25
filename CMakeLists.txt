@@ -190,11 +190,18 @@ if(CORO_BUILD_TESTS)
     add_subdirectory(thirdparty/googletest-main EXCLUDE_FROM_ALL)
 
     file(GLOB CORO_TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.cpp)
+    # Web 测试依赖文件和网络 I/O, 在能力可用时单独加入, 与示例开关无关。
+    list(REMOVE_ITEM CORO_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_layer.cpp")
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
-    if(TARGET web_server)
-        # 中间件测试的真实服务器用例: 复用 web_server/http_types 源 (仅 NET 平台)
-        target_sources(coro_tests PRIVATE Web/src/web_server.cpp Web/src/http_types.cpp)
+    if(CORO_HAS_NET AND CORO_HAS_FS)
+        # tests-only / Sanitizer 配置也需要 HTTP 库, 不能依赖 web_server 示例目标。
+        if(NOT TARGET http::http)
+            set(STD_HTTP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+            add_subdirectory(thirdparty/http ${CMAKE_BINARY_DIR}/http EXCLUDE_FROM_ALL)
+        endif()
+        target_sources(coro_tests PRIVATE
+            tests/test_web_layer.cpp Web/src/web_server.cpp Web/src/http_types.cpp)
         target_link_libraries(coro_tests PRIVATE http::http)
         target_include_directories(coro_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Web/src)
         if(MSVC)
