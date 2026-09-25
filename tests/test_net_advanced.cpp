@@ -1,5 +1,5 @@
 // test_net_advanced.cpp — 网络高级场景: 多连接/大数据/拒绝/多轮读写
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

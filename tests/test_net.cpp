@@ -1,5 +1,5 @@
 // test_net.cpp — TCP 回环: accept / connect / read / write (IOCP / io_uring)
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

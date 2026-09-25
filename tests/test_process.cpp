@@ -1,5 +1,5 @@
 // test_process.cpp — 子进程: stdout 捕获 / 退出码 / 终止
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

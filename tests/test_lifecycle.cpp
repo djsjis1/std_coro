@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <coro/net.hpp>
 #endif
 
@@ -102,7 +102,7 @@ namespace {
         co_await coro::sleep(1ms);
     }
 
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
     coro::Task<> pending_socket_read(coro::net::TcpListener* listener, bool* entered, int* destroyed) {
         auto conn = co_await listener->accept();
         if (!conn.valid())
@@ -207,7 +207,7 @@ TEST(LifecycleTest, TaskDestroyDuringPendingIO) {
     EXPECT_GE(destroyed, 1);
 }
 
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 TEST(LifecycleTest, TaskDestroyDuringPendingSocketRead) {
     bool bound = false;
     bool connected = false;

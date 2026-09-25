@@ -1,5 +1,5 @@
 // test_fs_watch.cpp — 目录监视: 创建/修改/重命名/删除 事件
-#if defined(_WIN32) || (defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING))
+#if defined(_WIN32) || (defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING)
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>

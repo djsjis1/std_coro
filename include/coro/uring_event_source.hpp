@@ -2,7 +2,7 @@
 
 #include "event_source.hpp"
 
-#if defined(__linux__) && (!defined(CORO_HAS_URING) || CORO_HAS_URING)
+#if defined(__linux__) && defined(CORO_HAS_URING) && CORO_HAS_URING
 #define CORO_URING_ENABLED 1
 #include <liburing.h>
 #include <sys/eventfd.h>
