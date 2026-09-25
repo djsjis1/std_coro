@@ -61,9 +61,9 @@ int main() {
 核心库提供 `coro::coro` 的安装导出，应用侧可直接使用：
 
 ```powershell
-cmake -S . -B build -DCORO_BUILD_TESTS=OFF -DCORO_BUILD_EXAMPLES=OFF
-cmake --build build --config Release
-cmake --install build --config Release --prefix <install-prefix>
+cmake --preset core               # 纯协程核心 (测试/示例/Web 默认关闭); 或 cmake -S . -B build
+cmake --build build/core --config Release
+cmake --install build/core --config Release --prefix <install-prefix>
 ```
 
 ```cmake
@@ -387,7 +387,7 @@ coro/
 ├── docs/                  # 文档中心 (docs/README.md 为地图)
 │   ├── tutorial/          #   使用教程 (10 讲)
 │   └── cpp20-coroutines-course/  #   C++20 协程语言课程 (14 讲)
-├── thirdparty/            # googletest (开发依赖, 库本身零依赖)
+├── thirdparty/            # googletest / llhttp 等仓库内源码集成 (库本身零依赖; 仅启用对应模块时构建)
 └── main.cpp               # 协程练习场（改完直接编译运行）
 ```
 

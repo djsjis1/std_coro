@@ -142,22 +142,22 @@ int main() { coro::run(main_task()); }   // 启动事件循环，跑完自动退
 构建：
 
 ```bash
-# Windows (Visual Studio)
-cmake -S . -B build -A x64
-cmake --build build --config Debug
-# Linux (Ninja/Make；先安装 liburing-dev)
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+# 开发验证配置 (测试+示例+Web 全开, 产物在 build/dev):
+cmake --preset dev
+cmake --build --preset dev
+ctest --test-dir build/dev --output-on-failure   # Windows 加 -C Debug
 
+# 作为依赖集成时 (核心零附加构建, 只编译被启用的模块):
+cmake -S . -B build -DCORO_ENABLE_WEB=ON         # 按需显式开启模块
+# 也可直接 cmake --preset core (纯协程核心) / native / web
 # 运行单元测试 (googletest, 集成于 thirdparty/googletest-main)
-ctest --test-dir build -C Debug --output-on-failure
-# Windows 也可直接运行: build/Debug/coro_tests.exe
-# Linux 也可直接运行: ./build/coro_tests
+# Windows 也可直接运行: build/dev/Debug/coro_tests.exe
+# Linux 也可直接运行: ./build/dev/coro_tests
 # 测试覆盖: Task/spawn/异常、取消语义、并发原语、同步原语、Future、调度、TCP、
-#           文件 IO、管道、信号、目录监视、子进程 (128 用例)
+#           文件 IO、管道、信号、目录监视、子进程 (238 用例)
 
-# 高并发压力测试 (独立程序):
-cmake --build build --config Release --target coro_stress
+# 高并发压力测试 (独立程序, 默认不构建):
+cmake --build build/dev --target coro_stress
 # Windows: .\build\Release\coro_stress.exe
 # Linux:   ./build/coro_stress
 # 覆盖: 10 万协程并发 / 10 万定时器 / 400 万次 yield / 100 万队列吞吐

@@ -1,0 +1,51 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CORO_BUILD_EXAMPLES": "OFF",
+        "CORO_BUILD_TESTS": "OFF",
+        "CORO_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "core",
+      "displayName": "纯协程核心（无原生 I/O，零第三方依赖）",
+      "inherits": "base",
+      "cacheVariables": { "CORO_ENABLE_NATIVE_IO": "OFF" }
+    },
+    {
+      "name": "native",
+      "displayName": "原生 I/O（Windows IOCP / Linux io_uring）",
+      "inherits": "base",
+      "cacheVariables": {
+        "CORO_ENABLE_NATIVE_IO": "ON",
+        "CORO_ENABLE_URING": "ON"
+      }
+    },
+    {
+      "name": "web",
+      "displayName": "Web 服务框架（coro::web + web_server）",
+      "inherits": "native",
+      "cacheVariables": { "CORO_ENABLE_WEB": "ON" }
+    },
+    {
+      "name": "dev",
+      "displayName": "开发验证：全特性 + 测试 + 示例 + 压测",
+      "inherits": "base",
+      "cacheVariables": {
+        "CORO_BUILD_TESTS": "ON",
+        "CORO_BUILD_EXAMPLES": "ON",
+        "CORO_BUILD_BENCHMARKS": "ON",
+        "CORO_ENABLE_NATIVE_IO": "ON",
+        "CORO_ENABLE_URING": "ON",
+        "CORO_ENABLE_WEB": "ON"
+      }
+    }
+  ]
+}
