@@ -588,4 +588,87 @@ TEST(WebLayerTest, StatsRouteCanBeShortCircuitedByGlobalMiddleware) {
 }
 #endif // CORO_WEB_LAYER_HAS_SERVER
 
+// ── include(): 子路由器路由带前缀合并到父路由器 ──
+TEST(WebLayerTest, IncludeSubRouterWithPrefix) {
+    int status = 0;
+    std::string body;
+    auto scenario = [&]() -> coro::Task<> {
+        router users;
+        users.get("/:id", echo_handler);
+        users.post("/", echo_handler);
+
+        router main_r;
+        main_r.include(users, "/api/users");
+
+        // GET /api/users/42 → 命中子路由器的 /:id
+        auto req = make_req("GET", "/api/users/42");
+        auto resp = co_await main_r.route(req);
+        status = resp.status;
+        body = resp.body;
+    };
+    test_util::run_task(scenario);
+    EXPECT_EQ(status, 200);
+    EXPECT_EQ(body, "ok:42");
+}
+
+// ── include(): 子路由器的全局中间件作为外层, 路由级中间件作为内层 ──
+TEST(WebLayerTest, IncludeMergesMiddlewares) {
+    std::vector<std::string> order;
+    int status = 0;
+    g_order = &order;
+    auto scenario = [&]() -> coro::Task<> {
+        router sub;
+        sub.use(mw_log);                        // 子路由器全局中间件
+        sub.get("/x", echo_handler, {mw_auth}); // 路由级中间件
+
+        router main_r;
+        main_r.include(sub, "/api");
+
+        auto req = make_req("GET", "/api/x");
+        req.headers["Authorization"] = "Bearer x";
+        auto resp = co_await main_r.route(req);
+        status = resp.status;
+    };
+    test_util::run_task(scenario);
+    g_order = nullptr;
+    EXPECT_EQ(status, 200);
+    // 顺序: 子全局(log) → 路由级(auth) → handler → 路由级(auth) → 子全局(log)
+    EXPECT_EQ(order, (std::vector<std::string>{"log:in", "auth:in", "handler", "auth:out", "log:out"}));
+}
+
+// ── include(): 冻结后拒绝 ──
+TEST(WebLayerTest, IncludeOnFrozenRouterRejects) {
+    router sub;
+    sub.get("/x", echo_handler);
+
+    router main_r;
+    main_r.freeze();
+    EXPECT_THROW(main_r.include(sub, "/api"), std::logic_error);
+}
+
+// ── include(): 多个子路由器、不同前缀 ──
+TEST(WebLayerTest, IncludeMultipleSubRouters) {
+    int status_a = 0, status_b = 0;
+    auto scenario = [&]() -> coro::Task<> {
+        router module_a, module_b;
+        module_a.get("/hello", echo_handler);
+        module_b.get("/world", echo_handler);
+
+        router main_r;
+        main_r.include(module_a, "/a");
+        main_r.include(module_b, "/b");
+
+        auto req_a = make_req("GET", "/a/hello");
+        auto resp_a = co_await main_r.route(req_a);
+        status_a = resp_a.status;
+
+        auto req_b = make_req("GET", "/b/world");
+        auto resp_b = co_await main_r.route(req_b);
+        status_b = resp_b.status;
+    };
+    test_util::run_task(scenario);
+    EXPECT_EQ(status_a, 200);
+    EXPECT_EQ(status_b, 200);
+}
+
 #endif // _WIN32 || __linux__ + uring

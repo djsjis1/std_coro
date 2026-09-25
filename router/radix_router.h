@@ -164,6 +164,7 @@ template <typename Value> class radix_router {
         if (!cur->value)
             ++count_;
         cur->value = std::move(value); // 模式终点, 存放 handler
+        log_.emplace_back(pattern);
         return true;
     }
 
@@ -189,12 +190,17 @@ template <typename Value> class radix_router {
     size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0; }
 
+    /// 注册顺序日志: 按 insert 成功顺序记录原始模式字符串。
+    /// 用于 router::include() 按序回放子路由器的路由。
+    const std::vector<std::string>& patterns() const noexcept { return log_; }
+
     /// 清空全部路由 (热重载场景: 清空重建)。
     /// 节点在 arena 池里, pool_.clear() 线性析构, 不递归深树。
     void clear() {
         root_ = node{};
         pool_.clear();
         count_ = 0;
+        log_.clear();
     }
 
     // 节点指针指向内部 arena: move 转移所有权安全, 拷贝会悬空 → 禁止
@@ -409,6 +415,7 @@ template <typename Value> class radix_router {
         return false;
     }
 
-    node root_;        // 字典树根 (静态路由也在树里, httprouter 同款单树结构)
-    size_t count_ = 0; // 已注册模式数
+    node root_;                    // 字典树根 (静态路由也在树里, httprouter 同款单树结构)
+    size_t count_ = 0;             // 已注册模式数
+    std::vector<std::string> log_; // 注册顺序日志 (include 回放用)
 };

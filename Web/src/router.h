@@ -83,6 +83,47 @@ class router {
         middlewares_.push_back(std::move(mw));
     }
 
+    /// 合并子路由器的路由到本路由器, 所有路径加 prefix 前缀。
+    /// 类似 FastAPI 的 app.include_router(sub, prefix="/api"):
+    ///   router users;
+    ///   users.get("/:id", handle_user);
+    ///   users.post("/", create_user);
+    ///   main.include(users, "/api/users");
+    ///   // → GET  /api/users/:id   POST /api/users/
+    ///
+    /// 语义:
+    ///   - 子路由器的全局中间件 (use) 作为外层, 路由级中间件作为内层;
+    ///     合并后一次性展平到父路由器, 运行时无嵌套链开销。
+    ///   - 子路由器的 static_dir 不随 include 转移 (静态挂载应直接在父注册)。
+    ///   - 注册顺序按子路由器的注册顺序保留。
+    void include(const router& sub, const std::string& prefix) {
+        check_frozen();
+        // 规范化前缀: 保证非空且不以 '/' 开头、不以 '/' 结尾
+        std::string norm = prefix;
+        if (!norm.empty() && norm.front() != '/')
+            norm.insert(norm.begin(), '/');
+        while (norm.size() > 1 && norm.back() == '/')
+            norm.pop_back();
+
+        for (const auto& [method, sub_tree] : sub.trees_) {
+            for (const auto& pattern : sub_tree.patterns()) {
+                const auto* entry = sub_tree.lookup(pattern);
+                if (!entry)
+                    continue; // 替换场景的旧日志条目, 当前树里已被覆盖
+                // 拼接路径: prefix + 原路径
+                std::string full_path = (norm == "/") ? pattern : norm + pattern;
+                // 合并中间件: 子路由器全局 (外层) + 路由级 (内层)
+                std::vector<middleware_fn> combined;
+                combined.reserve(sub.middlewares_.size() + entry->middlewares.size());
+                for (const auto& mw : sub.middlewares_)
+                    combined.push_back(mw);
+                for (const auto& mw : entry->middlewares)
+                    combined.push_back(mw);
+                add(method, full_path, entry->handler, std::move(combined));
+            }
+        }
+    }
+
     /// 冻结路由表: 之后所有注册入口 (use/get/post/add/static_dir) 抛
     /// std::logic_error —— 不用 assert, Release 下同样生效。
     /// 顺序约定: 注册 → freeze() → 设置运行标志/开始 accept;
