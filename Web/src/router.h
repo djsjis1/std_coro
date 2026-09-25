@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "http_types.h"
+#include "middleware.h"
 
 // ============================================================================
 // router.h — HTTP 路由层: 基于 radix_router 的高性能动态路由
@@ -36,27 +37,63 @@ class router {
     // std::function 让它可以用 lambda / 函数指针 / 任意可调用对象.
     // Task<http_response> 意味着 handler 内部可以 co_await 异步操作
     // (比如 sleep / 数据库查询), 挂起时不占 CPU.
+    // 中间件可以修改请求 (参数是可写引用), handler 保持只读 const&.
     using handler_fn = std::function<coro::Task<http_response>(const http_request&)>;
+
+    // 中间件类型别名 (定义见 middleware.h, 减少调用方改动)
+    using terminal_fn = middleware::terminal_fn;
+    using middleware_fn = middleware::middleware_fn;
+    using next_fn = middleware::next_fn;
+
+    // 路由条目: handler + 路由级中间件 (radix_router<Value> 的 Value)。
+    // 必须定义在使用它的成员函数签名之前 —— 签名中的类型在声明点解析,
+    // 不属于「完整类上下文」。
+    struct route_entry {
+        handler_fn handler;
+        std::vector<middleware_fn> middlewares; // 内层链, 可为空
+    };
 
     /// 注册 GET 处理器。路径支持:
     ///   静态:  "/user/list"
     ///   参数:  "/user/:id"      (handler 内用 req.param("id") 取)
     ///   通配:  "/files/*path"   (吞掉剩余全部路径)
-    void get(const std::string& path, handler_fn fn) { add("GET", path, std::move(fn)); }
+    /// mws: 路由级中间件 (匹配命中后才执行, 可读 req.param; 先挂载的在外层)
+    void get(const std::string& path, handler_fn fn, std::vector<middleware_fn> mws = {}) {
+        add("GET", path, std::move(fn), std::move(mws));
+    }
 
     /// 注册 POST 处理器
-    void post(const std::string& path, handler_fn fn) { add("POST", path, std::move(fn)); }
+    void post(const std::string& path, handler_fn fn, std::vector<middleware_fn> mws = {}) {
+        add("POST", path, std::move(fn), std::move(mws));
+    }
 
     /// 注册任意 HTTP 方法的处理器
-    void add(const std::string& method, const std::string& path, handler_fn fn) {
+    void add(const std::string& method, const std::string& path, handler_fn fn, std::vector<middleware_fn> mws = {}) {
+        check_frozen();
         // 每方法一棵树: operator[] 首次访问时创建该方法的空 router
-        trees_[method].insert(path, std::move(fn));
+        route_entry entry{std::move(fn), std::move(mws)};
+        trees_[method].insert(path, std::move(entry));
     }
+
+    /// 全局中间件: 包在所有路由 (含 404/405/静态文件) 外层, 按注册顺序执行,
+    /// 先注册的在最外层 (aiohttp/gin 同语义)。此时路由参数尚未填充 ——
+    /// 需要读取 req.param 的鉴权类中间件应挂在路由级。
+    void use(middleware_fn mw) {
+        check_frozen();
+        middlewares_.push_back(std::move(mw));
+    }
+
+    /// 冻结路由表: 之后所有注册入口 (use/get/post/add/static_dir) 抛
+    /// std::logic_error —— 不用 assert, Release 下同样生效。
+    /// 顺序约定: 注册 → freeze() → 设置运行标志/开始 accept;
+    /// 注册与冻结只在启动线程顺序进行, 不承诺并发注册安全。
+    void freeze() { frozen_ = true; }
 
     /// 静态文件服务: 把 URL 前缀 mount 映射到磁盘目录 dir.
     /// 例: static_dir("/static", "/var/www")
     ///     请求 GET /static/css/style.css → 读取 /var/www/css/style.css 返回
     void static_dir(const std::string& mount, const std::string& dir) {
+        check_frozen();
         std::string normalized = mount.empty() ? "/" : mount;
         while (normalized.size() > 1 && normalized.back() == '/')
             normalized.pop_back();
@@ -65,26 +102,50 @@ class router {
         static_dirs_.emplace_back(std::move(normalized), dir); // 存入 vector, 支持多个挂载点
     }
 
-    /// 路由分发: 按优先级依次尝试:
+    /// 路由分发入口。无全局中间件时走快路径: 直接进入 route_core,
+    /// 不创建链对象与协程帧 (默认零中间件的请求零额外开销)。
+    coro::Task<http_response> route(http_request& req) const {
+        if (middlewares_.empty())
+            return route_core(req);
+        return route_with_global(req);
+    }
+
+  private:
+    /// 全局链消费协程: 链在协程内创建为局部对象并 co_await 到结束
+    /// (Task 延迟执行, 临时链会悬空 —— 见 middleware.h 生命周期约定)。
+    coro::Task<http_response> route_with_global(http_request& req) const {
+        middleware::middleware_chain chain(middlewares_, [this](http_request& r) { return route_core(r); });
+        co_return co_await chain.run(0, req);
+    }
+
+    /// 路由级链消费协程: 同上, 链尾终端是该路由的 handler
+    coro::Task<http_response> run_route_middlewares(const route_entry& entry, http_request& req) const {
+        middleware::middleware_chain chain(entry.middlewares, [&entry](http_request& r) { return entry.handler(r); });
+        co_return co_await chain.run(0, req);
+    }
+
+    /// 路由匹配核心 (原 route 逻辑): 按优先级依次尝试:
     ///   1. radix_router 匹配 (当前方法的树), 命中时填充 req.params
     ///   2. 405 / OPTIONS: 路径存在但方法不同 (生产路由器内建能力)
     ///   3. 静态文件目录 (仅 GET)
     ///   4. 都不匹配 → 404
     /// 注意: req 为非 const 引用 —— 动态路由捕获的参数要写入 req.params
-    coro::Task<http_response> route(http_request& req) const {
+    coro::Task<http_response> route_core(http_request& req) const {
         // path_view(): 零分配的路径视图 (直接指向 req.url 内部)
         std::string_view path = req.path_view();
 
         // ---- 第一步: 在该方法的树里查找 ----
         if (auto it = trees_.find(req.method); it != trees_.end()) {
-            radix_router<handler_fn>::params_view caps; // 捕获结果 (string_view)
-            if (const handler_fn* fn = it->second.lookup(path, &caps)) {
+            radix_router<route_entry>::params_view caps; // 捕获结果 (string_view)
+            if (const route_entry* entry = it->second.lookup(path, &caps)) {
                 // 捕获的视图实体化成 string 存入 req.params
                 // (handler 通过 req.param("id") 按名访问)
                 req.params.reserve(caps.size());
                 for (const auto& [k, v] : caps)
                     req.params.emplace_back(std::string(k), std::string(v));
-                co_return co_await (*fn)(req);
+                if (entry->middlewares.empty())
+                    co_return co_await entry->handler(req);
+                co_return co_await run_route_middlewares(*entry, req);
             }
         }
 
@@ -180,7 +241,6 @@ class router {
         co_return http_response::error(404, "not found");
     }
 
-  private:
     /// 路径安全校验: 防止攻击者通过精心构造的 URL 读取服务器上的敏感文件.
     /// 攻击示例:
     ///   - /static/../../etc/passwd       (.. 穿越)
@@ -233,11 +293,20 @@ class router {
         return true; // 所有检查通过, 路径安全
     }
 
+    void check_frozen() const {
+        if (frozen_)
+            throw std::logic_error("router is frozen: register before serve()");
+    }
+
     // 每个 HTTP 方法一棵 radix_router 树 (httprouter 同款设计):
     //   GET 树 / POST 树 / ... 互不干扰, 同名路径不同方法各走各的.
     // unordered_map 的键是方法名 (GET/POST/...), 只有几个, 哈希开销可忽略.
-    std::unordered_map<std::string, radix_router<handler_fn>> trees_;
+    std::unordered_map<std::string, radix_router<route_entry>> trees_;
     // 静态文件目录: pair<URL 前缀, 磁盘目录>
     // 例: {"/static", "/var/www"} 表示 /static/* 映射到 /var/www/*
     std::vector<std::pair<std::string, std::string>> static_dirs_;
+    // 全局中间件 (外层链): 包住 route_core 的全部输出 (含 404/静态)
+    std::vector<middleware_fn> middlewares_;
+    // 冻结标志: freeze() 后注册入口抛错; 之后多 worker 只读并发安全
+    bool frozen_ = false;
 };

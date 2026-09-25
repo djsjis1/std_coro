@@ -93,6 +93,9 @@ void web_server::stop() {
 }
 
 coro::Task<> web_server::serve() {
+    // 冻结顺序: 注册 → freeze() → 发布运行状态/开始 accept。
+    // 保证 worker 看到的是只读且完整的路由表; 冻结后再注册会抛 logic_error。
+    router_.freeze();
     running_.store(true, std::memory_order_release);
     while (running_.load(std::memory_order_acquire)) {
         // ---- 第一步: 接受新连接 ----
