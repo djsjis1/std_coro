@@ -8,6 +8,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(CORO_BUILD_EXAMPLES "构建示例与压力程序" ON)
+option(CORO_BUILD_TESTS "构建单元测试" ON)
 option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
 option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止静默回退" OFF)
 if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING))
@@ -110,6 +111,15 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CORO_HAS_PROCESS ${CORO_HAS_URING})
 endif()
 
+# Web 实现按能力创建, 不依赖示例可执行目标; 属性跨独立入口的目录作用域可读。
+set_property(TARGET coro PROPERTY CORO_WEB_IO_AVAILABLE FALSE)
+if(CORO_HAS_NET AND CORO_HAS_FS)
+    set_property(TARGET coro PROPERTY CORO_WEB_IO_AVAILABLE TRUE)
+    if(CORO_BUILD_EXAMPLES OR CORO_BUILD_TESTS OR CORO_WEB_BOOTSTRAP)
+        add_subdirectory(Web/src)
+    endif()
+endif()
+
 # ============================================================================
 # 示例
 # ============================================================================
@@ -147,12 +157,8 @@ if(CORO_HAS_PROCESS)
 endif()
 
 if(CORO_HAS_NET AND CORO_HAS_SIGNAL)
-    add_executable(web_shutdown_check
-        tests/web_shutdown_check.cpp
-        Web/src/http_types.cpp
-        Web/src/web_server.cpp)
-    target_link_libraries(web_shutdown_check PRIVATE coro::coro http::http router::router)
-    target_include_directories(web_shutdown_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Web/src)
+    add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
+    target_link_libraries(web_shutdown_check PRIVATE coro::web)
     if(MSVC)
         target_compile_options(web_shutdown_check PRIVATE /utf-8)
     endif()
@@ -160,7 +166,9 @@ endif()
 
 # Web 服务器示例 (coro 网络层 + llhttp 协议解析, 独立子项目)
 if(CORO_HAS_NET)
-    add_subdirectory(Web)
+    if(NOT CORO_WEB_BOOTSTRAP)
+        add_subdirectory(Web)
+    endif()
     add_subdirectory(tcp_udp)
 endif()
 
@@ -176,8 +184,6 @@ endif()
 # ============================================================================
 # 单元测试 (googletest, 集成于 thirdparty/googletest-main)
 # ============================================================================
-option(CORO_BUILD_TESTS "构建单元测试" ON)
-
 if(CORO_BUILD_TESTS)
     enable_testing()
     # 禁止 gtest 的示例和内部测试, 只构建库
@@ -195,15 +201,8 @@ if(CORO_BUILD_TESTS)
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
     if(CORO_HAS_NET AND CORO_HAS_FS)
-        # tests-only / Sanitizer 配置也需要 HTTP 库, 不能依赖 web_server 示例目标。
-        if(NOT TARGET http::http)
-            set(STD_HTTP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-            add_subdirectory(thirdparty/http ${CMAKE_BINARY_DIR}/http EXCLUDE_FROM_ALL)
-        endif()
-        target_sources(coro_tests PRIVATE
-            tests/test_web_layer.cpp Web/src/web_server.cpp Web/src/http_types.cpp)
-        target_link_libraries(coro_tests PRIVATE http::http)
-        target_include_directories(coro_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Web/src)
+        target_sources(coro_tests PRIVATE tests/test_web_layer.cpp)
+        target_link_libraries(coro_tests PRIVATE coro::web http::http)
         if(MSVC)
             target_compile_options(coro_tests PRIVATE /utf-8)
         endif()
@@ -219,6 +218,17 @@ if(CORO_BUILD_TESTS)
         add_test(NAME web_selftest_malformed_port COMMAND web_server --selftest 18081junk)
         set_tests_properties(web_selftest_invalid_port web_selftest_malformed_port PROPERTIES
             TIMEOUT 5 WILL_FAIL TRUE LABELS integration)
+        add_test(NAME web_stress_smoke COMMAND web_server --stress 2 3)
+        set_tests_properties(web_stress_smoke PROPERTIES TIMEOUT 30 LABELS integration RESOURCE_LOCK web_port_8080)
+        set(case_index 0)
+        foreach(args IN ITEMS "0;1" "2junk;1" "999999999999999999;1" "1;-1" "1;1;extra")
+            math(EXPR case_index "${case_index} + 1")
+            add_test(NAME web_stress_invalid_${case_index}
+                COMMAND ${CMAKE_COMMAND} "-DPROGRAM=$<TARGET_FILE:web_server>"
+                    "-DARGS=--stress;${args}" -DEXPECTED=2
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/web_cli_check.cmake)
+            set_tests_properties(web_stress_invalid_${case_index} PROPERTIES TIMEOUT 15 LABELS integration)
+        endforeach()
     endif()
     if(TARGET web_shutdown_check)
         add_test(NAME web_shutdown_check COMMAND web_shutdown_check)

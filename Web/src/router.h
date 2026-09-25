@@ -71,8 +71,12 @@ class router {
     void add(const std::string& method, const std::string& path, handler_fn fn, std::vector<middleware_fn> mws = {}) {
         check_frozen();
         // 每方法一棵树: operator[] 首次访问时创建该方法的空 router
+        if (method.empty() || !fn || path.find_first_of("?#") != std::string::npos ||
+            path.find('\0') != std::string::npos)
+            throw std::invalid_argument("invalid route: " + method + " " + path);
         route_entry entry{std::move(fn), std::move(mws)};
-        trees_[method].insert(path, std::move(entry));
+        if (!trees_[method].insert(path, std::move(entry)))
+            throw std::invalid_argument("invalid or conflicting route: " + method + " " + path);
     }
 
     /// 全局中间件: 包在所有路由 (含 404/405/静态文件) 外层, 按注册顺序执行,
@@ -95,36 +99,57 @@ class router {
     ///   - 子路由器的全局中间件 (use) 作为外层, 路由级中间件作为内层;
     ///     合并后一次性展平到父路由器, 运行时无嵌套链开销。
     ///   - 子路由器的 static_dir 不随 include 转移 (静态挂载应直接在父注册)。
-    ///   - 注册顺序按子路由器的注册顺序保留。
+    ///   - 同方法内保留首次注册顺序; 不承诺跨方法全局顺序。
+    ///   - 导入是快照, 子中间件仅作用于命中的路由, 不覆盖前缀下的 404/405。
+    ///   - 语法/冲突错误在写入前发现; 资源耗尽等异常不承诺事务回滚, 应中止启动。
     void include(const router& sub, const std::string& prefix) {
         check_frozen();
-        // 规范化前缀: 保证非空且不以 '/' 开头、不以 '/' 结尾
+        if (this == &sub)
+            throw std::invalid_argument("router cannot include itself");
+        if (prefix.find_first_of("?#") != std::string::npos || prefix.find('\0') != std::string::npos ||
+            prefix.find("//") != std::string::npos)
+            throw std::invalid_argument("invalid route prefix: " + prefix);
         std::string norm = prefix;
         if (!norm.empty() && norm.front() != '/')
             norm.insert(norm.begin(), '/');
-        while (norm.size() > 1 && norm.back() == '/')
+        if (!norm.empty() && norm.back() == '/')
             norm.pop_back();
+        // 即使子路由为空也检查前缀; 前缀后的路由不能被通配符吞掉。
+        radix_router<bool> prefix_check;
+        if (!norm.empty() && (norm.find('*') != std::string::npos || !prefix_check.insert(norm, true)))
+            throw std::invalid_argument("invalid route prefix: " + prefix);
 
+        struct pending_route {
+            std::string method;
+            std::string path;
+            route_entry entry;
+        };
+        std::vector<pending_route> pending;
         for (const auto& [method, sub_tree] : sub.trees_) {
+            radix_router<bool> validation;
+            if (auto it = trees_.find(method); it != trees_.end()) {
+                for (const auto& pattern : it->second.patterns()) {
+                    if (!validation.insert(pattern, true))
+                        throw std::logic_error("inconsistent parent route metadata");
+                }
+            }
             for (const auto& pattern : sub_tree.patterns()) {
-                const auto* entry = sub_tree.lookup(pattern);
+                const auto* entry = sub_tree.find_exact(pattern);
                 if (!entry)
-                    continue; // 替换场景的旧日志条目, 当前树里已被覆盖
-                // 拼接路径: prefix + 原路径
-                std::string full_path = (norm == "/") ? pattern : norm + pattern;
-                // 合并中间件: 子路由器全局 (外层) + 路由级 (内层)
-                std::vector<middleware_fn> combined;
-                combined.reserve(sub.middlewares_.size() + entry->middlewares.size());
-                for (const auto& mw : sub.middlewares_)
-                    combined.push_back(mw);
-                for (const auto& mw : entry->middlewares)
-                    combined.push_back(mw);
-                add(method, full_path, entry->handler, std::move(combined));
+                    throw std::logic_error("inconsistent child route metadata");
+                std::string full_path = norm + pattern;
+                if (!validation.insert(full_path, true))
+                    throw std::invalid_argument("invalid or conflicting route: " + method + " " + full_path);
+                std::vector<middleware_fn> combined = sub.middlewares_;
+                combined.insert(combined.end(), entry->middlewares.begin(), entry->middlewares.end());
+                pending.push_back({method, std::move(full_path), {entry->handler, std::move(combined)}});
             }
         }
+        for (auto& item : pending)
+            add(item.method, item.path, std::move(item.entry.handler), std::move(item.entry.middlewares));
     }
 
-    /// 冻结路由表: 之后所有注册入口 (use/get/post/add/static_dir) 抛
+    /// 冻结路由表: 之后所有注册入口 (use/get/post/add/include/static_dir) 抛
     /// std::logic_error —— 不用 assert, Release 下同样生效。
     /// 顺序约定: 注册 → freeze() → 设置运行标志/开始 accept;
     /// 注册与冻结只在启动线程顺序进行, 不承诺并发注册安全。

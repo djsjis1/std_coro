@@ -347,6 +347,50 @@ TEST(Router, ParamViewPointsIntoPath) {
     EXPECT_EQ(p[0].second, "abc123");
 }
 
+TEST(Router, ExactPatternLookupDoesNotUseRequestMatching) {
+    router_int r;
+    ASSERT_TRUE(r.insert("/", 1));
+    ASSERT_TRUE(r.insert("/files/*path/", 2));
+    ASSERT_TRUE(r.insert("/files/:id", 3));
+    ASSERT_TRUE(r.insert("/files/static", 4));
+    ASSERT_NE(r.find_exact("/files/*path"), nullptr);
+    EXPECT_EQ(*r.find_exact("/files/*path"), 2);
+    EXPECT_EQ(*r.lookup("/files/*path"), 3);
+    EXPECT_EQ(*r.find_exact("/files/:id/"), 3);
+    EXPECT_EQ(*r.find_exact("/files/static"), 4);
+    EXPECT_EQ(*r.find_exact("/"), 1);
+    for (auto bad : {"", "files/:id", "/files/x", "/files/:other", "/files/*other", "/files", "/files//"})
+        EXPECT_EQ(r.find_exact(bad), nullptr) << bad;
+    router_int moved(std::move(r));
+    EXPECT_EQ(*moved.find_exact("/files/*path"), 2);
+    moved.clear();
+    EXPECT_EQ(moved.find_exact("/files/*path"), nullptr);
+}
+
+TEST(Router, InvalidWildcardNamesDoNotEnterPatternList) {
+    router_int r;
+    for (auto bad : {"/files/*", "/files/*a*b", "/files/:a:b", "/files/*path/more", "/files//"})
+        EXPECT_FALSE(r.insert(bad, 1)) << bad;
+    EXPECT_TRUE(r.patterns().empty());
+}
+
+TEST(Router, PatternsTrackActiveRoutesInFirstRegistrationOrder) {
+    router_int r;
+    ASSERT_TRUE(r.insert("/", 1));
+    ASSERT_TRUE(r.insert("/files/*path", 2));
+    ASSERT_TRUE(r.insert("/users/:id/", 3));
+    ASSERT_TRUE(r.insert("/users/:id", 4));
+    ASSERT_TRUE(r.insert("/files/*path", 5));
+    EXPECT_FALSE(r.insert("/users/:name", 6));
+    EXPECT_FALSE(r.insert("/bad/*path/more", 7));
+    EXPECT_EQ(r.patterns(), (std::vector<std::string>{"/", "/files/*path", "/users/:id"}));
+    EXPECT_EQ(r.patterns().size(), r.size());
+    r.clear();
+    EXPECT_TRUE(r.patterns().empty());
+    ASSERT_TRUE(r.insert("/new", 8));
+    EXPECT_EQ(r.patterns(), (std::vector<std::string>{"/new"}));
+}
+
 // ── 基准: 千级路由下的匹配开销 (只报告数据, 不做易碎断言) ──
 
 TEST(Router, BenchmarkManyRoutes) {

@@ -9,6 +9,7 @@
 
 #include "router.h"
 #include "test_util.h"
+#include "stress_client.h"
 
 #ifdef _WIN32
 #include <coro/net.hpp>
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -44,6 +46,51 @@ namespace {
         req.url = std::move(url);
         req.keep_alive = false;
         return req;
+    }
+
+    struct partial_stream {
+        std::string response;
+        std::string sent;
+        size_t offset = 0;
+        bool fail_write = false;
+        std::chrono::milliseconds read_delay{0};
+
+        coro::Task<int> write(const char* data, size_t size) {
+            if (fail_write && !sent.empty())
+                co_return 0;
+            size_t n = std::min(size, size_t{3});
+            sent.append(data, n);
+            co_return static_cast<int>(n);
+        }
+        coro::Task<int> read(char* data, size_t size) {
+            if (read_delay.count() > 0)
+                co_await coro::sleep(read_delay);
+            size_t n = std::min({size, response.size() - offset, size_t{5}});
+            std::copy_n(response.data() + offset, n, data);
+            offset += n;
+            co_return static_cast<int>(n);
+        }
+    };
+
+    coro::Task<> fake_http_peer(coro::net::TcpListener& listener, std::string response) {
+        auto conn = co_await listener.accept();
+        if (!conn.valid())
+            co_return;
+        char buffer[128];
+        std::string request;
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            int n = co_await conn.read(buffer, sizeof(buffer));
+            if (n <= 0)
+                co_return;
+            request.append(buffer, static_cast<size_t>(n));
+        }
+        size_t sent = 0;
+        while (sent < response.size()) {
+            int n = co_await conn.write(response.data() + sent, response.size() - sent);
+            if (n <= 0)
+                co_return;
+            sent += static_cast<size_t>(n);
+        }
     }
 
     // ---- 中间件/handler: 命名函数协程 (参数进帧, 规避临时闭包生命周期问题) ----
@@ -73,6 +120,10 @@ namespace {
         if (g_order)
             g_order->push_back("handler");
         co_return http_response::text("ok:" + req.param("id"));
+    }
+
+    coro::Task<http_response> wildcard_handler(const http_request& req) {
+        co_return http_response::text("wild:" + req.param("path"));
     }
 
     coro::Task<http_response> mw_double_next(http_request&, router::next_fn next) {
@@ -669,6 +720,227 @@ TEST(WebLayerTest, IncludeMultipleSubRouters) {
     test_util::run_task(scenario);
     EXPECT_EQ(status_a, 200);
     EXPECT_EQ(status_b, 200);
+}
+
+TEST(WebLayerTest, IncludePreservesWildcardAndParameterHandlers) {
+    std::vector<std::string> bodies;
+    test_util::run_task([&]() -> coro::Task<> {
+        router sub;
+        sub.get("/files/*path", wildcard_handler, {mw_mark});
+        sub.get("/files/:id", echo_handler);
+        sub.get("/files/fixed", echo_handler);
+        router parent;
+        parent.include(sub, "/api");
+        const char* paths[] = {"/api/files/a/b", "/api/files/42", "/api/files/fixed"};
+        for (auto path : paths) {
+            auto req = make_req("GET", path);
+            auto resp = co_await parent.route(req);
+            bodies.push_back(resp.body);
+            bodies.push_back(resp.build().find("X-Mark: 1\r\n") != std::string::npos ? "marked" : "plain");
+        }
+    });
+    EXPECT_EQ(bodies, (std::vector<std::string>{"wild:a/b", "marked", "ok:42", "plain", "ok:", "plain"}));
+}
+
+TEST(WebLayerTest, IncludeRejectsSelfWithoutChangingRoutes) {
+    router r;
+    r.get("/a", echo_handler);
+    r.get("/b", echo_handler);
+    EXPECT_THROW(r.include(r, "/api"), std::invalid_argument);
+    int original = 0, added = 0;
+    test_util::run_task([&]() -> coro::Task<> {
+        auto a = make_req("GET", "/a");
+        auto b = make_req("GET", "/api/a");
+        original = (co_await r.route(a)).status;
+        added = (co_await r.route(b)).status;
+    });
+    EXPECT_EQ(original, 200);
+    EXPECT_EQ(added, 404);
+}
+
+TEST(WebLayerTest, RegistrationAndIncludeFailuresAreVisibleAndPreflighted) {
+    router parent, child, empty;
+    parent.get("/api/u/:id", echo_handler);
+    child.get("/added", echo_handler);
+    child.get("/u/:other", echo_handler);
+    EXPECT_THROW(parent.include(child, "/api"), std::invalid_argument);
+    for (const auto* prefix : {"/a//b", "/a?x", "/a#x", "/a/*rest", "/a/:"})
+        EXPECT_THROW(parent.include(empty, prefix), std::invalid_argument) << prefix;
+    for (const auto* path : {"bad", "/a//b", "/a/*", "/a/*rest/more", "/a?x", "/a#x"})
+        EXPECT_THROW(parent.get(path, echo_handler), std::invalid_argument) << path;
+    EXPECT_THROW(parent.get("/api/u/:different", echo_handler), std::invalid_argument);
+    std::vector<int> statuses;
+    test_util::run_task([&]() -> coro::Task<> {
+        for (auto path : {"/api/added", "/api/u/7"}) {
+            auto req = make_req("GET", path);
+            statuses.push_back((co_await parent.route(req)).status);
+        }
+    });
+    EXPECT_EQ(statuses, (std::vector<int>{404, 200}));
+}
+
+TEST(WebLayerTest, IncludeSnapshotsSurviveSourceAndSupportNestedPrefixes) {
+    router parent;
+    {
+        router child, api;
+        child.get("/*path", wildcard_handler);
+        child.post("/", echo_handler);
+        child.get("/fixed", echo_handler);
+        child.get("/fixed/", wildcard_handler);
+        api.include(child, "users/");
+        parent.include(api, "/api/");
+        parent.include(child, "");
+        parent.include(child, "/");
+        child.get("/late", echo_handler);
+    }
+    std::vector<std::string> bodies;
+    test_util::run_task([&]() -> coro::Task<> {
+        const std::pair<const char*, const char*> cases[] = {{"GET", "/api/users/a/b"},
+                                                             {"POST", "/api/users"},
+                                                             {"GET", "/api/users/fixed"},
+                                                             {"GET", "/root/path"},
+                                                             {"GET", "/api/users/late"}};
+        for (const auto& [method, path] : cases) {
+            auto req = make_req(method, path);
+            bodies.push_back((co_await parent.route(req)).body);
+        }
+    });
+    EXPECT_EQ(bodies, (std::vector<std::string>{"wild:a/b", "ok:", "wild:", "wild:root/path", "wild:late"}));
+}
+
+TEST(WebLayerTest, IncludeMiddlewareOrderAndMissBoundary) {
+    std::vector<std::string> order;
+    std::vector<int> statuses;
+    g_order = &order;
+    auto scenario = [&]() -> coro::Task<> {
+        router parent, child;
+        parent.use(mw_log);
+        child.use(mw_auth);
+        child.get("/:id", echo_handler, {mw_log});
+        parent.include(child, "/api");
+        const std::pair<const char*, const char*> cases[] = {
+            {"GET", "/api/7"}, {"GET", "/api/missing/deep"}, {"POST", "/api/7"}};
+        for (const auto& [method, path] : cases) {
+            auto req = make_req(method, path);
+            req.headers["Authorization"] = "Bearer x";
+            statuses.push_back((co_await parent.route(req)).status);
+        }
+    };
+    test_util::run_task(scenario);
+    g_order = nullptr;
+    EXPECT_EQ(statuses, (std::vector<int>{200, 404, 405}));
+    EXPECT_EQ(order, (std::vector<std::string>{"log:in", "auth:in", "log:in", "handler", "log:out", "auth:out",
+                                               "log:out", "log:in", "log:out", "log:in", "log:out"}));
+}
+
+TEST(WebLayerTest, IncludeMatchesDirectRegistrationForDeterministicInputs) {
+    int differences = 0;
+    test_util::run_task([&]() -> coro::Task<> {
+        router sub, direct, included;
+        for (int i = 0; i < 24; ++i) {
+            const auto base = "/r" + std::to_string(i);
+            sub.get(base + "/*path", wildcard_handler, {mw_mark});
+            sub.get(base + "/:id", echo_handler);
+            sub.get(base + "/fixed", wildcard_handler);
+            direct.get("/api" + base + "/*path", wildcard_handler, {mw_mark});
+            direct.get("/api" + base + "/:id", echo_handler);
+            direct.get("/api" + base + "/fixed", wildcard_handler);
+        }
+        included.include(sub, "/api");
+        std::mt19937 random(20260925);
+        const char* suffixes[] = {"/7", "/a/b", "/fixed", "", "/7/"};
+        for (int i = 0; i < 400; ++i) {
+            auto path = "/api/r" + std::to_string(random() % 28) + suffixes[random() % 5];
+            auto a = make_req(i % 7 == 0 ? "POST" : "GET", path);
+            auto b = a;
+            auto ra = co_await direct.route(a);
+            auto rb = co_await included.route(b);
+            if (ra.status != rb.status || ra.body != rb.body || ra.headers != rb.headers || a.params != b.params)
+                ++differences;
+        }
+    });
+    EXPECT_EQ(differences, 0);
+}
+
+TEST(WebLayerTest, StressClientCompletesPartialWritesAndReads) {
+    partial_stream stream;
+    stream.response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const std::string request = "GET / HTTP/1.1\r\nHost: t\r\n\r\n";
+    bool success = false;
+    test_util::run_task(
+        [&]() -> coro::Task<> { success = co_await web_stress::exchange_with_timeout(stream, request, 1s); });
+    EXPECT_TRUE(success);
+    EXPECT_EQ(stream.sent, request);
+    EXPECT_EQ(stream.offset, stream.response.size());
+}
+
+TEST(WebLayerTest, StressClientRejectsWriteFailureMalformedAndTruncatedResponses) {
+    const std::vector<std::string> replies = {"", "not http\r\n\r\n", "HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n",
+                                              "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"};
+    for (const auto& reply : replies) {
+        partial_stream stream;
+        stream.response = reply;
+        bool success = true;
+        test_util::run_task([&]() -> coro::Task<> {
+            success = co_await web_stress::exchange_with_timeout(stream, "GET / HTTP/1.1\r\n\r\n", 1s);
+        });
+        EXPECT_FALSE(success) << reply;
+    }
+    partial_stream stream;
+    stream.fail_write = true;
+    bool success = true;
+    test_util::run_task([&]() -> coro::Task<> {
+        success = co_await web_stress::exchange_with_timeout(stream, "GET / HTTP/1.1\r\n\r\n", 1s);
+    });
+    EXPECT_FALSE(success);
+    EXPECT_EQ(stream.sent.size(), 3u);
+}
+
+TEST(WebLayerTest, StressClientDeadlineAndExitCodeReportFailure) {
+    partial_stream stream;
+    stream.read_delay = 50ms;
+    bool success = true;
+    test_util::run_task([&]() -> coro::Task<> {
+        success = co_await web_stress::exchange_with_timeout(stream, "GET / HTTP/1.1\r\n\r\n", 5ms);
+    });
+    EXPECT_FALSE(success);
+    EXPECT_EQ(web_stress::exit_code(10, 0, 0, 10), 0);
+    EXPECT_EQ(web_stress::exit_code(9, 0, 0, 10), 1);
+    EXPECT_EQ(web_stress::exit_code(10, 1, 0, 10), 1);
+    EXPECT_EQ(web_stress::exit_code(10, 0, 1, 10), 1);
+}
+
+TEST(WebLayerTest, StressClientRejectsEarlyCloseAndBadLocalServerResponses) {
+    for (const auto& reply :
+         std::vector<std::string>{"", "not http\r\n\r\n", "HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n"}) {
+        coro::net::TcpListener listener;
+        unsigned short port = 0;
+        for (auto candidate : kServerPorts) {
+            if (listener.bind_listen("127.0.0.1", candidate)) {
+                port = candidate;
+                break;
+            }
+        }
+        ASSERT_NE(port, 0) << "no test port available";
+        bool success = true;
+        test_util::run_task([&]() -> coro::Task<> {
+            auto peer = coro::spawn(fake_http_peer(listener, reply));
+            std::exception_ptr error;
+            try {
+                auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+                if (!conn.valid())
+                    throw std::runtime_error("local test connect failed");
+                success = co_await web_stress::exchange_with_timeout(conn, "GET / HTTP/1.1\r\n\r\n", 1s);
+            } catch (...) {
+                error = std::current_exception();
+            }
+            listener.close();
+            co_await std::move(peer);
+            if (error)
+                std::rethrow_exception(error);
+        });
+        EXPECT_FALSE(success);
+    }
 }
 
 #endif // _WIN32 || __linux__ + uring

@@ -66,7 +66,7 @@ ctest --test-dir build --output-on-failure
 | # | 领域 | 现状 | 代码/文档锚点 |
 |---|---|---|---|
 | 1 | 网络 | TCP + UDP，当前地址 API 仍以 IPv4 为主；暂无 DNS/IPv6 抽象 | `include/coro/net.hpp`（双平台实现） |
-| 2 | Web 层 | 无中间件、无 chunked 生成、响应体全量缓存 | `docs/web-framework.md` §已知限制（~251-261） |
+| 2 | Web 层 | 已有中间件、include、freeze、stats；无 chunked 生成、响应体全量缓存 | `docs/web-framework.md` §已知限制（~251-261） |
 | 3 | 平台 | Linux 在检测到 io_uring 时启用 process；portable-core 和 macOS 不提供该 IO 模块 | `CMakeLists.txt`；`.github/workflows/ci.yml` |
 | 4 | 性能 | 网络吞吐/延迟、每连接内存无基准 | `docs/performance.md` §3「未覆盖」清单（95-99） |
 
@@ -656,84 +656,22 @@ process 用例通过，Windows 侧无任何行为变化。
 
 ### 2.1 中间件机制
 
-> **目标**：`routes().use(mw)` 链式注册；中间件 = 「接 request、接 next、
-> 返回 response」的高阶协程函数。不引入新抽象层——就是教程第 9 讲练习 3
-> 「包装 handler」模式的官方语法糖。
+已实现，当前方案以 `Web/src/middleware.h` 和 [Web 指南](web-framework.md) 为准。
 
-- [ ] **步骤 1｜`router.h` 增类型与注册**（`class router` 公有段顶部）：
+- [x] 全局 `use()` 与路由级中间件，索引递归驱动洋葱链。
+- [x] move-only `next_fn`，普通 `operator()` 同步保证最多调用一次。
+- [x] 链对象在消费协程内保活；禁止 next 逃逸请求生命周期。
+- [x] `route()` 空全局链快路径，异常在 web_server 兜底；取消型异常不吞并。
+- [x] `include(sub, prefix)` 快照展平，精确模式定位，通配不丢失、自包含拒绝、冲突预检。
+- [x] 启动时注册内建统计路由，再冻结并开始服务。
 
-  ```cpp
-  public:
-      using next_fn       = std::function<coro::Task<http_response>()>;
-      using middleware_fn = std::function<coro::Task<http_response>(http_request&, next_fn)>;
-
-      /// 注册中间件。注册顺序 = 包裹顺序: 先注册者在最外层。
-      /// 中间件在路由匹配之前执行 —— 此时 req.params 尚未填充,
-      /// 鉴权/日志请用 req.path_view() 与 req.header(...) 判断。
-      void use(middleware_fn mw) { middlewares_.push_back(std::move(mw)); }
-
-  private:
-      std::vector<middleware_fn> middlewares_;
-  ```
-
-- [ ] **步骤 2｜拆分 dispatch**：把现有 `route()`（`router.h:68-154`）的
-  **四步分发逻辑原样搬进**新的私有协程 `dispatch_core(http_request&)`
-  （radix 命中 → 405/OPTIONS → 静态目录 → 404），一行不改——
-  这是「行为零变化」的硬要求，搬移用纯剪切粘贴完成。
-
-- [ ] **步骤 3｜链组装 + 异常兜底**：
-
-  ```cpp
-  /// 执行第 idx 层中间件; 到达链尾则做真正的路由分发
-  coro::Task<http_response> run_chain(size_t idx, http_request& req) const {
-      if (idx == middlewares_.size())
-          co_return co_await dispatch_core(req);
-      co_return co_await middlewares_[idx](req, [this, &req, idx]() -> coro::Task<http_response> {
-          return run_chain(idx + 1, req);
-      });
-  }
-
-  coro::Task<http_response> route(http_request& req) const {
-      try {
-          co_return co_await run_chain(0, req);
-      } catch (const std::exception& e) {
-          co_return http_response::error(500, std::string("internal error: ") + e.what());
-      } catch (...) {
-          co_return http_response::error(500, "internal error");
-      }
-  }
-  ```
-
-  **生命周期说明（写进头注释）**：`next_fn` 按引用捕获 `req` 与 `this`，
-  只能在当前中间件协程体内 `co_await next()` 使用，**不许存起来跨协程调用**
-  （`std::function` 复制出去 = 悬垂引用）。
-
-- [ ] **步骤 4｜使用示例**（写进 web-framework.md，测试也照这个写）：
-
-  ```cpp
-  router routes;
-  routes.use([](http_request& req, router::next_fn next) -> coro::Task<http_response> {
-      auto t0 = std::chrono::steady_clock::now();
-      http_response resp = co_await next();                  // 交给下一层
-      log("%s %s -> %d (%ld us)", req.method.c_str(),
-          req.path_view().data(), resp.status, elapsed(t0)); // 外层事后处理
-      co_return resp;
-  });
-  routes.use([](http_request& req, router::next_fn next) -> coro::Task<http_response> {
-      if (req.header("Authorization").empty())
-          co_return http_response::error(401, "unauthorized"); // 短路: 不调 next()
-      co_return co_await next();
-  });
-  ```
-
-- [ ] **步骤 5｜测试**（`tests/test_router.cpp` 增补）：
-  日志顺序（外→内→外，用 vector 记录断言）、鉴权短路 401（handler 未触达，
-  用标志位证明）、异常兜底 500（handler 里 `throw std::runtime_error`）。
-- [ ] **步骤 6｜文档**：web-framework.md 已知限制删「无中间件」，
-  增「中间件」章节（含 params 未填充时机、next 生命周期两条警告）。
+回归集中在 `tests/test_web_layer.cpp`，纯路由数据结构测试位于
+`tests/test_router.cpp`，后者也在 portable-core 模式执行。
 
 ### 2.2 流式响应 + chunked
 
+> **尚未实现**：下面保留历史设计草图，不是可直接调用的当前 API。
+> 实施时需重新核对 body 互斥、生产者生命周期、超时和 HEAD/204/304 规则。
 > **目标**：响应体可以边生产边发送（chunked 编码）；大文件不再全量驻留内存。
 > **本项最大风险**：chunked 与 Content-Length 的互斥语义搞错会**撕裂
 > keep-alive 连接**（客户端无法判断响应边界）——所以步骤 4 的四条语义测试
@@ -746,7 +684,7 @@ process 用例通过，Windows 侧无任何行为变化。
       // ...现有 status/headers/body 不动...
 
       /// 流式生产者: 每次调用产出一块数据; 返回 nullopt 表示流结束。
-      /// 非空 = web_server 走 chunked 编码路径 (此时忽略 body 字段)。
+      /// 非空 = web_server 走 chunked 编码路径; 同时设置 body 必须拒绝。
       std::function<coro::Task<std::optional<std::string>>() > chunk_producer;
 
       /// 异步文件工厂 (旧同步 file() 保留, 文档标记 deprecated):
@@ -758,10 +696,8 @@ process 用例通过，Windows 侧无任何行为变化。
   };
   ```
 
-  `file_async` 第一版实现 = `router.h:142` 静态文件分支的同款代码
-  （`co_await coro::fs::read_all` + mime_type）。真正的逐块磁盘读
-  （`read_at` 偏移接口）需要 fs 模块小扩展，**列为可选第二拍**——
-  第一版 producer 也可以「read_all 后切片」，已能解耦网络发送与磁盘等待。
+  `File::read_at` 已存在。真正流式应复用固定大小缓冲逐块读取，上一块完整
+  写出后再读取下一块；`read_all` 后切片仍持有整个文件，不能宣称低内存流式。
 
 - [ ] **步骤 2｜写回路径分叉**（`web_server.cpp` `handle_connection`，
   `:148` `resp.build()` 处改为）：
@@ -837,26 +773,14 @@ process 用例通过，Windows 侧无任何行为变化。
 
 ### 2.3 可观测性（`/__stats`）
 
-- [ ] **步骤 1｜计数器**（`web_server.h` 私有成员，全部 atomic）：
+- [x] requests 统计完整写出的所有响应，errors 为其中的 4xx/5xx 子集。
+- [x] in_flight/peak 是当前/峰值连接数（含空闲连接），使用原子计数。
+- [x] `GET /__stats` 在 freeze 前注册，经过全局中间件，可通过全局鉴权限制访问。
+- [x] workers 来自各 worker 的 `active_task_count()`，不依赖 `CORO_TASK_REGISTRY`。
+- [x] 真实请求覆盖计数、全局链、短路及停止后归零；TSan 结果仍以对应提交 CI 为准。
 
-  ```cpp
-  struct stats_t {
-      std::atomic<uint64_t> requests{0};   // 累计完成请求数
-      std::atomic<uint64_t> errors{0};     // 4xx/5xx 响应数
-      std::atomic<uint64_t> in_flight{0};  // 当前并发
-      std::atomic<uint64_t> peak{0};       // 峰值并发 (CAS 更新)
-  } stats_;
-  // handle_connection 入口: ++in_flight 后用 compare_exchange 循环抬 peak;
-  // 出口 --in_flight; 响应写出后按 status>=400 ++errors; 其余 ++requests。
-  ```
-
-- [ ] **步骤 2｜端点**：serve 前注册
-  `GET /__stats` → 手拼 JSON（`snprintf` 即可，不引依赖）：
-  requests / errors / in_flight / peak + 每 worker `active_task_count()`
-  （注意：任务注册表需 `CORO_TASK_REGISTRY` 编译期开启，未开启时该字段输出
-  `-1` 并注释说明，别让用户误读）。
-- [ ] **步骤 3｜测试**：打 N 个请求（含若干 404）后 `/__stats` 计数吻合；
-  TSan 下无竞争告警。
+各字段是独立快照；当前统计请求在写出后计数，不在自身快照里。
+自动指标导出、独立管理端口和连接背压仍是后续扩展。
 
 ---
 
@@ -905,7 +829,7 @@ process 用例通过，Windows 侧无任何行为变化。
   改为（默认行为完全不变）：
 
   ```cpp
-  // 同时挂起的异步操作上限; 万级并发挂起 IO 的场景可经编译宏调大
+  // ring 的队列容量, 不是所有在途 I/O 的硬上限; 是否调大应由测量决定
   #ifndef CORO_RING_SIZE
   #define CORO_RING_SIZE 256
   #endif

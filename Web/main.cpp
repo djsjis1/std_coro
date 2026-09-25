@@ -37,6 +37,7 @@
 
 #include "http_types.h"
 #include "web_server.h"
+#include "stress_client.h"
 
 using namespace std::chrono_literals;
 
@@ -327,44 +328,41 @@ coro::Task<int> selftest_client(web_server& server) {
 
 // ---- 高并发压测 ----
 
+static coro::Task<coro::net::TcpStream> stress_connect(unsigned short port) {
+    co_return co_await coro::net::TcpStream::connect("127.0.0.1", port);
+}
+
 // 单个压测客户端: 一条 keep-alive 连接上连续发送 rounds 个请求,
 // 每个请求都等对应响应解析完成后再发下一个 (非 pipelining, 模拟真实浏览器)
 coro::Task<> stress_client(int rounds, std::atomic<long long>& ok, std::atomic<long long>& conn_fail,
                            std::atomic<long long>& io_fail) {
-    auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
+    coro::net::TcpStream conn;
     // 高并发 connect 风暴可能撞上 TCP backlog 上限被拒绝 (正常拥塞控制),
     // 真实客户端会重试 → 压测工具同样重试几次
-    for (int retry = 0; !conn.valid() && retry < 3; ++retry) {
-        co_await coro::sleep(5ms);
-        conn = co_await coro::net::TcpStream::connect("127.0.0.1", g_port);
+    for (int retry = 0; retry < 4 && !conn.valid(); ++retry) {
+        if (retry != 0)
+            co_await coro::sleep(5ms);
+        try {
+            conn = co_await coro::wait_for(stress_connect(g_port), 2s);
+        } catch (const coro::TimeoutError&) {
+        }
     }
     if (!conn.valid()) {
-        ++conn_fail; // 重试后仍失败 (服务器过载等)
+        ++conn_fail;
         co_return;
     }
 
-    http_parse parser(HTTP_RESPONSE);
-    int completed = 0;
-    parser.message_complete = [&]() { ++completed; };
-
-    std::string wire = http_protocol::request("GET", "/greet?name=stress", {{"Host", "127.0.0.1"}});
-    char buf[4096];
+    const std::string wire = http_protocol::request("GET", "/greet?name=stress", {{"Host", "127.0.0.1"}});
     for (int i = 0; i < rounds; ++i) {
-        int target = completed + 1;
-        co_await conn.write(wire.data(), wire.size());
-        while (completed < target) {
-            int n = co_await conn.read(buf, sizeof(buf));
-            if (n <= 0) {
-                ++io_fail; // 连接中断
-                co_return;
-            }
-            parser.feed(buf, (size_t)n);
+        if (!co_await web_stress::exchange_with_timeout(conn, wire, 2s)) {
+            ++io_fail;
+            co_return;
         }
         ++ok;
     }
 }
 
-coro::Task<> stress_main(web_server& server, int clients, int rounds) {
+coro::Task<int> stress_main(web_server& server, int clients, int rounds) {
     std::cout << "[stress] clients=" << clients << " rounds=" << rounds << " workers=" << server.worker_count()
               << std::endl;
     co_await coro::sleep(50ms); // 等 accept 循环就绪
@@ -376,16 +374,50 @@ coro::Task<> stress_main(web_server& server, int clients, int rounds) {
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < clients; ++i)
         tasks.push_back(coro::spawn(stress_client(rounds, ok, conn_fail, io_fail)));
-    for (auto& t : tasks)
-        co_await std::move(t);
+    for (auto& t : tasks) {
+        try {
+            co_await std::move(t);
+        } catch (const coro::CancelledError&) {
+            throw;
+        } catch (...) {
+            ++io_fail;
+        }
+    }
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
-    long long expected = (long long)clients * rounds;
-    std::cout << "[stress] completed=" << ok << "/" << expected << " elapsed=" << ms << "ms ("
-              << (ms ? expected * 1000 / ms : 0) << " req/s)" << std::endl;
+    const long long expected = static_cast<long long>(clients) * rounds;
+    const long long succeeded = ok.load();
+    const int result = web_stress::exit_code(succeeded, conn_fail.load(), io_fail.load(), expected);
+    std::cout << "[stress] completed=" << succeeded << "/" << expected << " elapsed=" << ms << "ms ("
+              << (ms ? static_cast<double>(succeeded) * 1000 / ms : 0) << " req/s)" << std::endl;
     std::cout << "[stress] conn_fail=" << conn_fail << " io_fail=" << io_fail << std::endl;
-    std::cout << "[stress] " << (ok == expected ? "ALL OK" : "MISSING RESPONSES") << std::endl;
-    server.stop(); // 优雅停止
+    std::cout << "[stress] " << (result == 0 ? "ALL OK" : "FAILED") << std::endl;
+    co_return result;
+}
+
+static coro::Task<int> run_stress(web_server& server, int clients, int rounds) {
+    auto srv = coro::spawn(server.serve());
+    int result = 1;
+    try {
+        result = co_await stress_main(server, clients, rounds);
+    } catch (const std::exception& error) {
+        std::cerr << "[stress] failed: " << error.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[stress] failed: unknown exception" << std::endl;
+    }
+    server.stop();
+    try {
+        co_await std::move(srv);
+    } catch (...) {
+        result = 1;
+    }
+    server.wait_all();
+    co_return result;
+}
+
+static bool parse_positive(std::string_view text, int& value) {
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    return error == std::errc{} && end == text.data() + text.size() && value > 0;
 }
 
 // ---- 入口 ----
@@ -412,6 +444,13 @@ int main(int argc, char** argv) {
         g_port = requested_port;
     }
 
+    int clients = 200, rounds = 50;
+    if (stress && (argc > 4 || (argc > 2 && !parse_positive(argv[2], clients)) ||
+                   (argc > 3 && !parse_positive(argv[3], rounds)))) {
+        std::cerr << "usage: web_server --stress [positive clients] [positive rounds]" << std::endl;
+        return 2;
+    }
+
     web_server server;
     register_routes(server);
     if (!server.listen("127.0.0.1", g_port))
@@ -430,20 +469,8 @@ int main(int argc, char** argv) {
     }
 
     if (stress) {
-        int clients = argc > 2 ? std::atoi(argv[2]) : 200;
-        int rounds = argc > 3 ? std::atoi(argv[3]) : 50;
-        if (clients <= 0 || rounds <= 0) {
-            std::cerr << "usage: web_server --stress [clients] [rounds]" << std::endl;
-            return 1;
-        }
         server.set_verbose(false); // 压测: 关闭访问日志, 减少输出开销
-        coro::run([](web_server& s, int c, int r) -> coro::Task<> {
-            auto srv = coro::spawn(s.serve());
-            co_await stress_main(s, c, r);
-            co_await std::move(srv);
-            s.wait_all();
-        }(server, clients, rounds));
-        return 0;
+        return coro::run(run_stress(server, clients, rounds));
     }
 
     // 常驻模式: Ctrl+C (SIGINT) / Ctrl+Break (SIGBREAK) 优雅关停 ——

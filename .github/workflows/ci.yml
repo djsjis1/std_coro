@@ -130,6 +130,16 @@ jobs:
           cmake --build build/package-smoke
           ./build/package-smoke/coro_package_smoke
 
+      - name: Verify standalone Web build
+        timeout-minutes: 5
+        run: |
+          cmake -S Web -B build-web \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCORO_REQUIRE_URING=ON
+          cmake --build build-web --target web_server
+          ./build-web/web_server --selftest 18083
+          ./build-web/web_server --stress 2 3
+
       - name: Verify portable core without io_uring
         if: matrix.label == 'GCC 13' && matrix.build_type == 'Debug'
         run: |
@@ -219,6 +229,16 @@ jobs:
           cmake -S tests/package_smoke -B build/package-smoke -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-root"
           cmake --build build/package-smoke --config ${{ matrix.build_type }}
           & "build\package-smoke\${{ matrix.build_type }}\coro_package_smoke.exe"
+
+      - name: Verify standalone Web build
+        timeout-minutes: 5
+        run: |
+          cmake -S Web -B build-web
+          cmake --build build-web --config ${{ matrix.build_type }} --target web_server
+          & "build-web\${{ matrix.build_type }}\web_server.exe" --selftest 18083
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "build-web\${{ matrix.build_type }}\web_server.exe" --stress 2 3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'

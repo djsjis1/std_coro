@@ -124,8 +124,10 @@ template <typename Value> class radix_router {
     /// 参数名为空 / 段中间出现 ':' 或 '*' / 与已注册路由的参数名冲突),
     /// 且不会改动树。
     bool insert(std::string_view pattern, Value value) {
-        if (pattern.empty() || pattern.front() != '/')
-            return false; // 非法: 必须以 '/' 开头
+        if (pattern.empty() || pattern.front() != '/' || pattern.find("//") != std::string_view::npos)
+            return false; // 非法: 必须以 '/' 开头且不能有空路径段
+        if (pattern.size() > 1 && pattern.back() == '/')
+            pattern.remove_suffix(1);
 
         // ---- 第 1 遍: 纯校验 (含与现有树的冲突检测) ----
         if (!validate(pattern))
@@ -143,10 +145,8 @@ template <typename Value> class radix_router {
                     cur->wild = new_node();
                     cur->wild->name = seg.substr(1); // '*' 之后是参数名
                 }
-                if (!cur->wild->value)
-                    ++count_;
-                cur->wild->value = std::move(value);
-                return true;
+                cur = cur->wild;
+                break;
             }
             if (seg.front() == ':') {
                 if (!cur->param) {
@@ -161,10 +161,18 @@ template <typename Value> class radix_router {
                 break;
             rest = remaining;
         }
-        if (!cur->value)
+        const bool is_new = !cur->value;
+        if (is_new)
+            log_.emplace_back(pattern);
+        try {
+            cur->value = std::move(value); // 模式终点, 存放 handler
+        } catch (...) {
+            if (is_new)
+                log_.pop_back();
+            throw;
+        }
+        if (is_new)
             ++count_;
-        cur->value = std::move(value); // 模式终点, 存放 handler
-        log_.emplace_back(pattern);
         return true;
     }
 
@@ -187,11 +195,44 @@ template <typename Value> class radix_router {
         return nullptr;
     }
 
+    /// 精确定位注册模式, 不把 :param/*wild 当作请求内容执行 DFS 匹配。
+    const Value* find_exact(std::string_view pattern) const {
+        if (pattern.empty() || pattern.front() != '/' || pattern.find("//") != std::string_view::npos)
+            return nullptr;
+        if (pattern.size() > 1 && pattern.back() == '/')
+            pattern.remove_suffix(1);
+        if (!validate_syntax(pattern))
+            return nullptr;
+        const node* cur = &root_;
+        while (true) {
+            auto [seg, remaining] = next_segment(pattern);
+            if (seg.empty())
+                break;
+            if (seg.front() == ':') {
+                cur = cur->param;
+                if (!cur || cur->name != seg.substr(1))
+                    return nullptr;
+            } else if (seg.front() == '*') {
+                cur = cur->wild;
+                if (!cur || cur->name != seg.substr(1))
+                    return nullptr;
+            } else {
+                cur = find_child(cur->statics, seg);
+                if (!cur)
+                    return nullptr;
+            }
+            if (remaining.empty())
+                break;
+            pattern = remaining;
+        }
+        return cur->value ? &*cur->value : nullptr;
+    }
+
     size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0; }
 
-    /// 注册顺序日志: 按 insert 成功顺序记录原始模式字符串。
-    /// 用于 router::include() 按序回放子路由器的路由。
+    /// 按首次注册顺序记录有效模式, 去除尾斜杠; 替换不追加重复条目。
+    /// 用于注册期枚举, 不代表跨 HTTP 方法的全局顺序。
     const std::vector<std::string>& patterns() const noexcept { return log_; }
 
     /// 清空全部路由 (热重载场景: 清空重建)。
@@ -299,16 +340,16 @@ template <typename Value> class radix_router {
                 return true;      // 根路径或尾斜杠: 合法收尾
             }
             if (seg.front() == '*') {
-                if (!remaining.empty())
-                    return false; // 通配符必须是最后一段
+                if (!remaining.empty() || seg.size() == 1 || segment_has_misplaced_special(seg.substr(1)))
+                    return false; // 通配符必须是最后一段且具有合法名称
                 // 通配名必须与已有的一致 (防同位置异名歧义)
                 if (cur->wild && std::string_view(cur->wild->name) != seg.substr(1))
                     return false;
                 return true;
             }
             if (seg.front() == ':') {
-                if (seg.size() == 1)
-                    return false; // 空参数名 (":")
+                if (seg.size() == 1 || segment_has_misplaced_special(seg.substr(1)))
+                    return false; // 参数名不能为空或包含另一个特殊标记
                 if (cur->param) {
                     // 与已注册路由的参数名冲突: httprouter 在此 panic,
                     // 这里拒绝注册 —— 否则旧路由的参数名会被静默改写
@@ -344,10 +385,10 @@ template <typename Value> class radix_router {
                 return true;      // 尾斜杠收尾
             }
             if (seg.front() == '*')
-                return remaining.empty(); // 通配符必须是最后一段
+                return remaining.empty() && seg.size() > 1 && !segment_has_misplaced_special(seg.substr(1));
             if (seg.front() == ':') {
-                if (seg.size() == 1)
-                    return false; // 空参数名
+                if (seg.size() == 1 || segment_has_misplaced_special(seg.substr(1)))
+                    return false; // 参数名不能为空或包含另一个特殊标记
             } else if (segment_has_misplaced_special(seg)) {
                 return false; // 段中间出现 ':'/'*': 非法
             }

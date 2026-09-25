@@ -78,7 +78,8 @@ cmake --build build --config Release --target coro_stress
    （vector + 头索引 + 成员 batch 容量复用）。MSVC deque 对 8 字节的
    `coroutine_handle` 每个 16 字节块只装 2 个 —— 旧实现每 2 次 push
    一次堆分配; 现在 batch 与 ready_queue_ 经 swap 往复保留容量,
-   **稳态调度零堆分配**。影响所有场景, yield 风暴 / 高频 spawn 收益最大。
+   减少了队列容器自身的分配。当前调度仍有存活表/去重集合操作和锁，
+   不能据此宣称整个稳态调度路径零堆分配；实际收益需重新测量。
 2. **Web 层减少请求热路径的临时分配**：
    - 请求头 `std::map` 深拷贝 → 整表 `std::move`（llhttp 在下一条
      message_begin 会清空容器, move 安全）;
@@ -102,6 +103,16 @@ cmake --build build --config Release --target coro_stress
 - 真实协议的每连接内存（协程帧 + 缓冲区 + socket 内核缓冲）。
 
 ---
+
+### 当前 Web 性能测量边界
+
+`web_server --stress` 检查完整收发和 200 状态，按实际成功数报告吞吐；
+失败退出 1，参数错误退出 2。`--stress 2 3` 是正确性 smoke，不是性能基准。
+尚未建立固定环境下的 Web P50/P95/P99、每连接内存和中间件层数基线。
+
+include 在启动期展平子路由，避免逐层 router 分发；它仍复制注册元数据，
+各层中间件仍有调用及协程帧成本。优化前应分别测启动导入与请求热路径。
+当前 io_uring ring 容量默认 256，不能解释为所有在途 I/O 的硬上限。
 
 ## 4. 常见性能反模式与解法
 
@@ -143,8 +154,8 @@ coro::Task<> good() {
 
 `co_await` 挂起点存活的局部变量都住在**协程帧**（堆）里。
 1MB 的 `char buf[1MB]` 会让每个连接协程占 1MB 堆——
-万级连接直接 OOM。大缓冲用堆容器（vector/string 成员或
-`unique_ptr<char[]>`），帧里只留指针：
+万级连接可能耗尽内存。将大缓冲移到堆容器仅减小协程帧本身，
+不会减少每连接的总内存；应结合按需分配、固定块流式与背压。示例仅演示帧里留指针：
 
 ```cpp
 coro::Task<> handle(coro::net::TcpStream conn)
@@ -189,7 +200,7 @@ coro::Semaphore sem(64);                       // 最多 64 并发
 ### 5.3 观测手段
 
 ```cpp
-// 编译时定义 CORO_TASK_REGISTRY 启用任务注册表
+// active_task_count 始终可用; CORO_TASK_REGISTRY 仅控制帧地址注册表
 coro::EventLoop::get().active_task_count();    // 当前活跃协程数
 coro::EventLoop::current_task();               // 当前协程句柄 (调试器里看)
 ```
@@ -220,9 +231,9 @@ coro::EventLoop::current_task();               // 当前协程句柄 (调试器�
       → 就绪队列 → h.resume() → 从挂起点继续
 ```
 
-单线程内挂起/恢复**没有任何原子操作与系统调用**（同线程
-`schedule` 不 wake），本次压力测试中 yield 平均约 202ns（包含计数开销）。跨线程唤醒才
-涉及 atomic exchange + 一次 PostQueuedCompletionStatus/NOP SQE。
+同线程 `schedule` 通常不发送外部唤醒，但仍进行互斥、存活表和去重集合检查；
+协程生命周期也有原子计数。历史 yield 数据不能证明“无原子操作”或“整个路径无分配”。
+跨线程且循环睡眠时才请求唤醒：Windows 使用完成包，Linux 使用 eventfd。
 
 与线程对比：线程切换 ~1-10µs + 缓存污染；协程切换 ~tens of ns +
 无栈帧（协程帧只在挂起点存活的部分进堆）。这就是"协程可以开
