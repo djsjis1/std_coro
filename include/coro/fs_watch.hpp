@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <deque>
 #include <filesystem>
 #include <string>
@@ -99,8 +100,7 @@ namespace coro {
                 if (valid()) {
                     auto* iocp = EventLoop::get().iocp();
                     if (!iocp || !iocp->associate(dir_)) {
-                        io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
-                        close();
+                        fail(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
                     }
                 }
             }
@@ -109,7 +109,7 @@ namespace coro {
 
             DirectoryWatcher(DirectoryWatcher&& other) noexcept
                 : dir_(std::exchange(other.dir_, INVALID_HANDLE_VALUE)), recursive_(other.recursive_),
-                  pending_(std::move(other.pending_)) {}
+                  pending_(std::move(other.pending_)), terminal_error_(std::exchange(other.terminal_error_, 0)) {}
 
             DirectoryWatcher& operator=(DirectoryWatcher&& other) noexcept {
                 if (this != &other) {
@@ -117,6 +117,7 @@ namespace coro {
                     dir_ = std::exchange(other.dir_, INVALID_HANDLE_VALUE);
                     recursive_ = other.recursive_;
                     pending_ = std::move(other.pending_);
+                    terminal_error_ = std::exchange(other.terminal_error_, 0);
                 }
                 return *this;
             }
@@ -125,11 +126,13 @@ namespace coro {
             DirectoryWatcher& operator=(const DirectoryWatcher&) = delete;
 
             bool valid() const { return dir_ != INVALID_HANDLE_VALUE; }
+            int error() const noexcept { return terminal_error_; }
 
             /// 提交一次 ReadDirectoryChangesW 并挂起 (完成驱动)
             struct changes_awaiter {
                 DirectoryWatcher* w;
-                char buf[4096]; // 内核写入的事件缓冲 (awaiter 在协程帧里, 帧活着则缓冲活着)
+                alignas(FILE_NOTIFY_INFORMATION) char buf
+                    [4096]; // 内核写入的事件缓冲 (awaiter 在协程帧里, 帧活着则缓冲活着)
                 detail::iocp_op op;
 
                 bool await_ready() const noexcept { return false; }
@@ -173,20 +176,17 @@ namespace coro {
 
             /// 取下一个事件: pending 有则直接弹, 否则提交一次目录读并解析
             Task<watch_event> next() {
-                if (!pending_.empty())
-                    co_return pop_pending();
-                if (!valid()) {
-                    io::set_error((int)ERROR_INVALID_HANDLE);
-                    co_return watch_event{}; // 无效 watcher: 空事件
+                while (true) {
+                    if (!pending_.empty())
+                        co_return pop_pending();
+                    if (!valid()) {
+                        io::set_error(terminal_error_ ? terminal_error_ : (int)ERROR_INVALID_HANDLE);
+                        co_return watch_event{};
+                    }
+                    changes_awaiter aw{this, {}, {}};
+                    co_await aw;
+                    // 无事件时复用当前协程帧；终止错误已关闭 watcher。
                 }
-                changes_awaiter aw{this, {}, {}};
-                co_await aw;
-                // 解析结果在 pending_ 里 (可能为空, 如溢出恢复后)
-                if (pending_.empty()) {
-                    // 一次读没产生事件 (理论上少见): 递归再读
-                    co_return co_await next();
-                }
-                co_return pop_pending();
             }
 
             /// 停止监视并关闭句柄 (有挂起的 next() 时不可调用)
@@ -201,6 +201,14 @@ namespace coro {
             HANDLE dir_ = INVALID_HANDLE_VALUE;
             bool recursive_ = true;
             std::deque<watch_event> pending_;
+            int terminal_error_ = 0;
+
+            void fail(int error) {
+                terminal_error_ = error;
+                pending_.clear();
+                close();
+                io::set_error(error);
+            }
 
             watch_event pop_pending() {
                 watch_event ev = std::move(pending_.front());
@@ -210,19 +218,30 @@ namespace coro {
 
             /// 解析 FILE_NOTIFY_INFORMATION 记录链 (一次完成可含多条)
             void parse_records(const char* buf, int error, DWORD bytes) {
-                if (error == ERROR_NOTIFY_ENUM_DIR) {
+                if (error == ERROR_NOTIFY_ENUM_DIR || (!error && bytes == 0)) {
                     // 缓冲溢出: 内核丢了部分事件
                     pending_.push_back(watch_event{watch_event_type::overflow, "", "", false});
                     return;
                 }
-                if (error || bytes == 0) {
-                    io::set_error(error ? error : (int)ERROR_INVALID_FUNCTION);
+                if (error || bytes > 4096) {
+                    fail(error ? error : (int)ERROR_INVALID_DATA);
                     return;
                 }
                 std::string rename_old; // 配对 RENAMED_OLD/NEW (同一批次内)
                 const char* p = buf;
+                const char* end = buf + bytes;
+                constexpr size_t header_size = offsetof(FILE_NOTIFY_INFORMATION, FileName);
                 while (true) {
+                    if (static_cast<size_t>(end - p) < header_size) {
+                        fail(ERROR_INVALID_DATA);
+                        return;
+                    }
                     auto* ni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(p);
+                    if (ni->FileNameLength % sizeof(WCHAR) != 0 ||
+                        ni->FileNameLength > static_cast<size_t>(end - p) - header_size) {
+                        fail(ERROR_INVALID_DATA);
+                        return;
+                    }
                     std::string name = detail_watch::wide_to_utf8(ni->FileName, ni->FileNameLength / sizeof(WCHAR));
                     std::replace(name.begin(), name.end(), '\\', '/');
                     watch_event ev;
@@ -259,6 +278,12 @@ namespace coro {
 
                     if (ni->NextEntryOffset == 0)
                         break;
+                    if (ni->NextEntryOffset < header_size + ni->FileNameLength ||
+                        ni->NextEntryOffset >= static_cast<size_t>(end - p) ||
+                        ni->NextEntryOffset % alignof(FILE_NOTIFY_INFORMATION) != 0) {
+                        fail(ERROR_INVALID_DATA);
+                        return;
+                    }
                     p += ni->NextEntryOffset;
                 }
                 // 批次结束仍有未配对的旧名 → 按删除上报

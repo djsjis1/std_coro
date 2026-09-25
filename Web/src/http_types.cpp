@@ -25,13 +25,6 @@ namespace {
         return true;
     }
 
-    // 检查 headers 列表中是否已存在某个头部(大小写不敏感).
-    // 用于 build() 时判断是否需要自动补 Content-Length,
-    // 避免重复添加.
-    bool has_header(const http_response::header_list& headers, const std::string& name) {
-        return std::any_of(headers.begin(), headers.end(), [&](const auto& h) { return iequals(h.first, name); });
-    }
-
     // 按文件扩展名推断 MIME 类型 (Content-Type 的值).
     // 比如 "hello.html" → "text/html; charset=utf-8"
     // 不认识的扩展名统一返回 "application/octet-stream" (二进制流),
@@ -182,12 +175,13 @@ std::string http_response::build() const {
     http_protocol p;
     p.status_line(status); // 如 "HTTP/1.1 200 OK\r\n"
     for (const auto& h : headers) {
+        // 完整响应由实际 body 定界；过滤所有大小写变体及重复值。
+        // 此路径不编码 chunked，不能同时保留调用方的 Transfer-Encoding。
+        if (iequals(h.first, "Content-Length") || iequals(h.first, "Transfer-Encoding"))
+            continue;
         p.header(h.first, h.second); // 每个头部: "Name: Value\r\n"
     }
-    // 如果用户没手动设置 Content-Length, 自动补上
-    if (!has_header(headers, "Content-Length")) {
-        p.header("Content-Length", std::to_string(body.size()));
-    }
+    p.header("Content-Length", std::to_string(body.size()));
     p.body(body);     // 先输出 "\r\n"(头部与主体的分隔线), 再输出 body
     return p.build(); // 拼接成完整报文
 }

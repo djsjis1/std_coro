@@ -12,6 +12,11 @@
 #include <string>
 #include <vector>
 
+#ifdef CORO_URING_ENABLED
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 using namespace std::chrono_literals;
 
 namespace {
@@ -265,4 +270,79 @@ TEST(NetAdvancedTest, RapidConnectDisconnect) {
     test_util::run_task([&] { return rapid_connect_loop(20, &success); });
     EXPECT_GE(success, 15); // 至少 15 次成功 (允许少量端口冲突)
 }
+#ifdef CORO_URING_ENABLED
+namespace {
+    struct submit_fault_awaiter {
+        coro::net::UringEventSource* source;
+        int fd;
+        bool* sanitized;
+        coro::detail::uring_op op;
+        char byte = 'X';
+
+        ~submit_fault_awaiter() { source->untrack_op(&op); }
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {
+            op.continuation = h;
+            auto* ring = source->handle();
+            auto* sqe = io_uring_get_sqe(ring);
+            if (!sqe) {
+                op.result = -ENOBUFS;
+                coro::EventLoop::get().schedule(h);
+                return;
+            }
+            source->track_op(&op);
+            if (fd >= 0) {
+                io_uring_prep_write(sqe, fd, &byte, 1, -1);
+                // 保留真实 SQ 映射，仅让 enter 失败：liburing 仍会发布 SQ tail。
+                const int ring_fd = std::exchange(ring->ring_fd, -1);
+                const int enter_fd = std::exchange(ring->enter_ring_fd, -1);
+                coro::detail::uring_submit(source, sqe, &op);
+                ring->ring_fd = ring_fd;
+                ring->enter_ring_fd = enter_fd;
+                *sanitized = sqe->opcode == IORING_OP_NOP && sqe->user_data == 0 && sqe->addr == 0;
+            } else {
+                io_uring_prep_nop(sqe);
+                coro::detail::uring_submit(source, sqe, &op);
+            }
+        }
+        int await_resume() const { return op.result; }
+    };
+
+    coro::Task<int> submit_with_fault(coro::net::UringEventSource* source, int fd, bool* sanitized) {
+        submit_fault_awaiter aw{source, fd, sanitized, {}};
+        co_return co_await aw;
+    }
+} // namespace
+
+TEST(UringFailureTest, FailedSubmitCannotUseFreedBufferOnLaterSubmit) {
+    auto& loop = coro::EventLoop::get();
+    auto* source = loop.uring();
+    if (!source)
+        GTEST_SKIP() << "当前内核不支持 io_uring";
+    int fds[2];
+    ASSERT_EQ(::pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+    bool sanitized = false;
+    // 连续失败次数超过 ring 深度，仍须回收尾槽并允许下一次正常提交。
+    for (int round = 0; round < 512; ++round) {
+        auto failed = submit_with_fault(source, fds[1], &sanitized);
+        failed.start();
+        loop.run();
+        EXPECT_EQ(failed.take_result(), -EBADF);
+        EXPECT_TRUE(sanitized);
+        EXPECT_FALSE(source->has_pending());
+        EXPECT_EQ(io_uring_sq_ready(source->handle()), 0u);
+    }
+    // 上面的帧已经销毁；后续 submit 会刷新此前遗留的 SQE。
+    auto success = submit_with_fault(source, -1, &sanitized);
+    success.start();
+    loop.run();
+    EXPECT_EQ(success.take_result(), 0);
+    EXPECT_FALSE(source->has_pending());
+    char byte = 0;
+    EXPECT_EQ(::read(fds[0], &byte, 1), -1);
+    EXPECT_EQ(errno, EAGAIN);
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+#endif
 #endif // _WIN32 || __linux__

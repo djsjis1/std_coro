@@ -120,7 +120,85 @@ namespace {
         worker.join();
     }
 
+    coro::Task<int> schedule_during_resume(std::atomic<bool>* entered, std::atomic<bool>* posted) {
+        entered->store(true);
+        while (!posted->load())
+            std::this_thread::yield();
+        co_return 42;
+    }
+
+    coro::Task<> schedule_during_resume_void(std::atomic<bool>* entered, std::atomic<bool>* posted, int* runs) {
+        entered->store(true);
+        while (!posted->load())
+            std::this_thread::yield();
+        ++*runs;
+        co_return;
+    }
+
 } // namespace
+
+TEST(StressRaceTest, ScheduleDuringResumeDoesNotLeaveFreedFrame) {
+    auto& loop = coro::EventLoop::get();
+    for (int round = 0; round < 100; ++round) {
+        std::atomic<bool> entered{false}, posted{false};
+        auto task = schedule_during_resume(&entered, &posted);
+        auto h = task.handle();
+        task.start();
+        std::jthread producer([&] {
+            while (!entered.load())
+                std::this_thread::yield();
+            loop.schedule(h);
+            posted.store(true);
+        });
+        loop.run();
+        producer.join();
+        EXPECT_EQ(task.take_result(), 42);
+        EXPECT_EQ(loop.active_task_count(), 0u);
+    }
+}
+
+TEST(StressRaceTest, DetachedVoidFrameRejectsLateSchedule) {
+    auto& loop = coro::EventLoop::get();
+    std::atomic<bool> entered{false}, posted{false};
+    int runs = 0;
+    auto task = schedule_during_resume_void(&entered, &posted, &runs);
+    auto h = task.handle();
+    task.start();
+    task.detach();
+    std::jthread producer([&] {
+        while (!entered.load())
+            std::this_thread::yield();
+        loop.schedule(h);
+        posted.store(true);
+    });
+    loop.run();
+    producer.join();
+    loop.schedule(h); // 不解引用已完成的句柄
+    loop.run();
+    EXPECT_EQ(runs, 1);
+    EXPECT_EQ(loop.active_task_count(), 0u);
+}
+
+TEST(StressRaceTest, QueuedEntriesAreBoundToRegistrationGeneration) {
+    auto& loop = coro::EventLoop::get();
+    int runs = 0;
+    auto work = [&]() -> coro::Task<> {
+        co_await coro::sleep(10ms);
+        ++runs;
+    };
+    auto task = work();
+    task.start();
+    // 同一地址的新注册模拟帧地址复用，旧就绪项不能恢复新代次。
+    loop.on_coroutine_finished(task.handle());
+    loop.on_coroutine_started(task.handle());
+    loop.schedule(task.handle());
+    const auto before = std::chrono::steady_clock::now();
+    loop.run();
+    EXPECT_GE(std::chrono::steady_clock::now() - before, 10ms);
+    EXPECT_EQ(runs, 1);
+    EXPECT_EQ(loop.active_task_count(), 0u);
+    task.take_result();
+}
 
 // ── 多线程同时 wake 同一个 EventLoop ──
 TEST(StressRaceTest, MultiThreadWakeSameLoop) {

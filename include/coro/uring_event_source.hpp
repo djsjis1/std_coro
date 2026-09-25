@@ -86,7 +86,8 @@ namespace coro {
             ~UringEventSource() override {
                 if (wake_fd_ >= 0)
                     close(wake_fd_);
-                io_uring_queue_exit(&ring_);
+                if (valid_)
+                    io_uring_queue_exit(&ring_);
             }
 
             /// 底层 ring 是否有效 (初始化失败时返回 false)
@@ -94,6 +95,33 @@ namespace coro {
 
             /// 获取底层 ring (网络层提交 SQE 用)
             io_uring* handle() { return &ring_; }
+
+            /// 将尚未被内核消费的 SQE 替换为无指针的 NOP。
+            /// 本事件源不启用 SQPOLL：submit 返回后、下一次 enter 前，
+            /// 内核不会继续消费 SQ；已消费项必须保留缓冲并等待 CQE。
+            bool discard_pending(io_uring_sqe* sqe) {
+                auto& sq = ring_.sq;
+                const auto index = static_cast<unsigned>(sqe - sq.sqes);
+                const unsigned head = io_uring_smp_load_acquire(sq.khead);
+                const unsigned tail = *sq.ktail;
+                for (unsigned pos = head; pos != tail; ++pos) {
+                    if (sq.array[pos & *sq.kring_mask] == index) {
+                        *sqe = {};
+                        io_uring_prep_nop(sqe);
+                        io_uring_sqe_set_data(sqe, nullptr);
+                        // 普通 awaiter 提交的总是队尾 SQE。回收已发布但未消费
+                        // 的尾槽，避免持续失败耗尽 SQ、后续操作无法重试。
+                        // 中间项不能移动（会改变其他请求的顺序），保留安全 NOP。
+                        if (pos + 1 == tail && sq.sqe_head == sq.sqe_tail) {
+                            io_uring_smp_store_release(sq.ktail, tail - 1);
+                            --sq.sqe_head;
+                            --sq.sqe_tail;
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }
 
             /// 标记一个异步操作开始 (提交 SQE 后调用)
             void op_start() { ++pending_ops_; }
@@ -187,7 +215,7 @@ namespace coro {
                 }
             }
 
-            io_uring ring_;
+            io_uring ring_{};
             bool valid_ = false;              // io_uring 初始化是否成功
             int wake_fd_ = -1;                // eventfd 用于跨线程唤醒
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数

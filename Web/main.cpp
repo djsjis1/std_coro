@@ -283,8 +283,35 @@ static coro::Task<> route_tests(int* pass, int* fail) {
     }
 }
 
+// 用真实 HTTP 解析器连续读取完整响应，验证错误长度不会污染下一帧。
+static bool response_framing_test() {
+    auto first = http_response::text(std::string("a\0b", 3));
+    first.header("content-length", "1");
+    first.header("CONTENT-LENGTH", "999");
+    first.header("Transfer-Encoding", "chunked");
+    first.header("Set-Cookie", "a=1");
+    first.header("Set-Cookie", "b=2");
+    auto second = http_response::text("");
+    second.header("Content-Length", "8");
+    auto third = http_response::text("last");
+    third.header("Content-Length", "invalid");
+    const auto original_headers = first.headers;
+    const std::string wire = first.build() + second.build() + third.build();
+    http_parse parser(HTTP_RESPONSE);
+    std::vector<std::string> bodies;
+    parser.message_complete = [&] { bodies.push_back(parser.http_body); };
+    if (!parser.feed(wire.data(), wire.size()))
+        return false;
+    return bodies == std::vector<std::string>{std::string("a\0b", 3), "", "last"} &&
+           first.headers == original_headers && wire.find("Set-Cookie: a=1\r\n") != std::string::npos &&
+           wire.find("Set-Cookie: b=2\r\n") != std::string::npos;
+}
+
 coro::Task<int> selftest_client(web_server& server) {
     int pass = 0, fail = 0;
+    const bool framing_ok = response_framing_test();
+    std::cout << "[selftest] " << (framing_ok ? "PASS" : "FAIL") << ": response framing" << std::endl;
+    framing_ok ? ++pass : ++fail;
     try {
         co_await coro::sleep(50ms); // 等 accept 循环就绪
         co_await coro::wait_for(pipeline_test(g_port, &pass, &fail), 2s);

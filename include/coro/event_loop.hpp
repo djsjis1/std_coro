@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 // ============================================================================
@@ -197,21 +199,20 @@ namespace coro {
         // 性能: 注册表在热路径上每协程生命周期多花 2 次锁 + 2 次 hash
         // 操作, 默认编译关闭; 需要调试/监控时定义 CORO_TASK_REGISTRY。
         void on_coroutine_started(std::coroutine_handle<> h) {
+            std::lock_guard lock(queue_mutex_);
+            live_frames_.emplace(h.address(), ++next_generation_);
             ++active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
-            std::lock_guard lock(queue_mutex_);
             all_tasks_.insert(h.address());
-#else
-            (void)h;
 #endif
         }
         void on_coroutine_finished(std::coroutine_handle<> h) {
+            std::lock_guard lock(queue_mutex_);
+            live_frames_.erase(h.address());
+            scheduled_set_.erase(h.address());
             --active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
-            std::lock_guard lock(queue_mutex_);
             all_tasks_.erase(h.address());
-#else
-            (void)h;
 #endif
         }
 
@@ -223,7 +224,6 @@ namespace coro {
             auto it = scheduled_set_.find(h.address());
             if (it == scheduled_set_.end())
                 return false; // 不在就绪队列: 调用方可安全销毁帧
-            scheduled_set_.erase(it);
             abandoned_handles_.insert(h.address());
             return true; // 已注册废弃: 调用方不要销毁帧
         }
@@ -315,9 +315,14 @@ namespace coro {
         //     2. sleep_awaiter 析构 (协程帧销毁路径, 含取消注入的异常展开;
         //        此时 await_resume 根本不会执行, 必须靠析构置位)
         //   process_timers 跳过已标记条目。
+        struct ReadyEntry {
+            std::coroutine_handle<> handle;
+            uint64_t generation;
+        };
+
         struct TimerEntry {
             std::chrono::steady_clock::time_point deadline;
-            std::coroutine_handle<> handle;
+            ReadyEntry entry;
             std::shared_ptr<std::atomic<bool>> token; // 已取消/已消费标记 (堆上共享)
 
             bool operator<(const TimerEntry& other) const {
@@ -333,12 +338,12 @@ namespace coro {
         // + swap」后, 容量在 batch 与 ready_queue_ 之间往复保留,
         // 稳态零分配。
         struct HandleQueue {
-            std::vector<std::coroutine_handle<>> items;
+            std::vector<ReadyEntry> items;
             size_t head = 0;
 
-            void push(std::coroutine_handle<> h) { items.push_back(h); }
+            void push(ReadyEntry entry) { items.push_back(entry); }
             bool empty() const { return head >= items.size(); }
-            std::coroutine_handle<> front() const { return items[head]; }
+            ReadyEntry front() const { return items[head]; }
             void pop() {
                 ++head;
                 if (head == items.size()) {
@@ -354,10 +359,10 @@ namespace coro {
 
         // ---- 成员变量 ----
 
-        HandleQueue ready_queue_;                                // 就绪协程 FIFO
-        HandleQueue batch_;                                      // 本轮批量消费缓冲 (容量跨迭代复用)
-        std::vector<std::coroutine_handle<>> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_; // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
+        HandleQueue ready_queue_;                   // 就绪协程 FIFO
+        HandleQueue batch_;                         // 本轮批量消费缓冲 (容量跨迭代复用)
+        std::vector<ReadyEntry> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
+        mutable std::mutex queue_mutex_;            // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
 
         // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
         // 为什么需要: 同一句柄可能被多个来源同时调度, 例如
@@ -366,6 +371,11 @@ namespace coro {
         // 若双入队, W 第一次 resume 后帧销毁, 第二次 pop 到它时 done() 是 UB。
         // schedule 时查重, 出队 (批量 swap) 时移除。
         std::unordered_set<const void*> scheduled_set_;
+
+        // 始终启用的帧存活表，与可选调试注册表分离。出队前检查代次，
+        // 不对已释放帧调用 done()；地址复用也不能让旧条目恢复新帧。
+        std::unordered_map<const void*, uint64_t> live_frames_;
+        uint64_t next_generation_ = 0;
 
         // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
         // 仅事件循环线程访问 (mark_abandoned 也在事件循环线程调用)。
@@ -455,10 +465,12 @@ namespace coro {
         if (h) {
             {
                 std::lock_guard lock(queue_mutex_);
-                // 幂等: 已在队列中的句柄不再重复入队 (防 double-resume → UB)
-                if (!scheduled_set_.insert(h.address()).second)
+                // 调度入口只接受已启动的存活帧；自定义协程也须配对调用
+                // on_coroutine_started/on_coroutine_finished，且在 owner loop 销毁。
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end() || !scheduled_set_.insert(h.address()).second)
                     return;
-                ready_queue_.push(h);
+                ready_queue_.push({h, live->second});
             }
             // 同线程调度 (run() 内部) 不唤醒: 循环会自然处理就绪队列。
             // 等价 Python: loop.call_soon() 不唤醒, call_soon_threadsafe() 才写 self-pipe
@@ -470,7 +482,10 @@ namespace coro {
     inline void EventLoop::schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
                                           std::shared_ptr<std::atomic<bool>> token) {
         if (h) {
-            timer_heap_.push({deadline, h, std::move(token)});
+            std::lock_guard lock(queue_mutex_);
+            auto live = live_frames_.find(h.address());
+            if (live != live_frames_.end())
+                timer_heap_.push({deadline, {h, live->second}, std::move(token)});
         }
     }
 
@@ -501,14 +516,17 @@ namespace coro {
             while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
                 auto entry = timer_heap_.top();
                 timer_heap_.pop();
-                if (entry.handle && !entry.handle.done()) // 跳过已完成/已取消的协程
-                    timer_expired_buf_.push_back(entry.handle);
+                if (!entry.token || !entry.token->load())
+                    timer_expired_buf_.push_back(entry.entry);
             }
             if (!timer_expired_buf_.empty()) {
                 std::lock_guard lock(queue_mutex_);
-                for (auto eh : timer_expired_buf_)
-                    if (scheduled_set_.insert(eh.address()).second)
-                        ready_queue_.push(eh);
+                for (auto entry : timer_expired_buf_) {
+                    auto live = live_frames_.find(entry.handle.address());
+                    if (live != live_frames_.end() && live->second == entry.generation &&
+                        scheduled_set_.insert(entry.handle.address()).second)
+                        ready_queue_.push(entry);
+                }
             }
         }
         // 返回本次使用的时钟: run_impl 的超时计算直接复用 (省一次系统调用)
@@ -521,7 +539,8 @@ namespace coro {
         // 挂起的 I/O 操作也是"工作": 有它们事件循环就不能退出
         // 活跃协程 > 0 也是"工作": 它们可能挂起在等待跨线程唤醒 (Future 等)
         std::lock_guard lock(queue_mutex_);
-        return !ready_queue_.empty() || !timer_heap_.empty() || event_source_->has_pending() || active_coroutines_ > 0;
+        return !ready_queue_.empty() || !fn_queue_.empty() || !timer_heap_.empty() || event_source_->has_pending() ||
+               active_coroutines_ > 0;
     }
 
     inline void EventLoop::run() {
@@ -631,13 +650,17 @@ namespace coro {
                 // 防止 batch 内前面的协程 cancel 后面的协程时重复入队。
             }
             while (!batch_.empty()) {
-                auto h = batch_.front();
+                auto entry = batch_.front();
+                auto h = entry.handle;
                 batch_.pop();
                 {
                     // resume 前移除: 协程 resume 后若再次挂起, 允许重新入队。
                     // 必须逐个进行而非整批提前擦除 —— 这是防 double-schedule
                     // 的正确性机制 (见上方注释), 不能作为纯优化合并。
                     std::lock_guard lock(queue_mutex_);
+                    auto live = live_frames_.find(h.address());
+                    if (live == live_frames_.end() || live->second != entry.generation)
+                        continue;
                     scheduled_set_.erase(h.address());
                 }
                 if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)

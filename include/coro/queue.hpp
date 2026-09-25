@@ -2,6 +2,7 @@
 
 #include "sync.hpp"
 
+#include <algorithm>
 #include <deque>
 #include <optional>
 
@@ -41,24 +42,41 @@ namespace coro {
             get_awaiter(Queue* q) : q_(q) {} // 保存指向所属队列的指针
 
             /// 有数据? 有则直接返回 (快速路径, 不挂起)
-            bool await_ready() const noexcept { return !q_->items_.empty(); }
+            bool await_ready() const noexcept {
+                return q_->reserved_getters_ == 0 && q_->get_waiters_.empty() && !q_->items_.empty();
+            }
 
             /// 没数据 → 把协程句柄登记到等待队列, 然后挂起
-            void await_suspend(std::coroutine_handle<> h) { q_->get_waiters_.push_back(h); }
+            void await_suspend(std::coroutine_handle<> h) {
+                handle_ = h;
+                q_->get_waiters_.push_back(this);
+                q_->notify_getters();
+            }
 
             /// 被唤醒后: 取出队首数据, 并顺带叫醒一个生产者
             T await_resume() {
-                auto item = std::move(q_->items_.front());
-                q_->items_.pop_front();
-                // 如果有 put 等待者，唤醒一个
-                q_->notify_putters();
-                return item;
+                q_->remove_get_waiter(this);
+                try {
+                    auto item = std::move(q_->items_.front());
+                    q_->items_.pop_front();
+                    q_->notify_putters();
+                    return item;
+                } catch (...) {
+                    q_->notify_getters();
+                    throw;
+                }
             }
 
             /// 等待者协程帧被销毁时, 从 get 等待队列摘除僵尸句柄
-            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { q_->remove_get_waiter(h); }
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
+                q_->remove_get_waiter(this);
+                q_->notify_getters(); // 取消不消费元素，将预留交给下一位等待者
+            }
 
           private:
+            friend class Queue;
+            std::coroutine_handle<> handle_;
+            bool reserved_ = false;
             Queue* q_; // 所属队列 (本 awaiter 生命周期内队列必然存活)
         };
 
@@ -71,23 +89,38 @@ namespace coro {
             put_awaiter(Queue* q, T item) : q_(q), item_(std::move(item)) {}
 
             /// 有空间 (无限队列或未满)? 有则直接放 (快速路径, 不挂起)
-            bool await_ready() const noexcept { return q_->maxsize_ == 0 || q_->items_.size() < q_->maxsize_; }
+            bool await_ready() const noexcept { return !q_->full(); }
 
             /// 满了 → 把协程句柄登记到等待队列, 然后挂起
-            void await_suspend(std::coroutine_handle<> h) { q_->put_waiters_.push_back(h); }
+            void await_suspend(std::coroutine_handle<> h) {
+                handle_ = h;
+                q_->put_waiters_.push_back(this);
+                q_->notify_putters();
+            }
 
             /// 被唤醒后: 放入数据, 并顺带叫醒一个消费者
             void await_resume() {
-                q_->items_.push_back(std::move(item_));
-                // 如果有 get 等待者，唤醒一个
-                q_->notify_getters();
+                q_->remove_put_waiter(this);
+                try {
+                    q_->items_.push_back(std::move(item_));
+                } catch (...) {
+                    q_->notify_putters();
+                    throw;
+                }
                 ++q_->unfinished_tasks_; // 未完成任务计数 (join 依赖)
+                q_->notify_getters();
             }
 
             /// 等待者协程帧被销毁时, 从 put 等待队列摘除僵尸句柄
-            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { q_->remove_put_waiter(h); }
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
+                q_->remove_put_waiter(this);
+                q_->notify_putters(); // 释放未使用的容量预留
+            }
 
           private:
+            friend class Queue;
+            std::coroutine_handle<> handle_;
+            bool reserved_ = false;
             Queue* q_; // 所属队列
             T item_;   // 待放入的数据 (挂起期间暂存在这里)
         };
@@ -99,7 +132,7 @@ namespace coro {
 
         /// 非阻塞取: 空 → nullopt (对标 Python q.get_nowait)
         std::optional<T> get_nowait() {
-            if (items_.empty())
+            if (items_.empty() || reserved_getters_ != 0 || !get_waiters_.empty())
                 return std::nullopt;
             auto item = std::move(items_.front());
             items_.pop_front();
@@ -109,11 +142,11 @@ namespace coro {
 
         /// 非阻塞放: 满 → false (对标 Python q.put_nowait)
         bool put_nowait(T item) {
-            if (maxsize_ > 0 && items_.size() >= maxsize_)
+            if (full())
                 return false;
             items_.push_back(std::move(item));
-            notify_getters();    // 有货了 → 唤醒一个消费者
             ++unfinished_tasks_; // 未完成任务计数 (join 依赖)
+            notify_getters();    // 有货了 → 唤醒一个消费者
             return true;
         }
 
@@ -168,53 +201,65 @@ namespace coro {
         /// 未处理完的任务数
         size_t unfinished_count() const noexcept { return unfinished_tasks_; }
 
-        size_t size() const noexcept { return items_.size(); }                           // 当前元素个数
-        bool empty() const noexcept { return items_.empty(); }                           // 是否为空
-        bool full() const noexcept { return maxsize_ > 0 && items_.size() >= maxsize_; } // 是否已满
+        size_t size() const noexcept { return items_.size(); } // 当前元素个数
+        bool empty() const noexcept { return items_.empty(); } // 是否为空
+        bool full() const noexcept { return maxsize_ > 0 && items_.size() + reserved_putters_ >= maxsize_; } // 是否已满
 
       private:
         /// 叫醒最早等待的生产者 (队列有空位了)
         void notify_putters() {
-            if (!put_waiters_.empty()) {
-                auto h = put_waiters_.front();
+            while (!put_waiters_.empty() && !full()) {
+                auto* waiter = put_waiters_.front();
                 put_waiters_.pop_front();
-                EventLoop::get().schedule(h); // 交给事件循环恢复
+                waiter->reserved_ = true;
+                ++reserved_putters_;
+                EventLoop::get().schedule(waiter->handle_);
             }
         }
 
         /// 叫醒最早等待的消费者 (队列有数据了)
         void notify_getters() {
-            if (!get_waiters_.empty()) {
-                auto h = get_waiters_.front();
+            while (!get_waiters_.empty() && reserved_getters_ < items_.size()) {
+                auto* waiter = get_waiters_.front();
                 get_waiters_.pop_front();
-                EventLoop::get().schedule(h); // 交给事件循环恢复
+                waiter->reserved_ = true;
+                ++reserved_getters_;
+                EventLoop::get().schedule(waiter->handle_);
             }
         }
 
         /// 从 get 等待队列中移除指定句柄 (防悬空句柄被调度)
-        void remove_get_waiter(std::coroutine_handle<> h) {
-            for (auto it = get_waiters_.begin(); it != get_waiters_.end();) {
-                if (*it == h)
-                    it = get_waiters_.erase(it); // 找到则删除
-                else
-                    ++it;
+        void remove_get_waiter(get_awaiter* waiter) {
+            if (std::exchange(waiter->reserved_, false)) {
+                --reserved_getters_;
+            } else if (waiter->handle_) {
+                auto it = std::find(get_waiters_.begin(), get_waiters_.end(), waiter);
+                if (it != get_waiters_.end())
+                    get_waiters_.erase(it);
             }
+            waiter->handle_ = nullptr;
         }
 
         /// 从 put 等待队列中移除指定句柄 (防悬空句柄被调度)
-        void remove_put_waiter(std::coroutine_handle<> h) {
-            for (auto it = put_waiters_.begin(); it != put_waiters_.end();) {
-                if (*it == h)
-                    it = put_waiters_.erase(it); // 找到则删除
-                else
-                    ++it;
+        void remove_put_waiter(put_awaiter* waiter) {
+            if (std::exchange(waiter->reserved_, false)) {
+                --reserved_putters_;
+            } else if (waiter->handle_) {
+                auto it = std::find(put_waiters_.begin(), put_waiters_.end(), waiter);
+                if (it != put_waiters_.end())
+                    put_waiters_.erase(it);
             }
+            waiter->handle_ = nullptr;
         }
 
-        size_t maxsize_;                                   // 队列容量上限 (0 = 无限)
-        std::deque<T> items_;                              // 数据缓冲区
-        std::deque<std::coroutine_handle<>> put_waiters_;  // 挂起的生产者队列 (FIFO)
-        std::deque<std::coroutine_handle<>> get_waiters_;  // 挂起的消费者队列 (FIFO)
+        size_t maxsize_;      // 队列容量上限 (0 = 无限)
+        std::deque<T> items_; // 数据缓冲区
+        // 唤醒时 O(1) 出队，预留状态保留在 awaiter 中直到消费或取消。
+        // nowait/新调用不能抢走已移交的元素或容量。
+        size_t reserved_putters_ = 0;
+        size_t reserved_getters_ = 0;
+        std::deque<put_awaiter*> put_waiters_;             // 挂起的生产者队列 (FIFO)
+        std::deque<get_awaiter*> get_waiters_;             // 挂起的消费者队列 (FIFO)
         std::deque<std::coroutine_handle<>> join_waiters_; // join() 的等待者
         size_t unfinished_tasks_ = 0;                      // 已 put 未 task_done 的任务数
     };

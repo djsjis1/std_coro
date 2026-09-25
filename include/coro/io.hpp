@@ -39,13 +39,15 @@ namespace coro {
         inline void uring_submit(net::UringEventSource* u, io_uring_sqe* sqe, detail::uring_op* op) {
             io_uring_sqe_set_data(sqe, op);
             int ret = io_uring_submit(u->handle());
-            if (ret < 0) {
-                // 提交失败: 不增加挂起计数, 立即报错并恢复协程
-                op->result = ret;
-                op->error = -ret;
+            if (u->discard_pending(sqe)) {
+                // submit 已发布 SQ tail，失败/零提交/部分提交都可能留下 SQE。
+                // 先解除所有缓冲和 user_data 引用，再允许协程恢复并释放帧。
+                op->result = ret < 0 ? ret : -EAGAIN;
+                op->error = -op->result;
                 EventLoop::get().schedule(op->continuation);
                 return;
             }
+            // 内核已消费的操作不能因 submit 返回错误而提前释放。
             u->op_start();
         }
     } // namespace detail

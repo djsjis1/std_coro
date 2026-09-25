@@ -158,4 +158,62 @@ TEST(FsWatchTest, RecursiveTracksExistingRenamedAndNewDirectories) {
     EXPECT_TRUE(has_path("renamed/after.txt")) << "重命名子目录的 watch 映射未更新";
     EXPECT_TRUE(has_path("dynamic/new.txt")) << "新建子目录未动态加入递归监视";
 }
+#ifdef _WIN32
+TEST(FsWatchTest, TerminalErrorIsRetainedAcrossNextAndMove) {
+    coro::fs::DirectoryWatcher watcher;
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    aw.op.error = ERROR_ACCESS_DENIED;
+    aw.await_resume();
+    EXPECT_FALSE(watcher.valid());
+    EXPECT_EQ(watcher.error(), ERROR_ACCESS_DENIED);
+    auto moved = std::move(watcher);
+    for (int i = 0; i < 100; ++i) {
+        auto next = moved.next();
+        next.start();
+        coro::EventLoop::get().run();
+        EXPECT_TRUE(next.take_result().path.empty());
+        EXPECT_EQ(coro::io::last_error(), ERROR_ACCESS_DENIED);
+    }
+    EXPECT_EQ(coro::EventLoop::get().active_task_count(), 0u);
+}
+
+TEST(FsWatchTest, ZeroByteCompletionIsRecoverableOverflow) {
+    coro::fs::DirectoryWatcher watcher;
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    aw.await_resume();
+    auto next = watcher.next();
+    next.start();
+    coro::EventLoop::get().run();
+    EXPECT_EQ(next.take_result().type, coro::fs::watch_event_type::overflow);
+    EXPECT_EQ(watcher.error(), 0);
+}
+
+TEST(FsWatchTest, MalformedRecordsStopWatcher) {
+    coro::fs::DirectoryWatcher watcher;
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    aw.op.transferred = 1; // 连固定记录头都不完整
+    aw.await_resume();
+    EXPECT_EQ(watcher.error(), ERROR_INVALID_DATA);
+    EXPECT_FALSE(watcher.valid());
+}
+
+TEST(FsWatchTest, NonDirectoryReadTerminatesInsteadOfRecursing) {
+    const auto dir = make_watch_dir();
+    const auto path = std::filesystem::path(dir) / "not-a-directory.txt";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_FLAG_OVERLAPPED, nullptr);
+    ASSERT_NE(file, INVALID_HANDLE_VALUE);
+    {
+        coro::fs::DirectoryWatcher watcher(file, false);
+        ASSERT_TRUE(watcher.valid());
+        auto next = coro::wait_for(watcher.next(), 100ms);
+        next.start();
+        coro::EventLoop::get().run();
+        EXPECT_NO_THROW((void)next.take_result());
+        EXPECT_FALSE(watcher.valid());
+        EXPECT_NE(watcher.error(), 0);
+    }
+    std::filesystem::remove_all(dir);
+}
+#endif
 #endif // _WIN32 || __linux__

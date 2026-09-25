@@ -6,6 +6,7 @@
 #include "test_util.h"
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -282,6 +283,154 @@ namespace {
 
 } // namespace
 
+namespace {
+    coro::Task<int> reserved_get(coro::Queue<int>* q) {
+        co_return co_await q->get();
+    }
+
+    coro::Task<> reserved_put(coro::Queue<int>* q, int value) {
+        co_await q->put(value);
+    }
+} // namespace
+
+TEST(QueueReservationTest, GetterCannotBeOvertaken) {
+    bool stolen = true, ready = true;
+    int first = 0, second = 0;
+    auto scenario = [&]() -> coro::Task<> {
+        coro::Queue<int> q(2);
+        auto a = coro::spawn(reserved_get(&q));
+        co_await coro::yield();
+        q.put_nowait(11);
+        stolen = q.get_nowait().has_value();
+        ready = q.get().await_ready();
+        q.put_nowait(22);
+        auto b = coro::spawn(reserved_get(&q));
+        first = co_await a;
+        second = co_await b;
+        q.task_done();
+        q.task_done();
+        co_await q.join();
+    };
+    test_util::run_task(scenario);
+    EXPECT_FALSE(stolen);
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(first, 11);
+    EXPECT_EQ(second, 22);
+}
+
+TEST(QueueReservationTest, PutterCapacityCannotBeStolen) {
+    bool stolen = true, ready = true, full = false;
+    size_t size = 0;
+    std::vector<int> values;
+    auto scenario = [&]() -> coro::Task<> {
+        coro::Queue<int> q(1);
+        q.put_nowait(1);
+        auto a = coro::spawn(reserved_put(&q, 2));
+        co_await coro::yield();
+        values.push_back(*q.get_nowait());
+        full = q.full();
+        stolen = q.put_nowait(99);
+        ready = q.put(99).await_ready();
+        auto b = coro::spawn(reserved_put(&q, 3));
+        co_await a;
+        size = q.size();
+        values.push_back(co_await q.get());
+        co_await b;
+        values.push_back(co_await q.get());
+    };
+    test_util::run_task(scenario);
+    EXPECT_TRUE(full);
+    EXPECT_FALSE(stolen);
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(size, 1u);
+    EXPECT_EQ(values, (std::vector<int>{1, 2, 3}));
+}
+
+TEST(QueueReservationTest, CancelledOrDestroyedGetterPassesReservation) {
+    for (bool destroy : {false, true}) {
+        int value = 0;
+        size_t unfinished = 0;
+        auto scenario = [&]() -> coro::Task<> {
+            coro::Queue<int> q(1);
+            auto a = coro::spawn(reserved_get(&q));
+            auto b = coro::spawn(reserved_get(&q));
+            co_await coro::yield();
+            q.put_nowait(42);
+            if (destroy) {
+                a = coro::Task<int>{};
+            } else {
+                a.cancel();
+                try {
+                    (void)co_await a;
+                } catch (const coro::CancelledError&) {
+                }
+            }
+            value = co_await coro::wait_for(std::move(b), 100ms);
+            q.task_done();
+            co_await q.join();
+            unfinished = q.unfinished_count();
+        };
+        test_util::run_task(scenario);
+        EXPECT_EQ(value, 42);
+        EXPECT_EQ(unfinished, 0u);
+    }
+}
+
+TEST(QueueReservationTest, CancelledOrDestroyedPutterPassesReservation) {
+    for (bool destroy : {false, true}) {
+        int value = 0;
+        size_t unfinished = 0;
+        auto scenario = [&]() -> coro::Task<> {
+            coro::Queue<int> q(1);
+            q.put_nowait(1);
+            auto a = coro::spawn(reserved_put(&q, 2));
+            auto b = coro::spawn(reserved_put(&q, 3));
+            co_await coro::yield();
+            (void)q.get_nowait();
+            q.task_done();
+            if (destroy) {
+                a = coro::Task<>{};
+            } else {
+                a.cancel();
+                try {
+                    co_await a;
+                } catch (const coro::CancelledError&) {
+                }
+            }
+            co_await coro::wait_for(std::move(b), 100ms);
+            value = co_await q.get();
+            q.task_done();
+            co_await q.join();
+            unfinished = q.unfinished_count();
+        };
+        test_util::run_task(scenario);
+        EXPECT_EQ(value, 3);
+        EXPECT_EQ(unfinished, 0u);
+    }
+}
+
+TEST(QueueReservationTest, CancelBeforeNotificationAndMoveOnlyValue) {
+    int value = 0;
+    auto scenario = [&]() -> coro::Task<> {
+        coro::Queue<std::unique_ptr<int>> q(1);
+        auto consume = [&]() -> coro::Task<std::unique_ptr<int>> { co_return co_await q.get(); };
+        auto cancelled = coro::spawn(consume());
+        co_await coro::yield();
+        cancelled.cancel();
+        try {
+            (void)co_await cancelled;
+        } catch (const coro::CancelledError&) {
+        }
+        auto survivor = coro::spawn(consume());
+        co_await coro::yield();
+        co_await q.put(std::make_unique<int>(7));
+        auto result = co_await survivor;
+        value = *result;
+    };
+    test_util::run_task(scenario);
+    EXPECT_EQ(value, 7);
+}
+
 // ── Condition: 基本 notify 唤醒等待者 ──
 TEST(SyncExtendedTest, ConditionNotify) {
     int woken = 0;
@@ -375,6 +524,21 @@ TEST(EventLoopTest, CrossThreadDispatch) {
     });
 
     EXPECT_EQ(counter.load(), 1);
+}
+
+TEST(EventLoopTest, DispatchOnlyRunDrainsNestedCallbacks) {
+    auto& loop = coro::EventLoop::get();
+    int calls = 0;
+    std::thread poster([&] {
+        loop.dispatch([&] {
+            ++calls;
+            loop.dispatch([&] { ++calls; });
+        });
+    });
+    poster.join();
+    loop.run();
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(loop.active_task_count(), 0u);
 }
 
 // ── EventLoop::stop + run_until_stopped: 常驻模式优雅退出 ──
