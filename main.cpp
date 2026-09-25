@@ -2,7 +2,9 @@
 
 using coro::Task;
 
-Task<> main_task() {}
+Task<> main_task() {
+    co_return; // 协程体可为空, 但不能省略 co_return (MSVC C4716)
+}
 
 int main() {
 #ifdef _WIN32
