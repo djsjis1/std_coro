@@ -123,6 +123,28 @@ namespace coro {
                 return false;
             }
 
+            /// enter 完全失败 (返回负值) 时使用: 内核没有处理任何 SQE, 因此已发布
+            /// 区间 [khead, ktail) 内的全部 SQE 都可以安全丢弃。除本条外还可能残留
+            /// 其它协程提交的 SQE, 它们同样持有已释放的缓冲/user_data, 必须一并消毒,
+            /// 并把尾指针回退到内核消费头, 避免后续 submit 重新提交或耗尽 SQ。
+            void discard_all_published() {
+                auto& sq = ring_.sq;
+                const unsigned head = io_uring_smp_load_acquire(sq.khead);
+                const unsigned tail = *sq.ktail;
+                for (unsigned pos = head; pos != tail; ++pos) {
+                    auto& slot = sq.sqes[pos & *sq.kring_mask];
+                    slot = {};
+                    io_uring_prep_nop(&slot);
+                    io_uring_sqe_set_data(&slot, nullptr);
+                }
+                if (head != tail) {
+                    io_uring_smp_store_release(sq.ktail, head);
+                    // 同步 liburing 的用户态分配指针, 使其与回退后的环一致。
+                    sq.sqe_head = head;
+                    sq.sqe_tail = head;
+                }
+            }
+
             /// 标记一个异步操作开始 (提交 SQE 后调用)
             void op_start() { ++pending_ops_; }
 

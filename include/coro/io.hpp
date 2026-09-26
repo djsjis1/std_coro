@@ -39,11 +39,21 @@ namespace coro {
         inline void uring_submit(net::UringEventSource* u, io_uring_sqe* sqe, detail::uring_op* op) {
             io_uring_sqe_set_data(sqe, op);
             int ret = io_uring_submit(u->handle());
+            if (ret < 0) {
+                // enter 失败: 内核未消费任何 SQE, 本操作必须以错误结束。不能用
+                // “能否在已发布区间找到该 SQE” 来判定消费状态 —— 一旦判定失败,
+                // 协程会永久挂起并在帧销毁后留下悬空 op 供后续 CQE 写入。
+                u->discard_all_published();
+                op->result = ret;
+                op->error = -ret;
+                EventLoop::get().schedule(op->continuation);
+                return;
+            }
             if (u->discard_pending(sqe)) {
-                // submit 已发布 SQ tail，失败/零提交/部分提交都可能留下 SQE。
-                // 先解除所有缓冲和 user_data 引用，再允许协程恢复并释放帧。
-                op->result = ret < 0 ? ret : -EAGAIN;
-                op->error = -op->result;
+                // 部分提交: 本条未被内核消费, 以 EAGAIN 恢复交由调用方重试;
+                // 先解除缓冲与 user_data 引用, 再允许协程恢复并释放帧。
+                op->result = -EAGAIN;
+                op->error = EAGAIN;
                 EventLoop::get().schedule(op->continuation);
                 return;
             }
