@@ -22,7 +22,11 @@ runs:
       run: |
         # 诊断步骤本身不应改变 job 结论: 采集过程中的空匹配不算错误
         set +eo pipefail
-        log=$(find "$BUILD_DIR" -name LastTest.log -print -quit 2>/dev/null)
+        # 主 log 固定位于 Testing/Temporary/LastTest.log; 注意不能直接 find -name
+        # LastTest.log: 每个测试子目录 Testing/<name>/ 下也有一份该测试单独运行的
+        # log, find 命中的第一个很可能不是主 log, 会永远看不到用例结果行。
+        log="$BUILD_DIR/Testing/Temporary/LastTest.log"
+        [ -f "$log" ] || log=$(find "$BUILD_DIR" -path '*/Temporary/LastTest.log' -print -quit 2>/dev/null)
         if [ -z "$log" ]; then
           echo "::warning::$LABEL: LastTest.log not found, nothing to report"
           exit 0
@@ -32,8 +36,12 @@ runs:
         # 汇总段 "The following tests FAILED:" 只输出到控制台, 不在该文件里。
         failing=$(grep -E '\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | sed 's/^[[:space:]]*//' | head -n 10)
         if [ -z "$failing" ]; then
-          tail_lines=$(tail -n 6 "$log" | tr '\n' ' ' | cut -c1-400)
-          echo "::error::$LABEL: ctest exited non-zero without a case result; log tail: $tail_lines"
+          # 常见于"有测试失败但结果行格式未被上文模式覆盖", 把全部测试行原样带出;
+          # 同时兼容 CTest 3.26 ("N/M Test: name") 与 3.28 ("N/M Test  #N: name")。
+          lines=$(grep -E '^[0-9]+/[0-9]+ Test' "$log" | sed 's/^[[:space:]]*//' | tr '\n' '|' | cut -c1-900)
+          extra=$(grep -vE '^[0-9]+/[0-9]+ Test|^[[:space:]]*$|-----' "$log" | tail -n 4 | tr '\n' '|' | cut -c1-300)
+          echo "::error::$LABEL: no matched case; results: $lines"
+          echo "::error::$LABEL: log extras: $extra"
           exit 0
         fi
         while IFS= read -r line; do
