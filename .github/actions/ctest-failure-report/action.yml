@@ -31,21 +31,23 @@ runs:
           echo "::warning::$LABEL: LastTest.log not found, nothing to report"
           exit 0
         fi
-        # LastTest.log 中每个用例占一行结果, 形如:
-        #   3/11 Test  #3: web_selftest .........***Timeout 120.03 sec
-        # 汇总段 "The following tests FAILED:" 只输出到控制台, 不在该文件里。
-        failing=$(grep -E '\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | sed 's/^[[:space:]]*//' | head -n 10)
+        # 每测试节尾的结果行是 "Test Passed." / "Test Failed." (3.26 起即如此),
+        # 个别版本还用 "***Failed <reason>" 行; 两种都认。
+        failing=$(grep -nE 'Test Failed\.|^\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | head -n 10)
         if [ -z "$failing" ]; then
-          # 常见于"有测试失败但结果行格式未被上文模式覆盖", 把全部测试行原样带出;
+          # 常见于"有测试失败但结果行格式未被上文模式覆盖", 把测试行与结果统计带出;
           # 同时兼容 CTest 3.26 ("N/M Test: name") 与 3.28 ("N/M Test  #N: name")。
           lines=$(grep -E '^[0-9]+/[0-9]+ Test' "$log" | sed 's/^[[:space:]]*//' | tr '\n' '|' | cut -c1-900)
+          pass=$(grep -c 'Test Passed\.' "$log")
           extra=$(grep -vE '^[0-9]+/[0-9]+ Test|^[[:space:]]*$|-----' "$log" | tail -n 4 | tr '\n' '|' | cut -c1-300)
-          echo "::error::$LABEL: no matched case; results: $lines"
+          echo "::error::$LABEL: no matched case; pass=$pass; results: $lines"
           echo "::error::$LABEL: log extras: $extra"
           exit 0
         fi
         while IFS= read -r line; do
-          echo "::error::$LABEL failing case: $line"
+          # 带出行号 + 该结果行前后各 6 行上下文 (gtest 的 [  FAILED  ] 用例名就在其中)
+          lineno=${line%%:*}
+          echo "::error::$LABEL failing case: $(sed -n "$((lineno-6)),$((lineno+6))p" "$log" | grep -vE '^[[:space:]]*$' | tr '\n' '|' | cut -c1-700)"
         done <<< "$failing"
         # 失败用例自身的输出片段最能说明原因, 一并留到摘要
         {
