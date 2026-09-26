@@ -10,6 +10,7 @@ cmake_install.cmake
 # IDE
 .vscode/
 .zcode/
+.qoder/
 .idea/
 *.swp
 *.swo

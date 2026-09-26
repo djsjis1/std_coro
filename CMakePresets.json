@@ -44,7 +44,8 @@
         "CORO_BUILD_BENCHMARKS": "ON",
         "CORO_ENABLE_NATIVE_IO": "ON",
         "CORO_ENABLE_URING": "ON",
-        "CORO_ENABLE_WEB": "ON"
+        "CORO_ENABLE_WEB": "ON",
+        "CORO_ENABLE_CONCURRENCY_EXT": "ON"
       }
     }
   ],

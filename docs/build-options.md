@@ -13,6 +13,7 @@
 | `CORO_ENABLE_URING`               | `ON`                              | Linux 的 io_uring 后端（依赖`NATIVE_IO`）。关闭即纯协程核心                          |
 | `CORO_REQUIRE_URING`              | `OFF`                             | `ON` 时 io_uring 后端不可用直接配置失败，禁止静默降级；`OFF` 时只警告                |
 | `CORO_ENABLE_WEB`                 | `OFF`                             | `coro::web` 静态库、`web_server` 示例与 Web 层测试的唯一开关                         |
+| `CORO_ENABLE_CONCURRENCY_EXT`     | `OFF`                             | 并发工具扩展（`timer.hpp`/`context.hpp`/后续的 Channel、select 等）与其测试；只依赖纯核心，零第三方 |
 | `CORO_BUILD_TESTS`                | `OFF`                             | googletest 与`coro_tests`                                                            |
 | `CORO_BUILD_EXAMPLES`             | `OFF`                             | `examples/`、`tcp_udp` 示例、根 `main.cpp` 练习场                                    |
 | `CORO_BUILD_BENCHMARKS`           | `OFF`                             | `coro_stress` 压测程序（`EXAMPLES=ON` 时也会带上）                                   |
@@ -21,12 +22,13 @@
 **开发验证目标默认全 OFF 是刻意的**：本库以 `add_subdirectory` 或 `find_package`
 被消费时，不应该附带把测试框架、示例和 Web 服务一起配置进来。
 
-## 2. 能力宏：编译期只有一个
+## 2. 能力宏：每项能力一个，单点派生
 
-`coro` 目标向消费方导出**唯一**的能力宏：
+`coro` 目标向消费方导出的能力宏（每个都由一处派生，不允许各文件自己算）：
 
 ```
-CORO_HAS_URING=0|1        # 由 $<BOOL:${CORO_HAS_URING}> 单点派生
+CORO_HAS_URING=0|1                # 由 $<BOOL:${CORO_HAS_URING}> 派生
+CORO_HAS_CONCURRENCY_EXT=0|1      # 由 $<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}> 派生
 ```
 
 头文件里的平台守卫一律写成：
@@ -44,6 +46,9 @@ CORO_HAS_URING=0|1        # 由 $<BOOL:${CORO_HAS_URING}> 单点派生
    `CORO_HAS_FSWATCH` / `CORO_HAS_PROCESS` **只是 CMake 变量**（用来决定哪些
    target、哪些测试源文件参与构建），不会作为编译宏传给 C++。写头文件守卫时
    不要引用它们。
+3. 新增能力时必须先定下**唯一事实源**再派生宏，禁止在多个文件里各写一套判定。
+   并发扩展头（`timer.hpp`/`context.hpp`）**不进 `coro.hpp` 聚合头**：它们由用户
+   显式包含，开关只决定测试与示例是否参与构建，这样纯核心消费者的依赖面不变。
 
 CMake 侧的派生关系（`CORO_ENABLE_NATIVE_IO` 为总门）：
 

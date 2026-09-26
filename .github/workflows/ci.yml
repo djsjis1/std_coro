@@ -113,6 +113,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCORO_REQUIRE_URING=ON \
             -DCORO_ENABLE_WEB=ON \
+            -DCORO_ENABLE_CONCURRENCY_EXT=ON \
             -DCORO_BUILD_TESTS=ON \
             -DCORO_BUILD_EXAMPLES=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -307,7 +308,7 @@ jobs:
           uname -sr
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
 
       - name: Build (tests only)
         run: cmake --build build --target coro_tests
@@ -379,6 +380,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCORO_REQUIRE_URING=ON \
             -DCORO_ENABLE_WEB=ON \
+            -DCORO_ENABLE_CONCURRENCY_EXT=ON \
             -DCORO_BUILD_TESTS=ON \
             -DCORO_BUILD_EXAMPLES=OFF \
             -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"

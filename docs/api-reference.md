@@ -12,6 +12,8 @@
 - [异常类型 exceptions.hpp / task.hpp](#异常类型)
 - [Task task.hpp](#task-taskhpp)
 - [时间 sleep.hpp](#时间-sleephpp)
+- [定时器 timer.hpp](#定时器-timerhpp)
+- [上下文与取消 context.hpp](#上下文与取消-contexthpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -157,6 +159,82 @@ namespace coro {
   202ns/次（包含计数开销，具体值随机器变化）。
 
 ---
+
+## 定时器 timer.hpp
+
+> 属于并发扩展，需 `-DCORO_ENABLE_CONCURRENCY_EXT=ON`（默认 OFF）。
+> 它**不进 `coro/coro.hpp` 聚合头**，请 `#include <coro/timer.hpp>` 显式引入。
+
+一次性、可取消、可重置的定时器；**不会自己起后台任务**，周期行为由你循环 `reset`。
+
+```cpp
+#include <coro/timer.hpp>
+using namespace std::chrono_literals;
+
+coro::Timer idle{500ms};
+if (co_await idle.wait()) {
+    // 到期
+} else {
+    // 被 cancel() 唤醒
+}
+idle.reset(500ms);   // 上一轮已结束 -> 重新开局, 下一轮 wait() 会真的再等
+idle.cancel();       // 唤醒等待者, wait() 返回 false
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `Timer{duration}` / `Timer{}` | 带期限构造，或先建后 `reset`（无限期：只由 `cancel` 唤醒） |
+| `Task<bool> wait()` | 到期 `true`；被 `cancel()` 唤醒 `false`；等待任务自身被取消仍抛 `CancelledError` |
+| `reset(duration)` | 有等待者时只把它的 deadline 往后搬；无等待者时重新开局 |
+| `cancel()` | 非阻塞，可从任意线程调用（唤醒投递回等待者所属 loop） |
+| `done()` / `has_waiter()` | 是否已进终态 / 是否正在被等待 |
+
+要点：
+
+- **只允许一个等待者**：第二个 `wait()` 当场抛 `StructuredConcurrencyError`，
+  而不是"谁被唤醒看调度运气"。
+- **析构等价于 `cancel()`**：不会留下再也醒不过来的等待者。
+- 全部使用 `steady_clock`，不受系统时间调整影响。
+
+## 上下文与取消 context.hpp
+
+> 同样属于并发扩展（需开关），不进聚合头：`#include <coro/context.hpp>`。
+
+只携带两件事：**取消关系**与 **deadline**（`steady_clock`）。不内置日志、服务定位
+或任意键值容器；必须**显式传递**，没有 thread_local 隐式上下文。
+
+```cpp
+#include <coro/context.hpp>
+using namespace std::chrono_literals;
+
+coro::CancellationSource src;
+auto parent = coro::Context::from(src.token()).with_deadline(5s);
+auto child  = parent.make_child();          // 继承取消关系; deadline 取较早值
+
+child.throw_if_cancelled();                 // 长任务里的同步检查点
+co_await child.wait();                      // 取消 -> CancelledError; 超期 -> TimeoutError
+src.cancel();                               // 非阻塞, 可从任意线程调用
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `Context::root()` / `Context::from(token[, deadline])` | 根上下文 / 从取消源的令牌派生 |
+| `Context::with_timeout(d)` | 只带期限、不带取消源 |
+| `make_child()` | 继承取消关系与父 deadline（不新建取消链） |
+| `with_deadline(d)` | 派生额外带期限的视图，**不会放宽**已有期限 |
+| `wait()` | 挂起直到取消或超时，分别抛 `CancelledError` / `TimeoutError` |
+| `throw_if_cancelled()` | 同步检查点：已取消抛 `CancelledError`，已超期抛 `TimeoutError` |
+| `cancelled()` / `deadline_passed()` / `deadline()` / `cancellation()` | 状态查询与取令牌 |
+| `CancellationSource::cancel()` | 唤醒**全部**等待者，每个都回到它自己的 loop；重复调用无副作用 |
+| `CancellationToken::cancelled()` / `wait_cancelled()` | 只观察取消（这里取消是正常结局，不抛异常） |
+
+要点：
+
+- 取消与超时同时发生时**取消优先**（`cancel` 已被 `claim_cancel` 串行化）；只有未被
+  取消时才报告超时。
+- 取消源比令牌/上下文先析构是安全的：取消状态由 `shared_ptr` 共享，不反指回源。
+- 默认构造的 `CancellationToken` 视为**已取消**——它不可能再有人 cancel，定为
+  "永不取消"会静默吞掉本该发生的取消。
 
 ## 并发组合 gather.hpp / wait.hpp
 

@@ -22,6 +22,8 @@ option(CORO_ENABLE_NATIVE_IO "启用 Windows/Linux 原生 I/O 后端与基础 I/
 option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
 option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止静默回退" OFF)
 option(CORO_ENABLE_WEB "构建 Web 服务框架 (coro::web 与 web_server)" OFF)
+# 并发工具扩展 (Timer/Context/Channel/select/...): 只依赖纯核心, 零第三方
+option(CORO_ENABLE_CONCURRENCY_EXT "启用新增并发工具头与对应测试" OFF)
 if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING))
     message(FATAL_ERROR "CORO_REQUIRE_URING requires Linux and CORO_ENABLE_URING=ON")
 endif()
@@ -105,6 +107,8 @@ endif()
 # io_uring 能力单一事实源: 仅 Linux + 仓库内源码可用时为真, 由头文件据此派生
 # CORO_HAS_{NET,FS,PIPE,FSWATCH,PROCESS} 等模块宏。
 target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
+# 并发扩展能力同样单点派生: 关闭时相关实现与测试整体不参与编译 (不是只屏蔽几个调用点)
+target_compile_definitions(coro INTERFACE CORO_HAS_CONCURRENCY_EXT=$<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}>)
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router
 add_subdirectory(router)
@@ -190,6 +194,12 @@ endif()
 if(CORO_HAS_PROCESS)
     add_executable(example_process examples/process_demo.cpp)
     target_link_libraries(example_process PRIVATE coro::coro)
+endif()
+
+# 并发扩展示例: 受自己的开关门控, 不开关时既不编译也不拉进纯核心消费者的依赖面
+if(CORO_ENABLE_CONCURRENCY_EXT)
+    add_executable(example_timer_context examples/timer_context.cpp)
+    target_link_libraries(example_timer_context PRIVATE coro::coro)
 endif()
 
 if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
