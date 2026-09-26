@@ -166,8 +166,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCORO_ENABLE_URING=OFF \
             -DCORO_BUILD_TESTS=ON \
-            -DCORO_BUILD_EXAMPLES=OFF
-          cmake --build build-core --target coro_tests
+            -DCORO_BUILD_EXAMPLES=ON
+          cmake --build build-core
           ctest --test-dir build-core --output-on-failure --timeout 120
 
       - name: Run stress test (Release only)
