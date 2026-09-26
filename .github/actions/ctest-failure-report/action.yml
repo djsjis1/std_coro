@@ -1,0 +1,46 @@
+name: 'Report ctest failures'
+description: '把失败的 ctest 用例以 annotation 形式报出，避免只能登录 Actions 才能看到失败详情'
+
+inputs:
+  build-dir:
+    description: 'ctest 构建目录'
+    required: false
+    default: 'build'
+  label:
+    description: 'annotation 前缀，用于区分同一 run 中的不同 job'
+    required: false
+    default: 'ctest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Collect failing tests
+      shell: bash
+      env:
+        BUILD_DIR: ${{ inputs.build-dir }}
+        LABEL: ${{ inputs.label }}
+      run: |
+        # 诊断步骤本身不应改变 job 结论: 采集过程中的空匹配不算错误
+        set +eo pipefail
+        log=$(find "$BUILD_DIR" -name LastTest.log -print -quit 2>/dev/null)
+        if [ -z "$log" ]; then
+          echo "::warning::$LABEL: LastTest.log not found, nothing to report"
+          exit 0
+        fi
+        # ctest 在末尾写入 "The following tests FAILED:" 段落, 形如 "\t 1 - coro_tests (Failed)"
+        failing=$(sed -n '/The following tests FAILED:/,$p' "$log" | tail -n +2 | grep -E '^[[:space:]]*[0-9]+[[:space:]]+-[[:space:]]+' | sed 's/^[[:space:]]*//' | head -n 10)
+        if [ -z "$failing" ]; then
+          echo "::warning::$LABEL: no failed case recorded"
+          exit 0
+        fi
+        while IFS= read -r line; do
+          echo "::error::$LABEL failed case: $line"
+        done <<< "$failing"
+        # 失败用例自身的输出片段最能说明原因, 一并留到摘要
+        {
+          echo "### $LABEL failing cases"
+          echo '```'
+          grep -A 15 '\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -n 120
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 0

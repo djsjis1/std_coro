@@ -229,23 +229,13 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
-      # 失败详情只存在于 job 日志里, 外部工具无法读取; 把失败清单与输出尾部写进
-      # run 摘要, 便于定位是哪个用例在哪类平台/后端上挂掉。
-      - name: Attach failing tests to run summary
+      # 失败详情默认只存于 job 日志, 外部工具无法读取; 统一复用本地 action
+      # 把失败用例名以 annotation 报出。
+      - name: Report ctest failures
         if: failure()
-        run: |
-          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
-          {
-            echo '### ctest failures'
-            echo '```'
-            if [ -n "$log" ]; then
-              sed -n '/The following tests FAILED/,$p' "$log"
-              grep -B1 -A12 '\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -120
-            else
-              echo 'LastTest.log not found'
-            fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          label: "Linux ${{ matrix.label }} ${{ matrix.build_type }}"
 
       - name: Verify installed package
         run: |
@@ -317,21 +307,11 @@ jobs:
         timeout-minutes: 10
         run: ctest --test-dir build --output-on-failure --timeout 120
 
-      - name: Attach failing tests to run summary
+      - name: Report ctest failures
         if: failure()
-        run: |
-          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
-          {
-            echo "### ctest failures (${{ matrix.name }})"
-            echo '```'
-            if [ -n "$log" ]; then
-              sed -n '/The following tests FAILED/,$p' "$log"
-              grep -B1 -A20 'ERROR: \|SUMMARY: \|\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -160
-            else
-              echo 'LastTest.log not found'
-            fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          label: "Sanitizer ${{ matrix.name }}"
 
   # ============================================================
   # 静态分析 (cppcheck)
@@ -401,21 +381,11 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build --output-on-failure --timeout 120
 
-      - name: Attach failing tests to run summary
+      - name: Report ctest failures
         if: failure()
-        run: |
-          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
-          {
-            echo '### ctest failures (coverage)'
-            echo '```'
-            if [ -n "$log" ]; then
-              sed -n '/The following tests FAILED/,$p' "$log"
-              grep -B1 -A12 '\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -120
-            else
-              echo 'LastTest.log not found'
-            fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          label: coverage
 
       - name: Generate coverage report
         run: |
