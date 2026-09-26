@@ -209,10 +209,12 @@ if(CORO_HAS_NET)
 endif()
 
 # 协程练习场 (main.cpp 用于练习写协程代码)
-add_executable(coro_practice main.cpp)
-target_link_libraries(coro_practice PRIVATE coro::coro)
-# 练习场可以按仓库根路径引用 tcp_udp/ 等目录内的头文件 (与 tcp_udp_example 同构)
-target_include_directories(coro_practice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# 练习场当前使用 tcp_udp 组件, 因此与网络能力一同注册: 否则 core-only + EXAMPLES=ON
+# 的配置会因缺少 <tcp_udp/...> 而构建失败 (该组合此前从未被验证)。
+if(CORO_HAS_NET)
+    add_executable(coro_practice main.cpp)
+    target_link_libraries(coro_practice PRIVATE coro::coro coro::tcp_udp)
+endif()
 
 # 高并发压力测试 (独立程序, 不计入常规 ctest)
 if(CORO_BUILD_BENCHMARKS OR CORO_BUILD_EXAMPLES)
@@ -240,6 +242,10 @@ if(CORO_BUILD_TESTS)
     list(REMOVE_ITEM CORO_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_layer.cpp")
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
+    # 服务器生命周期测试需要 tcp_udp 组件 (无网络能力的构建里该测试文件自身会被门控)
+    if(TARGET coro_tcp_udp)
+        target_link_libraries(coro_tests PRIVATE coro::tcp_udp)
+    endif()
     if(CORO_ENABLE_WEB)
         target_sources(coro_tests PRIVATE tests/test_web_layer.cpp)
         target_link_libraries(coro_tests PRIVATE coro::web http::http)
@@ -301,6 +307,12 @@ endif()
 # ============================================================================
 install(TARGETS coro coro_core EXPORT coroTargets)
 install(DIRECTORY include/coro DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# tcp_udp 是正式组件: 导出 target 并安装头文件, 保持与源码树相同的 <tcp_udp/...> 写法
+if(TARGET coro_tcp_udp)
+    install(TARGETS coro_tcp_udp EXPORT coroTargets)
+    install(FILES tcp_udp/tcp_server.hpp tcp_udp/udp_server.hpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tcp_udp)
+endif()
 
 install(EXPORT coroTargets
     FILE coroTargets.cmake

@@ -436,7 +436,18 @@ namespace coro {
             TcpListener& operator=(const TcpListener&) = delete;
 
             /// 绑定并监听 (同步, 一次性; 零配置: 自动关联 IOCP)
-            bool bind_listen(const char* ip, unsigned short port) {
+            /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
+            unsigned short local_port() const {
+                if (sock_ == INVALID_SOCKET)
+                    return 0;
+                sockaddr_in name{};
+                int len = static_cast<int>(sizeof(name));
+                if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&name), &len) == SOCKET_ERROR)
+                    return 0;
+                return ntohs(name.sin_port);
+            }
+
+            bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 ensure_winsock(); // 必须先初始化 Winsock
                 close();
                 accept_ex_ = nullptr;
@@ -465,7 +476,7 @@ namespace coro {
                     sock_ = INVALID_SOCKET;
                     return false;
                 }
-                if (listen(sock_, SOMAXCONN) == SOCKET_ERROR) {
+                if (listen(sock_, backlog) == SOCKET_ERROR) {
                     closesocket(sock_);
                     sock_ = INVALID_SOCKET;
                     return false;
@@ -629,6 +640,17 @@ namespace coro {
             UdpSocket& operator=(const UdpSocket&) = delete;
 
             /// 绑定本地地址 (同步, 一次性)
+            /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
+            unsigned short local_port() const {
+                if (sock_ == INVALID_SOCKET)
+                    return 0;
+                sockaddr_in name{};
+                int len = static_cast<int>(sizeof(name));
+                if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&name), &len) == SOCKET_ERROR)
+                    return 0;
+                return ntohs(name.sin_port);
+            }
+
             bool bind_listen(const char* ip, unsigned short port) {
                 ensure_winsock();
                 close();
@@ -1079,7 +1101,18 @@ namespace coro {
             TcpListener& operator=(const TcpListener&) = delete;
 
             /// 绑定并监听 (同步, 一次性; 零配置)
-            bool bind_listen(const char* ip, unsigned short port) {
+            /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
+            unsigned short local_port() const {
+                if (fd_ < 0)
+                    return 0;
+                sockaddr_in name{};
+                socklen_t len = sizeof(name);
+                if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&name), &len) != 0)
+                    return 0;
+                return ntohs(name.sin_port);
+            }
+
+            bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                 if (fd_ < 0)
                     return false;
@@ -1095,7 +1128,7 @@ namespace coro {
 
                 if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0)
                     return false;
-                if (::listen(fd_, SOMAXCONN) < 0)
+                if (::listen(fd_, backlog) < 0)
                     return false;
                 return true;
             }
@@ -1213,6 +1246,17 @@ namespace coro {
             UdpSocket& operator=(const UdpSocket&) = delete;
 
             /// 绑定本地地址 (同步, 一次性)
+            /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
+            unsigned short local_port() const {
+                if (fd_ < 0)
+                    return 0;
+                sockaddr_in name{};
+                socklen_t len = sizeof(name);
+                if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&name), &len) != 0)
+                    return 0;
+                return ntohs(name.sin_port);
+            }
+
             bool bind_listen(const char* ip, unsigned short port) {
                 fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                 if (fd_ < 0)
@@ -1378,9 +1422,18 @@ namespace coro {
 
             void close() {
                 if (fd_ >= 0) {
+                    // io_uring 上挂起的 recvmsg/sendmsg 持有文件引用, 仅 close 不会让它们
+                    // 完成: 服务端关停时事件循环会永久等待。先 shutdown 解除收发, 再关描述符。
+                    ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
                 }
+            }
+
+            /// 中止收发但保留描述符: 供其他线程唤醒挂起的 recvfrom, 避免 fd 复用竞态。
+            void shutdown() noexcept {
+                if (fd_ >= 0)
+                    ::shutdown(fd_, SHUT_RDWR);
             }
 
             bool valid() const { return fd_ >= 0; }
