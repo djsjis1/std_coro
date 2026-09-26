@@ -29,7 +29,7 @@ static constexpr auto CLEANUP_INTERVAL = 10s;
 
 // 客户端会话: 标识一个 (IP, port) 对应的连接状态
 struct ClientSession {
-    std::vector<char> buffer;                // 累积的原始字节, 尚未凑够完整消息
+    std::vector<char> buffer;                          // 累积的原始字节, 尚未凑够完整消息
     std::chrono::steady_clock::time_point last_active; // 最后一次收到数据的时间
 };
 
@@ -37,9 +37,7 @@ struct ClientSession {
 struct SockAddrKey {
     uint32_t ip;
     uint16_t port;
-    bool operator<(const SockAddrKey& o) const {
-        return ip < o.ip || (ip == o.ip && port < o.port);
-    }
+    bool operator<(const SockAddrKey& o) const { return ip < o.ip || (ip == o.ip && port < o.port); }
 };
 
 static SockAddrKey make_key(const sockaddr_in& addr) {
@@ -70,7 +68,7 @@ Task<> main_task() {
             co_await coro::sleep(CLEANUP_INTERVAL); // 每 10s 扫一次
 
             auto now = std::chrono::steady_clock::now();
-            for (auto it = sessions.begin(); it != sessions.end(); ) {
+            for (auto it = sessions.begin(); it != sessions.end();) {
                 if (now - it->second.last_active > SESSION_TIMEOUT) {
                     // 超时: 可选地通知应用层 (如日志记录)
                     std::cout << "[cleanup] session expired, removing" << std::endl;
@@ -107,17 +105,14 @@ Task<> main_task() {
             session.buffer.erase(session.buffer.begin(), session.buffer.begin() + msg_len);
 
             // 4) 处理这条完整消息
-            std::cout << "[" << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port)
-                      << "] complete message (" << payload.size() << " bytes): "
-                      << payload << std::endl;
+            std::cout << "[" << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port) << "] complete message ("
+                      << payload.size() << " bytes): " << payload << std::endl;
         }
 
         co_return;
     });
 
-    server.set_error_handler([](const std::string& error) {
-        std::cout << "Error: " << error << std::endl;
-    });
+    server.set_error_handler([](const std::string& error) { std::cout << "Error: " << error << std::endl; });
 
     server.run_forever("0.0.0.0", 8080);
 
