@@ -95,10 +95,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }} liburing-dev pkg-config
+          sudo apt-get install -y ${{ matrix.install }}
           "$CXX" --version
-          pkg-config --modversion liburing
           uname -sr
+          # liburing 不从系统安装: io_uring 后端编译仓库内 thirdparty/liburing 源码
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -283,9 +283,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }} liburing-dev pkg-config
+          sudo apt-get install -y ${{ matrix.install }}
           "$CXX" --version
-          pkg-config --modversion liburing
           uname -sr
 
       - name: Configure CMake
@@ -345,9 +344,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-13 liburing-dev pkg-config lcov
+          sudo apt-get install -y g++-13 lcov
           "$CXX" --version
-          pkg-config --modversion liburing
           uname -sr
 
       - name: Configure CMake (coverage flags)

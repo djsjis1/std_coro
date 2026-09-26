@@ -1,19 +1,11 @@
 @PACKAGE_INIT@
 
-if(@CORO_HAS_URING@ AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT TARGET uring::uring)
-    find_path(CORO_URING_INCLUDE_DIR NAMES liburing.h)
-    find_library(CORO_URING_LIBRARY NAMES uring)
-    if(NOT CORO_URING_INCLUDE_DIR OR NOT CORO_URING_LIBRARY)
-        set(coro_FOUND FALSE)
-        set(coro_NOT_FOUND_MESSAGE "coro was built with io_uring support, but liburing was not found")
-        return()
-    endif()
-    add_library(uring::uring UNKNOWN IMPORTED)
-    set_target_properties(uring::uring PROPERTIES
-        IMPORTED_LOCATION "${CORO_URING_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${CORO_URING_INCLUDE_DIR}")
-endif()
-
+# 依赖解析说明:
+#   * Linux 的 io_uring 后端来自仓库内源码 thirdparty/liburing, 与本工程一起
+#     构建为静态库并以 coro::uring 导出在 coroTargets.cmake 中 —— 消费端不需要、
+#     也不会去查找系统预装的 liburing;
+#   * Windows 仅链接系统库 ws2_32, 其他 POSIX 平台仅链接 pthread,
+#     这些由导出目标的 INTERFACE_LINK_LIBRARIES 自动带入。
 include("${CMAKE_CURRENT_LIST_DIR}/coroTargets.cmake")
 
 check_required_components(coro)

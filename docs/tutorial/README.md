@@ -29,7 +29,7 @@
 - **第 1-5 讲是地基**，只用 `#include <coro/coro.hpp>`，零平台依赖，
   任何能编译 C++20 的环境都能跑。
 - **第 6-7 讲涉及平台 IO**：Windows 开箱即用（IOCP）；
-  Linux 需要先 `sudo apt install liburing-dev`。
+  Linux 直接使用仓库内 `thirdparty/liburing` 源码，无需安装系统包。
 - **贯穿全课程的约定**：逃逸当前语句的任务优先使用**命名函数**或
   “无捕获 lambda + 按值参数”。捕获型协程 lambda 也受支持，但闭包必须
   活到任务结束。详见[第 1 讲](01-hello-coroutine.md#命名函数-vs-lambda协程体)与
@@ -48,4 +48,4 @@
 | 编译器 | MSVC 2022 / GCC 11+（<14 加 `-fcoroutines`）/ Clang 14+ |
 | CMake | 3.20+ |
 | C++ 标准 | C++20 |
-| 平台 | Windows 全功能；Linux 网络与 IO 需 `liburing-dev`；其他平台核心功能可用 |
+| 平台 | Windows 全功能；Linux 网络与 IO 使用仓库内 liburing 源码（无需系统包）；其他平台核心功能可用 |

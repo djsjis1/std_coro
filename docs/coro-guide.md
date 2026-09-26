@@ -11,7 +11,7 @@
 
 - **零配置**：Windows 默认 IOCP，Linux 默认 io_uring，其他平台退化为纯标准库
 - **Header-only**：`#include <coro/coro.hpp>` 即可；网络需额外 `#include <coro/net.hpp>`
-- **依赖**：CMake 3.20+，MSVC 2022 / GCC 11+（<14 加 `-fcoroutines`）/ Clang 14+；Linux 网络层需 `liburing-dev`
+- **依赖**：CMake 3.20+，MSVC 2022 / GCC 11+（<14 加 `-fcoroutines`）/ Clang 14+；Linux 网络层使用仓库内 `thirdparty/liburing` 源码，无需安装系统 liburing
 - **模型**：单线程事件循环（类 asyncio 默认模式）+ 惰性启动的 `Task<T>`
 
 ---

@@ -38,10 +38,12 @@
 
 ### Linux 网络编译失败：找不到 `liburing/io_uring.h`
 
-```bash
-sudo apt install liburing-dev    # Debian/Ubuntu
-# 或 dnf install liburing-devel / pacman -S liburing
-```
+io_uring 后端编译仓库内 `thirdparty/liburing` 的源码，**不需要安装系统 liburing**。
+报此错一般是源码目录缺失或路径被改：
+
+- 确认 `thirdparty/liburing/CMakeLists.txt` 存在（该模块仅在 `CORO_ENABLE_URING=ON` 时参与构建）；
+- 不需要 io_uring 时用 `cmake -B build -DCORO_ENABLE_URING=OFF` 重新配置，
+  将构建纯协程核心（Linux 上定时器等回退到 CVEventSource，网络/文件模块自动关闭）。
 
 ### MSVC 报 C1128：段超过对象文件限制
 

@@ -64,24 +64,22 @@ if(UNIX)
     target_link_libraries(coro INTERFACE pthread)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_URING)
-    find_path(URING_INCLUDE_DIR liburing.h)
-    find_library(URING_LIB uring)
-    if(URING_INCLUDE_DIR AND URING_LIB)
+    # io_uring 后端统一使用仓库内源码 (thirdparty/liburing), 不查找系统预装库:
+    # 避免"部分源码化 + 部分系统查找"造成两套依赖解析路径与 CI/本地行为不一致。
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/liburing/CMakeLists.txt")
+        # 不用 EXCLUDE_FROM_ALL: 它会使子目录内的 install() 规则失效,
+        # 导致安装导出引用到未安装的 liburing.a。
+        add_subdirectory(thirdparty/liburing)
         set(CORO_HAS_URING ON)
-        if(NOT TARGET uring::uring)
-            add_library(uring::uring UNKNOWN IMPORTED)
-            set_target_properties(uring::uring PROPERTIES
-                IMPORTED_LOCATION "${URING_LIB}"
-                INTERFACE_INCLUDE_DIRECTORIES "${URING_INCLUDE_DIR}")
-        endif()
-        target_link_libraries(coro INTERFACE uring::uring)
-
+        target_link_libraries(coro INTERFACE uring)
+        message(STATUS "io_uring backend: in-tree liburing 2.9 source (thirdparty/liburing)")
     else()
         set(CORO_HAS_URING OFF)
         if(CORO_REQUIRE_URING)
-            message(FATAL_ERROR "liburing headers/library not found; install liburing-dev or liburing-devel")
+            message(FATAL_ERROR
+                "thirdparty/liburing source is missing; restore it or set CORO_ENABLE_URING=OFF")
         endif()
-        message(WARNING "liburing headers/library not found: Linux I/O modules are disabled; core timers/tasks use CVEventSource.")
+        message(WARNING "thirdparty/liburing source not found: Linux I/O modules are disabled; core timers/tasks use CVEventSource.")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(CORO_ENABLE_URING)
@@ -90,6 +88,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(STATUS "io_uring disabled by CORO_ENABLE_URING=OFF; building portable core only.")
     endif()
 endif()
+# io_uring 能力单一事实源: 仅 Linux + 仓库内源码可用时为真, 由头文件据此派生
+# CORO_HAS_{NET,FS,PIPE,FSWATCH,PROCESS} 等模块宏。
 target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router

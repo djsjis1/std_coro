@@ -78,7 +78,8 @@ accept/read/write；`wait_all()` 随后等待连接协程在各自 worker 上安
 
 ## 下一批修复路线
 
-1. 现有 Linux CI 配置已安装 liburing，测试源码覆盖 net/fs/pipe/process/fs_watch；
+1. Linux CI 直接编译仓库内 `thirdparty/liburing` 源码（不再安装系统 liburing），
+   测试源码覆盖 net/fs/pipe/process/fs_watch；
    CI 另有 `CORO_ENABLE_URING=OFF` 的 portable-core 构建。每次发布仍需保留并核对
    对应提交的 GCC/Clang 与 sanitizer 实际结果。
 2. inotify 已具备递归目录表、移动 cookie 跨批次关联和新目录动态 watch；
