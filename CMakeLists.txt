@@ -197,6 +197,8 @@ endif()
 # 协程练习场 (main.cpp 用于练习写协程代码)
 add_executable(coro_practice main.cpp)
 target_link_libraries(coro_practice PRIVATE coro::coro)
+# 练习场可以按仓库根路径引用 tcp_udp/ 等目录内的头文件 (与 tcp_udp_example 同构)
+target_include_directories(coro_practice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # 高并发压力测试 (独立程序, 不计入常规 ctest)
 if(CORO_BUILD_BENCHMARKS OR CORO_BUILD_EXAMPLES)

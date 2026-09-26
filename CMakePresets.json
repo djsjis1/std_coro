@@ -47,5 +47,24 @@
         "CORO_ENABLE_WEB": "ON"
       }
     }
+  ],
+  "buildPresets": [
+    { "name": "core", "configurePreset": "core", "jobs": 2 },
+    { "name": "native", "configurePreset": "native", "jobs": 2 },
+    { "name": "web", "configurePreset": "web", "jobs": 2 },
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "jobs": 2,
+      "targets": ["all"]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "timeout": 120 }
+    }
   ]
 }
