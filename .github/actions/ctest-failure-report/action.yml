@@ -1,5 +1,5 @@
 name: 'Report ctest failures'
-description: '把失败的 ctest 用例以 annotation 形式报出，避免只能登录 Actions 才能看到失败详情'
+description: '把失败的 ctest 用例名以 annotation 报出，定位问题不必登录 Actions 看日志'
 
 inputs:
   build-dir:
@@ -35,40 +35,20 @@ runs:
         # 个别版本还用 "***Failed <reason>" 行; 两种都认。
         failing=$(grep -nE 'Test Failed\.|^\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | head -n 10)
         if [ -z "$failing" ]; then
-          # 常见于"有测试失败但结果行格式未被上文模式覆盖", 把测试行与结果统计带出;
-          # 同时兼容 CTest 3.26 ("N/M Test: name") 与 3.28 ("N/M Test  #N: name")。
-          lines=$(grep -E '^[0-9]+/[0-9]+ Test' "$log" | sed 's/^[[:space:]]*//' | tr '\n' '|' | cut -c1-900)
-          pass=$(grep -c 'Test Passed\.' "$log")
-          extra=$(grep -vE '^[0-9]+/[0-9]+ Test|^[[:space:]]*$|-----' "$log" | tail -n 4 | tr '\n' '|' | cut -c1-300)
-          echo "::error::$LABEL: no matched case; pass=$pass; results: $lines"
-          echo "::error::$LABEL: log extras: $extra"
+          echo "::warning::$LABEL: ctest reported no failed case"
           exit 0
         fi
         while IFS= read -r line; do
-          # 带出该结果行前 30 行的 gtest 失败输出 (含 [  FAILED  ] 用例名与 expected/actual)
           lineno=${line%%:*}
-          echo "::error::$LABEL failing case: $(sed -n "$((lineno-30)),$((lineno+4))p" "$log" | grep -vE '^[[:space:]]*$' | tr '\n' '|' | cut -c1-1500)"
-          # gtest 崩溃/abort 时可能毫无失败输出: 取第一个测试节的尾部 1500 字符,
-          # 崩溃消息 (assert stderr/信号说明) 位于节尾且无缓冲, 一定在这里。
-          echo "::error::$LABEL section tail: $(awk 'NR==1,/2\/[0-9]+ Test/' "$log" | tail -c 1500 | tr '\n' '|')"
-          # 直接单跑失败用例拿真实退出码/崩溃栈 (非 sanitizer 环境)。
-          # 已证实 exit=139 (SIGSEGV), 有 gdb 时直接拿 backtrace 定位崩溃帧。
-          if [ -z "$ASAN_OPTIONS$TSAN_OPTIONS" ] && [ -x "$BUILD_DIR/coro_tests" ]; then
-            if command -v gdb > /dev/null 2>&1; then
-              gdb -batch -ex run -ex "bt 12" --args "$BUILD_DIR/coro_tests" --gtest_filter='UringFailureTest.*' > /tmp/bt.log 2>&1
-              echo "::error::$LABEL gdb bt: $(grep -E '^#[0-9]+ |Program received|SIGSEGV' /tmp/bt.log | head -n 14 | tr '\n' '|' | cut -c1-1400)"
-            else
-              timeout 60 "$BUILD_DIR/coro_tests" --gtest_filter='UringFailureTest.*' --gtest_brief=1 > /tmp/direct_run.log 2>&1
-              rc=$?
-              echo "::error::$LABEL direct run exit=$rc: $(tail -n 40 /tmp/direct_run.log | tr '\n' '|' | cut -c1-1300)"
-            fi
-          fi
+          # 结果行本身不含用例名, 回溯同一节内最近的 "N/M Testing: <name>" 行。
+          name=$(awk -v n="$lineno" 'NR<=n { if (match($0, /Testing: .*/)) t = substr($0, RSTART + 9, RLENGTH - 9) } NR == n { print t }' "$log")
+          echo "::error::$LABEL failed case: ${name:-unknown} ${line#*:}"
         done <<< "$failing"
         # 失败用例自身的输出片段最能说明原因, 一并留到摘要
         {
           echo "### $LABEL failing cases"
           echo '```'
-          grep -A 15 '\*\*\*Failed\|\*\*\*Timeout\|\*\*\*SIGSEGV\|\*\*\*SIGABRT' "$log" | tail -n 120
+          grep -B 2 -A 20 'Test Failed\.' "$log" | tail -n 120
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
         exit 0
