@@ -126,6 +126,14 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+      # 失败详情默认只存于 job 日志, 外部工具无法读取; 统一复用本地 action
+      # 把失败用例名以 annotation 报出。
+      - name: Report ctest failures
+        if: failure()
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          label: "Linux ${{ matrix.label }} ${{ matrix.build_type }}"
+
       - name: Verify installed package
         run: |
           cmake --install build --prefix "$PWD/build/install-root"
@@ -228,14 +236,6 @@ jobs:
       - name: Run unit tests
         timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
-
-      # 失败详情默认只存于 job 日志, 外部工具无法读取; 统一复用本地 action
-      # 把失败用例名以 annotation 报出。
-      - name: Report ctest failures
-        if: failure()
-        uses: ./.github/actions/ctest-failure-report
-        with:
-          label: "Linux ${{ matrix.label }} ${{ matrix.build_type }}"
 
       - name: Verify installed package
         run: |

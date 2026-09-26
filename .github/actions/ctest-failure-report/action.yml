@@ -32,8 +32,8 @@ runs:
         # 汇总段 "The following tests FAILED:" 只输出到控制台, 不在该文件里。
         failing=$(grep -E '\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | sed 's/^[[:space:]]*//' | head -n 10)
         if [ -z "$failing" ]; then
-          echo "::error::$LABEL: ctest exited non-zero without a recorded case result; log tail follows"
-          { echo "### $LABEL log tail"; echo '```'; tail -n 30 "$log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          tail_lines=$(tail -n 6 "$log" | tr '\n' ' ' | cut -c1-400)
+          echo "::error::$LABEL: ctest exited non-zero without a case result; log tail: $tail_lines"
           exit 0
         fi
         while IFS= read -r line; do
