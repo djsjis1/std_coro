@@ -51,11 +51,17 @@ runs:
           # gtest 崩溃/abort 时可能毫无失败输出: 取第一个测试节的尾部 1500 字符,
           # 崩溃消息 (assert stderr/信号说明) 位于节尾且无缓冲, 一定在这里。
           echo "::error::$LABEL section tail: $(awk 'NR==1,/2\/[0-9]+ Test/' "$log" | tail -c 1500 | tr '\n' '|')"
-          # 直接单跑失败用例拿真实退出码 (非 sanitizer 环境): brief 模式只打失败行
+          # 直接单跑失败用例拿真实退出码/崩溃栈 (非 sanitizer 环境)。
+          # 已证实 exit=139 (SIGSEGV), 有 gdb 时直接拿 backtrace 定位崩溃帧。
           if [ -z "$ASAN_OPTIONS$TSAN_OPTIONS" ] && [ -x "$BUILD_DIR/coro_tests" ]; then
-            timeout 60 "$BUILD_DIR/coro_tests" --gtest_filter='UringFailureTest.*' --gtest_brief=1 > /tmp/direct_run.log 2>&1
-            rc=$?
-            echo "::error::$LABEL direct run exit=$rc: $(tail -n 40 /tmp/direct_run.log | tr '\n' '|' | cut -c1-1300)"
+            if command -v gdb > /dev/null 2>&1; then
+              gdb -batch -ex run -ex "bt 12" --args "$BUILD_DIR/coro_tests" --gtest_filter='UringFailureTest.*' > /tmp/bt.log 2>&1
+              echo "::error::$LABEL gdb bt: $(grep -E '^#[0-9]+ |Program received|SIGSEGV' /tmp/bt.log | head -n 14 | tr '\n' '|' | cut -c1-1400)"
+            else
+              timeout 60 "$BUILD_DIR/coro_tests" --gtest_filter='UringFailureTest.*' --gtest_brief=1 > /tmp/direct_run.log 2>&1
+              rc=$?
+              echo "::error::$LABEL direct run exit=$rc: $(tail -n 40 /tmp/direct_run.log | tr '\n' '|' | cut -c1-1300)"
+            fi
           fi
         done <<< "$failing"
         # 失败用例自身的输出片段最能说明原因, 一并留到摘要
