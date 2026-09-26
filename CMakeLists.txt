@@ -31,37 +31,51 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# ---- 库 target: header-only INTERFACE 库 ----
-add_library(coro INTERFACE)
-add_library(coro::coro ALIAS coro)
+# ============================================================================
+# 库 target 分层 (header-only INTERFACE):
+#   coro::core — 纯协程核心, 不携带任何第三方头与 I/O 链接依赖
+#   coro::coro — 兼容入口, 在 core 之上追加原生 I/O 后端依赖
+# 依赖方向单向 (coro -> coro_core), 核心不得反向感知 net/fs/tls/http。
+# ============================================================================
+add_library(coro_core INTERFACE)
+add_library(coro::core ALIAS coro_core)
+# 导出名必须显式指定: ALIAS 不参与 install(EXPORT) 命名, 否则消费者拿到的是
+# coro::coro_core 而不是文档承诺的 coro::core。
+set_target_properties(coro_core PROPERTIES EXPORT_NAME core)
 
-target_include_directories(coro INTERFACE
+target_include_directories(coro_core INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_compile_features(coro INTERFACE cxx_std_20)
+target_compile_features(coro_core INTERFACE cxx_std_20)
+
+# Scheduler 线程设施属于核心, 与是否启用原生 I/O 无关
+if(UNIX)
+    target_link_libraries(coro_core INTERFACE pthread)
+endif()
+
+add_library(coro INTERFACE)
+add_library(coro::coro ALIAS coro)
+target_link_libraries(coro INTERFACE coro_core)
 
 if(MSVC)
-    target_compile_options(coro INTERFACE /utf-8 /EHsc)
+    target_compile_options(coro_core INTERFACE /utf-8 /EHsc)
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
-    target_compile_options(coro INTERFACE -fcoroutines)
+    target_compile_options(coro_core INTERFACE -fcoroutines)
 endif()
 
 # GCC 13 的 SLP 优化可能让协程帧函数指针引用已被丢弃的 COMDAT section。
 # 保留其余优化；通过生成器表达式让安装包按消费者的编译器版本应用规避。
 option(CORO_GCC13_COROUTINE_WORKAROUND "规避 GCC 13 协程链接错误（禁用 SLP 向量化）" ON)
 if(CORO_GCC13_COROUTINE_WORKAROUND)
-    target_compile_options(coro INTERFACE
+    target_compile_options(coro_core INTERFACE
         "$<$<AND:$<COMPILE_LANG_AND_ID:CXX,GNU>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,13>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,14>>:-fno-tree-slp-vectorize>")
 endif()
 
-# 平台链接库
+# 平台链接库: ws2_32 仅网络模块需要, 挂在兼容入口 coro 上
 set(CORO_HAS_URING OFF)
 if(WIN32)
     target_link_libraries(coro INTERFACE ws2_32)
-endif()
-if(UNIX)
-    target_link_libraries(coro INTERFACE pthread)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_URING)
     # io_uring 后端统一使用仓库内源码 (thirdparty/liburing), 不查找系统预装库:
@@ -265,7 +279,7 @@ endif()
 # ============================================================================
 # 安装与 find_package(coro CONFIG REQUIRED)
 # ============================================================================
-install(TARGETS coro EXPORT coroTargets)
+install(TARGETS coro coro_core EXPORT coroTargets)
 install(DIRECTORY include/coro DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT coroTargets

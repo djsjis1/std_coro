@@ -5,7 +5,9 @@
 #     构建为静态库并以 coro::uring 导出在 coroTargets.cmake 中 —— 消费端不需要、
 #     也不会去查找系统预装的 liburing;
 #   * Windows 仅链接系统库 ws2_32, 其他 POSIX 平台仅链接 pthread,
-#     这些由导出目标的 INTERFACE_LINK_LIBRARIES 自动带入。
+#     这些由导出目标的 INTERFACE_LINK_LIBRARIES 自动带入;
+#   * 只需要协程核心 (Task/调度/同步/定时器) 的消费者应链接 coro::core,
+#     它不携带任何原生 I/O 后端依赖; coro::coro 是其上的兼容入口。
 include("${CMAKE_CURRENT_LIST_DIR}/coroTargets.cmake")
 
 check_required_components(coro)

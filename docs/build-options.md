@@ -78,6 +78,21 @@ core (task/scheduler/sync/gather/...)        ← 零第三方依赖, 任何平�
 - `Web` 支持 `cmake -S Web` 独立构建（`CORO_WEB_BOOTSTRAP` 路径自动引入根工程），
   改动根 CMake 时必须保持这条路径可用。
 
+### 3.1 消费者目标：`coro::core` 与 `coro::coro`
+
+| 目标 | 携带内容 | 适用消费者 |
+|---|---|---|
+| `coro::core` | include 路径、`cxx_std_20`、MSVC/GCC 协程方言、GCC13 规避、`pthread` | 只用 Task/调度/同步/定时器；**不**继承 `liburing`、`ws2_32` |
+| `coro::coro` | `coro::core` + 原生 I/O 后端（Linux `coro::uring`、Windows `ws2_32`）与 `CORO_HAS_URING` | 使用 net/fs/pipe/process，或沿用旧代码 |
+
+- 依赖方向单向 `coro::coro → coro::core`，禁止反向；核心头不得 include 后端头
+  （`coro.hpp` 不含 IO 头，后端由 `event_loop.hpp` 按宏条件引入）。
+- 安装导出名由 `EXPORT_NAME` 显式指定：`add_library(ns::name ALIAS)` 不参与
+  `install(EXPORT)` 命名，不设则消费者拿到的是 `coro::coro_core`。
+- 回归门禁：`tests/core_smoke` 在**带 io_uring 的安装包**上配置 `coro::core` 消费者，
+  核心若把 `uring`/`ws2_32` 转交给消费者则配置期直接 `FATAL_ERROR`；Linux 与
+  Windows 的 "Verify installed package" 步骤均已纳入。
+
 ## 4. 第三方源码
 
 全部放在仓库既有的 `thirdparty/` 下，随仓库提供固定版本源码，**不查找系统
