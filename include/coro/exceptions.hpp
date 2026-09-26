@@ -32,6 +32,13 @@ namespace coro {
         BrokenPromiseError() : std::runtime_error("promise destroyed before completion") {}
     };
 
+    /// 结构化并发容器被按非法顺序使用: wait() 之后又 spawn、或重复 wait()。
+    /// 这属于调用顺序错误而非运行时故障, 单独成类型便于调用方精确断言。
+    class StructuredConcurrencyError : public std::runtime_error {
+      public:
+        explicit StructuredConcurrencyError(const std::string& message) : std::runtime_error(message) {}
+    };
+
     class ExceptionGroup : public std::runtime_error {
       public:
         explicit ExceptionGroup(std::vector<std::exception_ptr> exceptions)

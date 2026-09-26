@@ -160,3 +160,111 @@ TEST(TaskGroupTest, GroupDoneAfterWait) {
     test_util::run_task([&] { return post_failure_state(&group_done); });
     EXPECT_TRUE(group_done); // wait 后组进入终态
 }
+
+// ============================================================================
+// 组状态机 (计划 C3): open -> closing -> finished
+// ============================================================================
+
+namespace {
+
+    coro::Task<int> group_sleep_then(int ms, int value, std::atomic<int>* hits) {
+        co_await coro::sleep(std::chrono::milliseconds(ms));
+        hits->fetch_add(1);
+        co_return value;
+    }
+
+    coro::Task<> never_ends(std::atomic<int>* hits) {
+        co_await coro::sleep(30s);
+        hits->fetch_add(1);
+        co_return;
+    }
+
+    // wait() 之后仍 spawn: 必须被拒绝
+    coro::Task<> spawn_after_wait_throws(bool* rejected) {
+        coro::TaskGroup group;
+        std::atomic<int> hits{0};
+        group.spawn(group_sleep_then(1, 1, &hits));
+        co_await group.wait();
+        try {
+            group.spawn(group_sleep_then(1, 2, &hits));
+        } catch (const coro::StructuredConcurrencyError&) {
+            *rejected = true;
+        }
+        co_return;
+    }
+
+    // 重复 wait(): 第二个 waiter 会让第一个永久挂起, 因此直接拒绝
+    coro::Task<> double_wait_throws(bool* rejected) {
+        coro::TaskGroup group;
+        std::atomic<int> hits{0};
+        group.spawn(group_sleep_then(1, 1, &hits));
+        co_await group.wait();
+        try {
+            co_await group.wait();
+        } catch (const coro::StructuredConcurrencyError&) {
+            *rejected = true;
+        }
+        co_return;
+    }
+
+    // cancel() 后仍能 wait() 收尾; 长任务确实被取消唤醒
+    coro::Task<> cancel_then_wait_drains(std::atomic<int>* hits, bool* cancelled_out, int* ms_cost) {
+        coro::TaskGroup group;
+        group.spawn(never_ends(hits));
+        group.spawn(never_ends(hits));
+        const auto begin = std::chrono::steady_clock::now();
+        co_await coro::yield(); // 让子任务真正进入 sleep
+        group.cancel();
+        try {
+            co_await group.wait();
+        } catch (const coro::ExceptionGroup&) {
+            // 组内取消不应被聚合, 走到这里说明语义变了
+            *cancelled_out = false;
+            co_return;
+        } catch (const coro::CancelledError&) {
+        }
+        *cancelled_out = true;
+        *ms_cost = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+        co_return;
+    }
+
+    // accepts_new_tasks() 反映真实阶段
+    coro::Task<> phase_visible_through_api(bool* open_before, bool* open_after) {
+        coro::TaskGroup group;
+        *open_before = group.accepts_new_tasks();
+        co_await group.wait(); // 空组: 立即完成
+        *open_after = group.accepts_new_tasks();
+        co_return;
+    }
+
+} // namespace
+
+TEST(TaskGroupStateMachineTest, SpawnAfterWaitIsRejected) {
+    bool rejected = false;
+    test_util::run_task([&] { return spawn_after_wait_throws(&rejected); });
+    EXPECT_TRUE(rejected) << "wait() 之后 spawn 应抛 StructuredConcurrencyError";
+}
+
+TEST(TaskGroupStateMachineTest, SecondWaitIsRejected) {
+    bool rejected = false;
+    test_util::run_task([&] { return double_wait_throws(&rejected); });
+    EXPECT_TRUE(rejected) << "重复 wait() 会让第一个 waiter 永久挂起, 必须拒绝";
+}
+
+TEST(TaskGroupStateMachineTest, CancelStillAllowsWaitToFinish) {
+    std::atomic<int> hits{0};
+    bool ok = false;
+    int cost = 0;
+    test_util::run_task([&] { return cancel_then_wait_drains(&hits, &ok, &cost); });
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(hits.load(), 0) << "被取消的长任务不该跑到完成";
+    EXPECT_LT(cost, 2000) << "cancel 后 wait 未被关闭唤醒, 耗时 " << cost << "ms";
+}
+
+TEST(TaskGroupStateMachineTest, AcceptsNewTasksTracksPhase) {
+    bool open_before = false, open_after = true;
+    test_util::run_task([&] { return phase_visible_through_api(&open_before, &open_after); });
+    EXPECT_TRUE(open_before);
+    EXPECT_FALSE(open_after);
+}
