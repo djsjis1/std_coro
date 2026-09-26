@@ -1,5 +1,6 @@
 #pragma once
 
+#include "future.hpp"
 #include "io.hpp"
 #include "pipe.hpp"
 #include "task.hpp"
@@ -532,6 +533,8 @@ namespace coro {
 
 #endif
 
+// 便捷函数依赖上面按平台选定的 Process 实现, 两端都不成立时不得参与编译。
+#if defined(_WIN32) || defined(CORO_URING_ENABLED)
         // ==================================================================
         // 便捷函数 — 运行到退出并收集 stdout
         // ==================================================================
@@ -562,6 +565,7 @@ namespace coro {
             co_await std::move(reader);
             co_return std::make_pair(code, std::move(out));
         }
+#endif // _WIN32 || CORO_URING_ENABLED
 
     } // namespace process
 } // namespace coro

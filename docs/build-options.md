@@ -159,6 +159,10 @@ ctest --preset dev            # 等价于 ctest --test-dir build/dev --output-on
 2. 默认（`NATIVE_IO=ON`）+ `TESTS=ON`：全量单测；
 3. `-DCORO_ENABLE_WEB=ON`：Web 库/示例/Web 层测试；`URING=OFF` 时该组合必须配置期报错；
 4. `cmake -S Web`：独立构建路径；
-5. `--install` + `tests/package_smoke` 消费安装树；
-6. CI 四个 job 的 `-D` 组合与 `ctest` 注册保持一致（Web 自测是通过 `add_test`
+5. `--install` + `tests/package_smoke` 消费安装树；`tests/core_smoke` 以 `coro::core`
+   消费，验证纯核心消费者拿不到任何后端依赖；
+6. `coro_header_check`（`TESTS=ON` 时随 all 目标构建）在 `URING=OFF` 与原生两种配置下
+   都要通过：它给每个公共头生成一个独立 TU，专抓隐式 include 依赖与平台守卫边界外的
+   代码；新增公共头无需登记，glob 自动覆盖；
+7. CI 四个 job 的 `-D` 组合与 `ctest` 注册保持一致（Web 自测是通过 `add_test`
    挂在 `ctest` 下，不是独立步骤）。

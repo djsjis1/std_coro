@@ -249,6 +249,26 @@ if(CORO_BUILD_TESTS)
     endif()
     add_test(NAME coro_tests COMMAND coro_tests)
     set_tests_properties(coro_tests PROPERTIES TIMEOUT 120)
+
+    # ---- 公共头独立包含自检 ----
+    # 每个头文件单独成一个 TU, 抽出“靠 include 顺序碰巧能过”的隐式依赖。
+    # 生成物只进构建目录, 不污染源码树; 目标随 all 一起编译, 所以 CI 的
+    # "Build all targets" 就是它的门禁, 无需额外构建一轮。
+    file(GLOB CORO_PUBLIC_HEADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/coro/*.hpp)
+    set(CORO_HEADER_CHECK_SOURCES "")
+    foreach(header IN LISTS CORO_PUBLIC_HEADERS)
+        get_filename_component(header_name "${header}" NAME_WE)
+        file(GENERATE
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/header_check/${header_name}.cpp"
+            CONTENT "#include <coro/${header_name}.hpp>\n")
+        list(APPEND CORO_HEADER_CHECK_SOURCES
+            "${CMAKE_CURRENT_BINARY_DIR}/header_check/${header_name}.cpp")
+    endforeach()
+    add_library(coro_header_check OBJECT ${CORO_HEADER_CHECK_SOURCES})
+    target_link_libraries(coro_header_check PRIVATE coro::coro)
+    if(MSVC)
+        target_compile_options(coro_header_check PRIVATE /utf-8)
+    endif()
     if(TARGET web_server)
         add_test(NAME web_selftest COMMAND web_server --selftest 18081)
         set_tests_properties(web_selftest PROPERTIES
