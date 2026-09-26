@@ -46,12 +46,15 @@
 
 ## 构建、测试、安装
 
-```powershell
-cmake -S . -B build -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
-cmake --build build --config Debug --target coro_tests
-ctest --test-dir build -C Debug --output-on-failure
+第三方源码（googletest / llhttp / liburing）全部随仓库提供，不安装也不查找
+系统预装包；选项矩阵与分层约定见[构建选项与模块解耦约定](build-options.md)。
 
-cmake --install build --config Release --prefix <install-prefix>
+```powershell
+cmake --preset dev                               # 全特性 + 测试 + 示例 + 压测
+cmake --build --preset dev
+ctest --test-dir build/dev --output-on-failure      # Windows 多配置生成器加 -C <Config>
+
+cmake --install build/dev --config Release --prefix <install-prefix>
 ```
 
 安装后消费者可以使用：
@@ -61,14 +64,18 @@ find_package(coro CONFIG REQUIRED)
 target_link_libraries(app PRIVATE coro::coro)
 ```
 
-`router::router`、`coro::web`、Web/llhttp 和测试依赖仍属于源码树组件；
-`find_package(coro)` 只承诺核心 `coro::coro`，应用需要 Web 时应显式加入源码子目录。
+Linux 下 `coro::coro` 会连带导出仓库内构建的 `coro::uring`（静态），消费者无需
+额外的依赖解析。`router::router`、`coro::web`、Web/llhttp 和测试依赖仍属于
+源码树组件；`find_package(coro)` 只承诺核心 `coro::coro`，应用需要 Web 时应
+显式加入源码子目录。
 
 ## 尚未宣称的能力
 
 Linux 的 io_uring、macOS/其他 Unix、TLS、HTTP/2、流式响应和 sanitizer/TSAN
-结果不能由 Windows 构建推断。发布前应在目标平台重新配置、编译和执行测试；尤其
-需要验证 liburing 不可用时的配置行为、IOCP/取消竞态以及静态文件权限策略。
+结果不能由 Windows 构建推断。发布前应在目标平台重新配置、编译和执行测试。
+io_uring 后端已改为编译仓库内 `thirdparty/liburing` 源码；本机已验证该目录
+缺失时 `CORO_REQUIRE_URING=ON` 配置失败、默认下警告并降级为纯核心两条路径，
+仍需在目标内核上重新核对实际 I/O 行为、IOCP/取消竞态以及静态文件权限策略。
 Linux inotify 递归实现会初始遍历子目录，维护 wd 到相对路径的映射，
 并跟踪新建、移入和重命名的子目录；发布前仍需在 Linux 目标内核上做高频变更与
 `IN_Q_OVERFLOW` 压力验证。

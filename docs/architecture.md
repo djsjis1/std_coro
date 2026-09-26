@@ -3,7 +3,8 @@
 > 面向两类读者：想**给库贡献代码 / 改造库**的人，和想通过一个真实
 > 项目学习"**如何设计 C++20 协程框架**"的人。
 > 使用层面的问题请看 [API 参考](api-reference.md) 与 [教程](tutorial/README.md)；
-> 语言机制请看 [C++20 协程课程](cpp20-coroutines-course/README.md)。
+> 语言机制请看 [C++20 协程课程](cpp20-coroutines-course/README.md)；
+> 构建开关与模块解耦约定请看 [构建选项与模块解耦约定](build-options.md)。
 >
 > 库本体：`include/coro/` 下的 24 个 header-only 头文件；文档刻意不固化行数，
 > 避免每次实现调整都产生无意义的文档漂移。

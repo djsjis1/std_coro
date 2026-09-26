@@ -19,6 +19,7 @@
 | 性能调优 / 压测 | [性能指南](performance.md) |
 | 排查问题 | [FAQ 与故障排查](faq.md) |
 | 查看可验证质量基线 / 安装方式 | [质量基线与发布说明](quality-status.md) |
+| 改构建脚本 / 新增模块或三方依赖 | [构建选项与模块解耦约定](build-options.md) |
 | 了解后续计划 / 参与开发 | [路线图](roadmap.md) |
 
 ---
@@ -49,6 +50,8 @@
 - **[架构与源码剖析](architecture.md)** — 事件循环主循环逐行讲解、Task 的 promise_type 设计、
   取消机制的完整链条、三大事件源（IOCP / io_uring / CV）、include 依赖图、
   八大横切设计模式。想给库贡献代码或学习协程框架设计必读。
+- **[构建选项与模块解耦约定](build-options.md)** — CMake 选项矩阵、能力宏单一事实源、
+  模块依赖方向、thirdparty 源码集成范式、presets 与提交前必跑的验证组合。
 - **[性能指南](performance.md)** — 实测性能数据、协程成本模型、压测方法、调优建议。
 - **[Web 框架指南](web-framework.md)** — Web/ 目录的 HTTP 服务器：路由、动态参数、静态目录、
   优雅关停、压测；以及 router/radix_router.h 基数树路由的独立使用。
