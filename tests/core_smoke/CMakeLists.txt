@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(coro_core_smoke LANGUAGES CXX)
 
-find_package(coro CONFIG REQUIRED)
+find_package(coro CONFIG REQUIRED COMPONENTS core)
 
 add_executable(coro_core_smoke main.cpp)
 # 纯核心消费者: 只链接 coro::core, 用于证明核心不牵连任何原生 I/O 依赖。

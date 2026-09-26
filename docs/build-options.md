@@ -89,6 +89,9 @@ core (task/scheduler/sync/gather/...)        ← 零第三方依赖, 任何平�
   （`coro.hpp` 不含 IO 头，后端由 `event_loop.hpp` 按宏条件引入）。
 - 安装导出名由 `EXPORT_NAME` 显式指定：`add_library(ns::name ALIAS)` 不参与
   `install(EXPORT)` 命名，不设则消费者拿到的是 `coro::coro_core`。
+- `find_package(coro COMPONENTS ...)` 的组件名即导出目标名（`core`/`coro`/`web`…）；
+  请求安装包中不存在的组件在配置期直接失败并给出可操作原因，未请求的组件不会给消费者
+  带来任何链接依赖。
 - 回归门禁：`tests/core_smoke` 在**带 io_uring 的安装包**上配置 `coro::core` 消费者，
   核心若把 `uring`/`ws2_32` 转交给消费者则配置期直接 `FATAL_ERROR`；Linux 与
   Windows 的 "Verify installed package" 步骤均已纳入。

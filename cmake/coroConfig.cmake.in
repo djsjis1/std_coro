@@ -10,4 +10,17 @@
 #     它不携带任何原生 I/O 后端依赖; coro::coro 是其上的兼容入口。
 include("${CMAKE_CURRENT_LIST_DIR}/coroTargets.cmake")
 
+# 组件名即导出目标名: find_package(coro COMPONENTS core) 只校验所请求的目标是否存在。
+# 未被请求的组件不会给消费者带来任何链接依赖 (由 target 级依赖保证), 因此这里不再为
+# 组件单独 include 额外文件, 也不引入"按组件裁剪导出集"的二次机制。
+foreach(_coro_comp IN LISTS coro_FIND_COMPONENTS)
+    if(TARGET coro::${_coro_comp})
+        set(coro_${_coro_comp}_FOUND TRUE)
+    else()
+        set(coro_${_coro_comp}_FOUND FALSE)
+        set(coro_NOT_FOUND_MESSAGE
+            "component '${_coro_comp}' is not provided by this installation; rebuild with the matching CORO_ENABLE_* option, or request only the components you need")
+    endif()
+endforeach()
+
 check_required_components(coro)
