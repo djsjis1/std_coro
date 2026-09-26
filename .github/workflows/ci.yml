@@ -26,7 +26,9 @@ permissions:
 
 on:
   push:
-    branches: [main]
+    # 除 main 外, 未合并的特性/修复分支也自带 CI 证据
+    # (跨平台矩阵无法在本机复现, 分支级验证避开"未验证先入 main")
+    branches: [main, 'feat/**', 'fix/**', 'refactor/**']
   pull_request:
     branches: [main]
 
