@@ -45,9 +45,9 @@ runs:
           exit 0
         fi
         while IFS= read -r line; do
-          # 带出行号 + 该结果行前后各 6 行上下文 (gtest 的 [  FAILED  ] 用例名就在其中)
+          # 带出该结果行前 30 行的 gtest 失败输出 (含 [  FAILED  ] 用例名与 expected/actual)
           lineno=${line%%:*}
-          echo "::error::$LABEL failing case: $(sed -n "$((lineno-6)),$((lineno+6))p" "$log" | grep -vE '^[[:space:]]*$' | tr '\n' '|' | cut -c1-700)"
+          echo "::error::$LABEL failing case: $(sed -n "$((lineno-30)),$((lineno+4))p" "$log" | grep -vE '^[[:space:]]*$' | tr '\n' '|' | cut -c1-1500)"
         done <<< "$failing"
         # 失败用例自身的输出片段最能说明原因, 一并留到摘要
         {
