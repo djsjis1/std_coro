@@ -48,9 +48,9 @@ runs:
           # 带出该结果行前 30 行的 gtest 失败输出 (含 [  FAILED  ] 用例名与 expected/actual)
           lineno=${line%%:*}
           echo "::error::$LABEL failing case: $(sed -n "$((lineno-30)),$((lineno+4))p" "$log" | grep -vE '^[[:space:]]*$' | tr '\n' '|' | cut -c1-1500)"
-          # gtest 崩溃/abort 时可能毫无失败输出: 把第一个测试节整段带出, 里面保留
-          # 全部 stdout 与 ctest 记录的退出状态
-          echo "::error::$LABEL first test section: $(awk 'NR==1,/2\/[0-9]+ Test/' "$log" | tr '\n' '|' | cut -c1-1400)"
+          # gtest 崩溃/abort 时可能毫无失败输出: 取第一个测试节的尾部 1500 字符,
+          # 崩溃消息 (assert stderr/信号说明) 位于节尾且无缓冲, 一定在这里。
+          echo "::error::$LABEL section tail: $(awk 'NR==1,/2\/[0-9]+ Test/' "$log" | tail -c 1500 | tr '\n' '|')"
         done <<< "$failing"
         # 失败用例自身的输出片段最能说明原因, 一并留到摘要
         {
