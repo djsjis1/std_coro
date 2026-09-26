@@ -229,6 +229,24 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
+      # 失败详情只存在于 job 日志里, 外部工具无法读取; 把失败清单与输出尾部写进
+      # run 摘要, 便于定位是哪个用例在哪类平台/后端上挂掉。
+      - name: Attach failing tests to run summary
+        if: failure()
+        run: |
+          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
+          {
+            echo '### ctest failures'
+            echo '```'
+            if [ -n "$log" ]; then
+              sed -n '/The following tests FAILED/,$p' "$log"
+              grep -B1 -A12 '\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -120
+            else
+              echo 'LastTest.log not found'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify installed package
         run: |
           cmake --install build --config ${{ matrix.build_type }} --prefix "$env:GITHUB_WORKSPACE\build\install-root"
@@ -299,6 +317,22 @@ jobs:
         timeout-minutes: 10
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+      - name: Attach failing tests to run summary
+        if: failure()
+        run: |
+          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
+          {
+            echo "### ctest failures (${{ matrix.name }})"
+            echo '```'
+            if [ -n "$log" ]; then
+              sed -n '/The following tests FAILED/,$p' "$log"
+              grep -B1 -A20 'ERROR: \|SUMMARY: \|\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -160
+            else
+              echo 'LastTest.log not found'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ============================================================
   # 静态分析 (cppcheck)
   # ============================================================
@@ -366,6 +400,22 @@ jobs:
       - name: Run tests
         timeout-minutes: 5
         run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Attach failing tests to run summary
+        if: failure()
+        run: |
+          log=$(find build -name LastTest.log -print -quit 2>/dev/null)
+          {
+            echo '### ctest failures (coverage)'
+            echo '```'
+            if [ -n "$log" ]; then
+              sed -n '/The following tests FAILED/,$p' "$log"
+              grep -B1 -A12 '\*\*\*Failed\|\*\*\*Timeout' "$log" | tail -120
+            else
+              echo 'LastTest.log not found'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate coverage report
         run: |
