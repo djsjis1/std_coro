@@ -554,7 +554,10 @@ process 用例通过，Windows 侧无任何行为变化。
 > （`performance.md` §4.1 头号反模式）——用 `coro::to_thread` 把它桥到
 > 线程池（`thread.hpp`），事件循环线程只 `co_await` 结果。
 
-- [ ] **步骤 1｜实现 `resolve`**（`net.hpp` 两个平台段共用，放在平台
+- [x] **步骤 1｜实现 `resolve`**（已落地为**独立头 `dns.hpp`** 而非塞进 `net.hpp`：
+  `net.hpp` 要保持平台分段且不该拉进 `thread.hpp`; `dns.hpp` 依赖 task+thread+net,
+  在非原生网络配置下编译为空, 消费者不用 DNS 就零成本。见提交 5e287e7。原计划位置:
+  放在平台
   `#endif` 之后、`namespace net` 收尾之前）：
 
   ```cpp
@@ -612,7 +615,8 @@ process 用例通过，Windows 侧无任何行为变化。
   需要补的 include：`<netdb.h>`（Windows 是 `<ws2tcpip.h>`，已包含）+
   `<algorithm>`。
 
-- [ ] **步骤 2｜域名版 connect**。注意：现有 `TcpStream::connect(ip, port)` 是
+- [x] **步骤 2｜端点版 connect**（已实现 `coro::net::connect(resolved_endpoint)`，把端点适配回 `ip + port` 接口）。**未实现**的是"直接收域名的 connect 重载"：
+  调用方目前需显式 `resolve` 再 `connect`，这样能把"解析失败"与"连接失败"分开处理，不在连接里藏一次阻塞性解析。原步骤说明：现有 `TcpStream::connect(ip, port)` 是
   **同步构造 awaiter** 的静态函数，域名解析是异步的，塞不进去——新增协程版：
 
   ```cpp
@@ -636,7 +640,10 @@ process 用例通过，Windows 侧无任何行为变化。
   字面 IP 或 `"0.0.0.0"`），在 api-reference 里写明服务端如需域名解析，
   先 `co_await resolve()` 再把结果传给 `bind_listen`。
 
-- [ ] **步骤 3｜测试 `tests/test_dns.cpp`**：
+- [x] **步骤 3｜测试已落地** `tests/test_dns.cpp`（4 例全通过）。两点与计划不同：
+  失败用例改用**非法服务名**而非"未知主机"（本机存在把任意域名含 .invalid 解析到
+  198.18.0.8 的拦截器，用主机名断言会变成分环境偶发）；守卫必须放在 include 之后，
+  因为 `CORO_HAS_DNS` 由 `dns.hpp` 自己定义。计划原文：
   - `"localhost"` 解析结果包含 `127.0.0.1`（Linux 读 /etc/hosts，离线可测）；
   - `connect_host("localhost", port)` 连上本机 echo 服务并完成一轮收发；
   - 解析不存在的域名（`"no.such.host.invalid"`）返回空列表且
@@ -644,7 +651,9 @@ process 用例通过，Windows 侧无任何行为变化。
   - 在线用例（解析公网域名）用环境变量门控，默认跳过：
     `if (!std::getenv("CORO_NET_TEST_ONLINE")) GTEST_SKIP();`
 
-- [ ] **步骤 4｜验证 + 文档**：同 1.1 步骤 5；api-reference「网络 net.hpp」
+- [x] **步骤 4｜验证 + 文档已完成**：DnsTest 4/4、`example_dns` 退出码 0、全量测试
+  通过、clang-format 18 全项目干净；api-reference 新增独立「异步 DNS dns.hpp」一节
+  （含 v1 只返回 IPv4、无超时/重试/SRV、c-ares 作可选增强等边界）。计划原文：同 1.1 步骤 5；api-reference「网络 net.hpp」
   节补 `resolve` / `connect_host`；tutorial 第 6 讲连接示例改用域名。
 
 ---
