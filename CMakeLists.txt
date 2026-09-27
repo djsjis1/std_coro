@@ -214,6 +214,12 @@ if(CORO_ENABLE_CONCURRENCY_EXT)
     target_link_libraries(example_shield PRIVATE coro::coro)
 endif()
 
+# 流适配示例: 需要真实 socket 与 pipe, 因此与网络能力同进同出
+if(CORO_HAS_NET)
+    add_executable(example_stream examples/stream_demo.cpp)
+    target_link_libraries(example_stream PRIVATE coro::coro)
+endif()
+
 if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
     add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
     target_link_libraries(web_shutdown_check PRIVATE coro::web)

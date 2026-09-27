@@ -17,6 +17,7 @@
 - [通道 channel.hpp](#通道-channelhpp)
 - [多路等待 select.hpp](#多路等待-selecthpp)
 - [限流 rate_limit.hpp](#限流-ratelimithpp)
+- [字节流 stream.hpp](#字节流-streamhpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -365,6 +366,47 @@ auto ms = rl.retry_after<std::chrono::milliseconds>(1); // 给上层回 429 Retr
 
 与 `coro::Semaphore` 的分工：Semaphore 限"**同时**在途数量"（并发度），令牌桶限"**速率**"
 并允许突发。要"最多 N 个并发"用 Semaphore，要"每秒 N 次"用 rate_limiter。
+
+## 字节流 stream.hpp
+
+> 只依赖核心与 `io.hpp`；`#include <coro/stream.hpp>`。作用：把 `TcpStream`/`PipeEnd`/未来的
+> TLS 流上“一次 N 字节”的裸读裸写，包成协议层常用的“读一行 / 读满定长 / 全量写出”。
+
+```cpp
+coro::net::TcpStream sock = co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
+coro::stream_reader  reader(sock);        // 不接管所有权: sock 必须活得比 reader 久
+coro::stream_writer  writer(sock);
+
+while (auto line = co_await reader.read_line()) handle(*line);
+co_await writer.write_all("PING\r\n");
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `read_line()` | 到下一个 LF（CR LF / 单 LF 均可，行尾不进结果）；`nullopt` = 已结束且无残留 |
+| `read_until(delim)` | 自定义分隔符（分隔符自己吞掉）；尾部无分隔符的残段会作为最后一段交出 |
+| `read_some(dst, n)` | 只要读到 ≥1 字节就返回（短读被吸收）；`nullopt` = EOF |
+| `read_exactly(dst, n)` | 读满 n；凑不齐就结束 → 抛 `IncompleteStreamError`（带 `requested`/`received`） |
+| `write_all(data, n)` | `true` = 全写完；`false` = 对端不可写（**已写出的部分不回退**，调用方需知道协议已不一致） |
+| `write_line(s)` | `write_all(s)` + 一个 LF |
+| `buffered()` | 已缓冲未消费字节数（跨次调用不丢数据） |
+
+四种结局严格可区分（本层的核心合同，测试逐条锁定）：
+
+| 情形 | 表现 |
+| --- | --- |
+| 对端正常结束 | `nullopt`（read_*）/ `false`（write_* 进不动了） |
+| IO 错误 | 抛 `std::system_error`（`errno` 与 `io::last_error()` 已填好） |
+| 被取消 | 抛 `CancelledError`（由 Task 的取消注入负责，本层不拦） |
+| 要求读满却提前结束 | 抛 `IncompleteStreamError` |
+
+另有“零进展写入”（`write` 返回 0）专门作为 `false` 返回而不是继续循环——它意味着对端
+已不可写，继续转就是死循环。
+
+多态方式选模板而非基类：`AsyncReadable`/`AsyncWritable` 只看得到两个方法，但每个方法都是
+awaitable——用虚函数擦除就得让虚函数返回类型擦除的 awaiter，代价与复杂度都不划算；按
+`Source` 模板化既零开销，也不会催生一个“什么都能包”的巨大基类。已有类型 `TcpStream`、
+`PipeEnd` 直接满足这两个 concept，无需适配。
 
 ## 并发组合 gather.hpp / wait.hpp
 

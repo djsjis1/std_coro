@@ -508,7 +508,7 @@ loop-per-thread），而非 Go 式 work-stealing。收益：
 第 0 层 (无内部依赖):   exceptions.hpp, event_source.hpp
 第 1 层:   iocp_event_source [WIN32] / uring_event_source [Linux] ─┐
            event_loop.hpp ◄────────────────────────────────────────┘
-第 2 层:   task.hpp, sleep.hpp, future.hpp, io.hpp
+第 2 层:   task.hpp, sleep.hpp, future.hpp, io.hpp, stream.hpp
 第 3 层:   sync.hpp, gather.hpp, schedule.hpp, wait.hpp, task_group.hpp,
            thread.hpp, scheduler.hpp, net.hpp,
            timer.hpp, context.hpp, channel.hpp, select.hpp, rate_limit.hpp,

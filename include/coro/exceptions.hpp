@@ -39,6 +39,31 @@ namespace coro {
         explicit StructuredConcurrencyError(const std::string& message) : std::runtime_error(message) {}
     };
 
+    /// 流上"要求读满 N 字节, 但对端在凑够之前正常关闭"。
+    /// 它必须与三种情况各自可区分: 对端正常 EOF(返回 nullopt/false)、IO 错误(-1 + 错误码)、
+    /// 被取消(CancelledError)。把它们混成一个异常会让调用方的重试/丢弃决策失去依据。
+    class IncompleteStreamError : public std::runtime_error {
+      public:
+        IncompleteStreamError(size_t wanted, size_t got)
+            : std::runtime_error("stream ended after " + std::to_string(got) + " of " + std::to_string(wanted) +
+                                 " byte(s)"),
+              requested(wanted), received(got) {}
+
+        size_t requested; ///< 本来要读多少
+        size_t received;  ///< 实际拿到多少 (可能是 0)
+    };
+
+    /// 在缓冲上限内始终找不到分隔符。没它的话"按行/按分隔符读"在遇到一行超长的
+    /// 恶意或损坏数据时会无界吃内存 —— 有界背压要求上限必须存在且可预期。
+    class StreamOverflowError : public std::runtime_error {
+      public:
+        explicit StreamOverflowError(std::size_t limit)
+            : std::runtime_error("delimiter not found within " + std::to_string(limit) + " buffered bytes"),
+              limit(limit) {}
+
+        std::size_t limit; ///< 当时生效的缓冲上限
+    };
+
     class ExceptionGroup : public std::runtime_error {
       public:
         explicit ExceptionGroup(std::vector<std::exception_ptr> exceptions)
