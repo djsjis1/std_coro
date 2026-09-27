@@ -34,7 +34,9 @@ int main() {
         }
         auto acceptor = coro::spawn(accept_one(&listener));
 
-        auto eps = co_await coro::net::resolve("localhost", std::to_string(port));
+        // 用数字主机: Windows 的解析器会把 localhost 优先返回 ::1, 被 v4 过滤器滤掉后
+        // 结果为空 —— 那属于 OS 行为差异, 不是本模块要验证的东西
+        auto eps = co_await coro::net::resolve("127.0.0.1", std::to_string(port));
         std::cout << "resolved " << eps.size() << " endpoint(s)" << std::endl;
         for (const auto& ep : eps)
             std::cout << "  " << ep.address << ':' << ep.port << std::endl;
