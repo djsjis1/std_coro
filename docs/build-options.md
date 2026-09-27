@@ -12,7 +12,9 @@
 | `CORO_ENABLE_NATIVE_IO`           | Windows/Linux`ON`，其他平台 `OFF` | 原生 I/O 总开关；关闭时核心走`CVEventSource`，网络/文件/管道/监视/进程模块全部不构建 |
 | `CORO_ENABLE_URING`               | `ON`                              | Linux 的 io_uring 后端（依赖`NATIVE_IO`）。关闭即纯协程核心                          |
 | `CORO_REQUIRE_URING`              | `OFF`                             | `ON` 时 io_uring 后端不可用直接配置失败，禁止静默降级；`OFF` 时只警告                |
+| `CORO_REQUIRE_TLS` | `OFF` | 要求 `thirdparty/openssl` 源码存在，缺失时配置期 `FATAL_ERROR`；`OFF` 时降级为警告并置 `CORO_HAS_TLS=0` |
 | `CORO_ENABLE_WEB`                 | `OFF`                             | `coro::web` 静态库、`web_server` 示例与 Web 层测试的唯一开关                         |
+| `CORO_ENABLE_TLS` | `OFF` | 构建 `coro::tls`；只用仓库内 `thirdparty/openssl` 源码，配置期不联网、不查系统 OpenSSL |
 | `CORO_ENABLE_CONCURRENCY_EXT`     | `OFF`                             | 并发工具扩展（`timer.hpp`/`context.hpp`/后续的 Channel、select 等）与其测试；只依赖纯核心，零第三方 |
 | `CORO_BUILD_TESTS`                | `OFF`                             | googletest 与`coro_tests`                                                            |
 | `CORO_BUILD_EXAMPLES`             | `OFF`                             | `examples/`、`tcp_udp` 示例、根 `main.cpp` 练习场                                    |

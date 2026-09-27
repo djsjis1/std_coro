@@ -22,6 +22,8 @@ option(CORO_ENABLE_NATIVE_IO "启用 Windows/Linux 原生 I/O 后端与基础 I/
 option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
 option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止静默回退" OFF)
 option(CORO_ENABLE_WEB "构建 Web 服务框架 (coro::web 与 web_server)" OFF)
+option(CORO_ENABLE_TLS "构建 coro::tls (依赖仓库内 OpenSSL 源码)" OFF)
+option(CORO_REQUIRE_TLS "配置时要求 thirdparty/openssl 源码可用, 禁止静默降级" OFF)
 # 并发工具扩展 (Timer/Context/Channel/select/...): 只依赖纯核心, 零第三方
 option(CORO_ENABLE_CONCURRENCY_EXT "启用新增并发工具头与对应测试" OFF)
 if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING))
@@ -109,6 +111,30 @@ endif()
 target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
 # 并发扩展能力同样单点派生: 关闭时相关实现与测试整体不参与编译 (不是只屏蔽几个调用点)
 target_compile_definitions(coro INTERFACE CORO_HAS_CONCURRENCY_EXT=$<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}>)
+
+# TLS: 与 io_uring 同一套语义 —— 只用仓库内 OpenSSL 源码, 配置期绝不联网、不查系统
+# 预装开发库; 缺源码时 REQUIRE_TLS=ON 直接失败, 否则警告并降级 (CORO_HAS_TLS=0)。
+# 关闭开关时下面整段不参与: 不 add_subdirectory、不探测 Perl/NASM、不注册测试与示例。
+set(CORO_HAS_TLS OFF)
+if(CORO_ENABLE_TLS)
+    if(NOT CORO_HAS_URING AND NOT WIN32)
+        # TLS 需要真正的 socket 后端 (Linux 走 io_uring, Windows 走 IOCP)。
+        message(WARNING "CORO_ENABLE_TLS=ON 但原生网络不可用 (需要 Linux+io_uring 或 Windows); TLS 已禁用。")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/openssl/CMakeLists.txt")
+        add_subdirectory(thirdparty/openssl)
+        set(CORO_HAS_TLS ON)
+        target_link_libraries(coro INTERFACE openssl_ssl openssl_crypto)
+        message(STATUS "TLS backend: in-tree OpenSSL source (thirdparty/openssl)")
+    else()
+        if(CORO_REQUIRE_TLS)
+            message(FATAL_ERROR
+                "thirdparty/openssl source is missing; restore it or set CORO_ENABLE_TLS=OFF")
+        endif()
+        message(WARNING "thirdparty/openssl source not found: coro::tls 已禁用 (CORO_HAS_TLS=0)。")
+    endif()
+endif()
+# TLS 能力单点派生: 头文件与测试只用 defined(CORO_HAS_TLS) && CORO_HAS_TLS 判定。
+target_compile_definitions(coro INTERFACE CORO_HAS_TLS=$<BOOL:${CORO_HAS_TLS}>)
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router
 add_subdirectory(router)

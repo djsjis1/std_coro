@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -17,7 +21,9 @@
       "name": "core",
       "displayName": "纯协程核心（无原生 I/O，零第三方依赖）",
       "inherits": "base",
-      "cacheVariables": { "CORO_ENABLE_NATIVE_IO": "OFF" }
+      "cacheVariables": {
+        "CORO_ENABLE_NATIVE_IO": "OFF"
+      }
     },
     {
       "name": "native",
@@ -32,7 +38,20 @@
       "name": "web",
       "displayName": "Web 服务框架（coro::web + web_server）",
       "inherits": "native",
-      "cacheVariables": { "CORO_ENABLE_WEB": "ON" }
+      "cacheVariables": {
+        "CORO_ENABLE_WEB": "ON"
+      }
+    },
+    {
+      "name": "tls",
+      "displayName": "原生 I/O + TLS (仓库内 OpenSSL 源码)",
+      "inherits": "native",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CORO_ENABLE_TLS": "ON",
+        "CORO_REQUIRE_TLS": "ON"
+      },
+      "description": "要求 thirdparty/openssl 源码存在, 缺失时配置期直接失败 (不联网、不回退系统库)"
     },
     {
       "name": "dev",
@@ -50,22 +69,40 @@
     }
   ],
   "buildPresets": [
-    { "name": "core", "configurePreset": "core", "jobs": 2 },
-    { "name": "native", "configurePreset": "native", "jobs": 2 },
-    { "name": "web", "configurePreset": "web", "jobs": 2 },
+    {
+      "name": "core",
+      "configurePreset": "core",
+      "jobs": 2
+    },
+    {
+      "name": "native",
+      "configurePreset": "native",
+      "jobs": 2
+    },
+    {
+      "name": "web",
+      "configurePreset": "web",
+      "jobs": 2
+    },
     {
       "name": "dev",
       "configurePreset": "dev",
       "jobs": 2,
-      "targets": ["all"]
+      "targets": [
+        "all"
+      ]
     }
   ],
   "testPresets": [
     {
       "name": "dev",
       "configurePreset": "dev",
-      "output": { "outputOnFailure": true },
-      "execution": { "timeout": 120 }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 120
+      }
     }
   ]
 }

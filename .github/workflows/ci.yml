@@ -248,7 +248,18 @@ jobs:
         # 所以把输出留档 (Tee 会让 pwsh 的最后一条命令变成 Tee-Object, 必须显式回传
         # ctest 的退出码, 否则作业会被误判为成功)。
         run: |
-          ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120 2>&1 |
+          # 上一轮证据: build 里有 CTestTestfile.cmake 却没有 Testing/, 而 CTest 一启动
+          # 就会创建它 => ctest 从未真正跑起来。先把它到底找不找得到说清楚: 找不到就直接
+          # 报一条明确的 annotation (而不是留下一个无法解释的 exit 1); 找到就用绝对路径
+          # 调用, 顺带排除 PATH 差异。
+          $ctest = (Get-Command ctest -ErrorAction SilentlyContinue)
+          if (-not $ctest) {
+            "::error::Windows ctest NOT FOUND on PATH"
+            exit 1
+          }
+          "::notice::Windows ctest at $($ctest.Source)"
+          $ctestExe = $ctest.Source
+          & $ctestExe --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120 2>&1 |
             Tee-Object -FilePath ctest-console.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
