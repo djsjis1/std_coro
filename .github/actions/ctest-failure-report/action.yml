@@ -50,6 +50,13 @@ runs:
               echo "::warning::$LABEL missing: $entry"
             fi
           done
+          # Windows 已确认 build 存在而 build/Testing 不存在, 说明 ctest 把 Testing 写到
+          # 了别处 (多配置生成器的布局差异)。把 build 顶层列出来, 一次推送问出真实路径。
+          for entry in "$BUILD_DIR"/*; do
+            if [ -e "$entry" ]; then
+              echo "::warning::$LABEL build entry: $entry"
+            fi
+          done
           exit 0
         fi
         # 一个 ctest 目标里可能跑几百个用例, 只报目标名定位不到问题 ——
