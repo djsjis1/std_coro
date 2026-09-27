@@ -209,6 +209,9 @@ if(CORO_ENABLE_CONCURRENCY_EXT)
 
     add_executable(example_rate_limit examples/rate_limit_demo.cpp)
     target_link_libraries(example_rate_limit PRIVATE coro::coro)
+
+    add_executable(example_shield examples/shield_demo.cpp)
+    target_link_libraries(example_shield PRIVATE coro::coro)
 endif()
 
 if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)

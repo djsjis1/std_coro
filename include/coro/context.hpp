@@ -43,11 +43,49 @@ namespace coro {
             std::mutex mutex;
             std::atomic<bool> cancelled{false};
             std::vector<std::pair<std::coroutine_handle<>, EventLoop*>> waiters;
+            // 屏蔽作用域计数与延后标记都由 mutex 保护 (与 waiters 同一把锁):
+            // 把它们放进 state 而不是放进协程帧, 是因为"当前哪个协程在跑"没法在
+            // 唤醒/取消路径上可靠得知 —— 屏蔽的是**这个源**, 作用域由 RAII 对象决定。
+            int shield_depth = 0;
+            bool deferred_cancel = false;
 
             /// 终态单选: 只有第一次 cancel 返回 true
             bool claim_cancel() noexcept {
                 bool expected = false;
                 return cancelled.compare_exchange_strong(expected, true);
+            }
+
+            /// 带屏蔽判断的申领: 处于 shield 作用域内时**只记账不生效**, 返回 false
+            /// 表示"这次取消被延后", 调用方因此既不置 cancelled 也不唤醒等待者。
+            bool claim_cancel_shielded() {
+                std::lock_guard lock(mutex);
+                if (shield_depth > 0) {
+                    deferred_cancel = true;
+                    return false;
+                }
+                if (cancelled.load(std::memory_order_acquire))
+                    return false;
+                cancelled.store(true, std::memory_order_release);
+                return true;
+            }
+
+            void shield_enter() {
+                std::lock_guard lock(mutex);
+                ++shield_depth;
+            }
+
+            /// 返回 true = 最后一个屏蔽作用域退出且期间有过取消请求, 调用方应当立即
+            /// 把它落实 (置终态 + 唤醒等待者)。
+            bool shield_exit() {
+                std::lock_guard lock(mutex);
+                if (shield_depth > 0)
+                    --shield_depth;
+                if (shield_depth == 0 && deferred_cancel) {
+                    deferred_cancel = false;
+                    bool expected = false;
+                    return cancelled.compare_exchange_strong(expected, true);
+                }
+                return false;
             }
 
             /// 摘一个等待者交给调用方唤醒 (每个等待者至多被摘走一次)
@@ -145,6 +183,8 @@ namespace coro {
 
     } // namespace detail
 
+    class cancellation_shield;
+
     /// 取消令牌: 观察取消是否发生, 并可挂起等待取消
     class CancellationToken {
       public:
@@ -173,16 +213,26 @@ namespace coro {
         CancellationSource(const CancellationSource&) = default;
         CancellationSource& operator=(const CancellationSource&) = default;
 
-        /// 发起取消: 非阻塞, 任意线程可调, 重复调用无副作用
+        /// 发起取消: 非阻塞, 任意线程可调, 重复调用无副作用。
+        /// 若当前有 cancellation_shield 作用域生效, 取消会被延后到最后一个作用域退出。
         void cancel() const {
-            if (!state_->claim_cancel())
+            if (!state_->claim_cancel_shielded())
                 return;
+            wake_waiters();
+        }
+
+        /// 把全部等待者摘走并投递回各自的 EventLoop 唤醒 (取消只发生一次, 摘链即消费)
+        void wake_waiters() const {
             std::pair<std::coroutine_handle<>, EventLoop*> waiter{};
             while (state_->take_waiter(waiter)) {
                 if (waiter.second != nullptr)
                     waiter.second->schedule(waiter.first);
             }
         }
+
+        /// 进入屏蔽作用域: 作用域存续期间本源的 cancel() 不产生终态, 退出时补发。
+        /// 用途是"清理/提交这类步骤不能被取消打断"。嵌套支持, 计数归零才生效。
+        cancellation_shield make_shield() const;
 
         bool cancelled() const noexcept { return state_->cancelled.load(); }
 
@@ -263,5 +313,45 @@ namespace coro {
         std::shared_ptr<detail::cancellation_state> state_;
         std::optional<time_point> deadline_;
     };
+
+    /// 取消屏蔽作用域: 存续期间所属 CancellationSource 的 cancel() 被延后, 而不是
+    /// 立刻在下一个 await 点抛 CancelledError。不可拷贝也不可移动 —— 它就是作用域本身,
+    /// 复制会让"退出时机"变得含混。
+    class cancellation_shield {
+      public:
+        cancellation_shield(const cancellation_shield&) = delete;
+        cancellation_shield& operator=(const cancellation_shield&) = delete;
+
+        /// 允许移动: 构造函数只对 CancellationSource 开放, 调用方需要它能把它存进
+        /// 自己的变量/容器。移出后本作用域立即失效 (析构不再补发), 语义仍然单点。
+        cancellation_shield(cancellation_shield&& other) noexcept : state_(std::move(other.state_)) {}
+        cancellation_shield& operator=(cancellation_shield&&) = delete;
+
+        /// 析构: 若是最后一层且期间有取消请求, 立即补发 (置终态 + 唤醒等待者)
+        ~cancellation_shield() {
+            if (state_ && state_->shield_exit()) {
+                std::pair<std::coroutine_handle<>, EventLoop*> waiter{};
+                while (state_->take_waiter(waiter)) {
+                    if (waiter.second != nullptr)
+                        waiter.second->schedule(waiter.first);
+                }
+            }
+        }
+
+        /// 当前是否仍处于被屏蔽的状态 (供需要自我约束的代码查询)
+        bool active() const noexcept { return static_cast<bool>(state_); }
+
+      private:
+        friend class CancellationSource;
+        explicit cancellation_shield(std::shared_ptr<detail::cancellation_state> st) : state_(std::move(st)) {
+            if (state_)
+                state_->shield_enter();
+        }
+        std::shared_ptr<detail::cancellation_state> state_;
+    };
+
+    inline cancellation_shield CancellationSource::make_shield() const {
+        return cancellation_shield{state_};
+    }
 
 } // namespace coro

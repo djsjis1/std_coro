@@ -239,6 +239,28 @@ src.cancel();                               // 非阻塞, 可从任意线程调�
 - 默认构造的 `CancellationToken` 视为**已取消**——它不可能再有人 cancel，定为
   "永不取消"会静默吞掉本该发生的取消。
 
+### 取消屏蔽 `cancellation_shield`
+
+```cpp
+co_await ctx.wait_and_save();                 // 假设: 中间步骤
+{
+    auto guard = src.make_shield();           // 作用域内本源的 cancel() 被延后
+    co_await commit_irreversible_step();      // 这一步不该被取消打断
+}                                             // 退出时若期间有 cancel 请求, 立即补发
+```
+
+| 行为 | 语义 |
+| --- | --- |
+| 作用域内 `src.cancel()` | 只记账：`token.cancelled()` 仍为 `false`，等待者不被唤醒 |
+| 最后一个作用域退出 | 补发取消：置终态并按各等待者的 loop 投递唤醒 |
+| 嵌套 | 按计数，最外层退出才生效 |
+| `Context::wait()` 的 deadline | **不受屏蔽影响**：只延后"取消"，超时照常报 `TimeoutError` |
+| 不使用屏蔽时 | 与原先完全一致（取消立即置终态） |
+
+注意它屏蔽的是**某个源**的取消，作用域由 RAII 对象决定；这与 `asyncio.shield(task)`
+"保护被 await 的那个任务"角度不同，本库的上下文是显式传递的，所以按源屏蔽更自洽。
+对象可移动、不可拷贝，也不提供赋值——避免"退出时机"被复制搞混。
+
 ## 通道 channel.hpp
 
 > 并发扩展（需 `-DCORO_ENABLE_CONCURRENCY_EXT=ON`），不进聚合头：`#include <coro/channel.hpp>`。
