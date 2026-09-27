@@ -218,6 +218,9 @@ endif()
 if(CORO_HAS_NET)
     add_executable(example_stream examples/stream_demo.cpp)
     target_link_libraries(example_stream PRIVATE coro::coro)
+
+    add_executable(example_dns examples/dns_demo.cpp)
+    target_link_libraries(example_dns PRIVATE coro::coro)
 endif()
 
 if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)

@@ -514,7 +514,7 @@ loop-per-thread），而非 Go 式 work-stealing。收益：
            timer.hpp, context.hpp, channel.hpp, select.hpp, rate_limit.hpp,
            task_registry.hpp  (并发扩展, 不进聚合头)
 第 4 层:   queue.hpp, fs.hpp, pipe.hpp, signal.hpp, fs_watch.hpp
-第 5 层:   process.hpp
+第 5 层:   process.hpp, dns.hpp (依赖 net + thread; 非原生网络配置下编译为空)
 第 6 层:   coro.hpp (聚合核心 + 并发; 不含 IO 模块)
 ```
 

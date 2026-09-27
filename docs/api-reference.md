@@ -18,6 +18,7 @@
 - [多路等待 select.hpp](#多路等待-selecthpp)
 - [限流 rate_limit.hpp](#限流-ratelimithpp)
 - [字节流 stream.hpp](#字节流-streamhpp)
+- [异步 DNS dns.hpp](#异步-dns-hpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -407,6 +408,37 @@ co_await writer.write_all("PING\r\n");
 awaitable——用虚函数擦除就得让虚函数返回类型擦除的 awaiter，代价与复杂度都不划算；按
 `Source` 模板化既零开销，也不会催生一个“什么都能包”的巨大基类。已有类型 `TcpStream`、
 `PipeEnd` 直接满足这两个 concept，无需适配。
+
+## 异步 DNS dns.hpp
+
+> `#include <coro/dns.hpp>`。仅在具备原生网络的构建里有效（Windows 或 Linux+io_uring，
+> 由头内 `CORO_HAS_DNS` 自行判定）；纯核心配置下它编译为空，不给消费者添依赖。
+
+```cpp
+auto eps = co_await coro::net::resolve("example.com", "80");   // 不占用事件循环线程
+if (eps.empty()) { /* 查不到地址: 不算错误 */ }
+auto sock = co_await coro::net::connect(eps[0]);               // 端点直接可连
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `resolve(host, service)` | 协程；返回 `vector<resolved_endpoint>`；失败抛 `DnsResolutionError`（带 `getaddrinfo` 返回码） |
+| `connect(endpoint)` | 按解析结果建立 `TcpStream`（把端点适配回 `ip + port` 接口） |
+| `resolved_endpoint` | `address`（点分 IPv4）、`port`（**主机字节序**）、`canonical_name`（可能为空） |
+
+实现取舍与边界（都写进了头文件注释）：
+
+- `getaddrinfo` 是同步阻塞调用（查 DNS、读 hosts、走 nsswitch），在事件循环线程上直接调
+  会让整个 loop 停摆，一个慢 DNS 服务器就能拖死所有连接；因此交给**已有的** `to_thread`
+  线程池，不新增依赖也不引入第二套调度器。
+- 代价如实说明：这不是真异步——一次慢解析会占住一个线程池线程；无解析超时、无重试、
+  无 SRV。需要这些时把 c-ares 作为**可选增强**源码化进 `thirdparty/` 并用开关门控
+  （接口不变、只换实现）。
+- **v1 只返回 IPv4**：`net.hpp` 目前只构造 `sockaddr_in`，返回 v6 地址等于交给调用方一个
+  连不上的东西；等 `net.hpp` 支持 `sockaddr_in6` 再放开。
+- 不做结果缓存与 happy-eyeballs 排序（属连接池 / HTTP Client 层策略），不做反向解析。
+- 测试刻意用**非法服务名**触发失败而非"未知主机"：本机存在把任意域名（含 RFC 6761 保留的
+  `.invalid`）解析到 198.18.0.8 的拦截器，用主机名断言会变成分环境偶发。
 
 ## 并发组合 gather.hpp / wait.hpp
 
