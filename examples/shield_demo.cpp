@@ -13,7 +13,7 @@ using namespace std::chrono_literals;
 coro::Task<> critical_section(coro::CancellationSource* src, std::atomic<int>* steps) {
     {
         auto guard = src->make_shield(); // 作用域内本源的取消被延后
-        src->cancel();                  // 模拟"用户在这会儿按了取消"
+        src->cancel();                   // 模拟"用户在这会儿按了取消"
         std::cout << "inside shield: cancelled=" << src->token().cancelled() << std::endl;
         for (int i = 0; i < 3; ++i) {
             co_await coro::sleep(5ms); // 不可中断的提交步骤

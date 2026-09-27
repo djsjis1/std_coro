@@ -245,6 +245,14 @@ jobs:
         timeout-minutes: 5
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
+      # 与 Linux 同样接上报通道: 之前 Windows 只有退出码, 定位不到是哪条用例
+      - name: Report ctest failures
+        if: failure()
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          build-dir: build
+          label: Windows ${{ matrix.build_type }}
+
       - name: Verify installed package
         run: |
           cmake --install build --config ${{ matrix.build_type }} --prefix "$env:GITHUB_WORKSPACE\build\install-root"
