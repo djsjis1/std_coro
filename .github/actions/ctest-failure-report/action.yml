@@ -31,6 +31,20 @@ runs:
           echo "::warning::$LABEL: LastTest.log not found, nothing to report"
           exit 0
         fi
+        # 一个 ctest 目标里可能跑几百个用例, 只报目标名定位不到问题 ——
+        # gtest 的失败行与 sanitizer 的诊断行才是可用粒度。
+        gtest_failed=$(grep -oE '^\[  FAILED  \] [A-Za-z0-9_./-]+' "$log" | sort -u | head -n 12)
+        if [ -n "$gtest_failed" ]; then
+          while IFS= read -r g; do
+            echo "::error::$LABEL gtest failure: ${g#*] }"
+          done <<< "$gtest_failed"
+        fi
+        san_err=$(grep -oE '(ERROR: AddressSanitizer|ERROR: LeakSanitizer|runtime error): [^[:cntrl:]]{0,120}' "$log" | sort -u | head -n 8)
+        if [ -n "$san_err" ]; then
+          while IFS= read -r e; do
+            echo "::error::$LABEL sanitizer: $e"
+          done <<< "$san_err"
+        fi
         # 每测试节尾的结果行是 "Test Passed." / "Test Failed." (3.26 起即如此),
         # 个别版本还用 "***Failed <reason>" 行; 两种都认。
         failing=$(grep -nE 'Test Failed\.|^\*\*\*(Failed|Timeout|Not Run|SIGSEGV|SIGABRT|Exception)' "$log" | head -n 10)
