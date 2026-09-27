@@ -171,6 +171,11 @@ namespace coro {
 
         /// 读满接收缓冲的数据报文数: 这类报文**可能被内核截断**, 与"满载丢弃"分开计数,
         /// 因为两者的处置方式完全不同 —— 丢弃要扩容量, 截断要调大 max_datagram_size。
+        ///
+        /// 平台差异 (CI 实测得出, 不是推测): 本计数只在 Linux 语义下增长 —— 那里
+        /// recvfrom 会截断交付; Windows 的 WSARecvFrom 默认**整包丢弃**超大报文, 既不
+        /// 交付也不读满缓冲, 所以该值恒为 0。两平台共同的不变量是"超大报文绝不会作为
+        /// 完整报文被处理", 需要跨平台判断请按这个口径, 别假设 truncated>0。
         size_t truncated_datagrams() const noexcept { return state_->truncated.load(); }
 
         /// 当前生命周期阶段

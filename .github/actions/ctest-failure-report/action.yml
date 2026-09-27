@@ -39,7 +39,7 @@ runs:
             echo "::error::$LABEL gtest failure: ${g#*] }"
           done <<< "$gtest_failed"
         fi
-        san_err=$(grep -oE '(ERROR: AddressSanitizer|ERROR: LeakSanitizer|runtime error): [^[:cntrl:]]{0,120}' "$log" | sort -u | head -n 8)
+        san_err=$(grep -oE '(ERROR: AddressSanitizer|ERROR: LeakSanitizer|WARNING: ThreadSanitizer|runtime error): [^[:cntrl:]]{0,120}' "$log" | sort -u | head -n 8)
         if [ -n "$san_err" ]; then
           while IFS= read -r e; do
             echo "::error::$LABEL sanitizer: $e"

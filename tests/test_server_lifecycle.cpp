@@ -343,8 +343,18 @@ TEST(ServerLifecycleTest, UdpOversizedDatagramIsReportedAsTruncated) {
     coro::UdpServer server;
     int handler_len = -1;
     test_util::run_task([&] { return udp_truncation_scenario(&server, &handler_len); });
+    // 平台语义不同, 断言必须分开写, 否则就是把 Windows 判错:
+    //   Linux: recvfrom 截断交付 -> 读满缓冲, 计入 truncated, handler 拿到 64 字节
+    //   Windows: 超大数据报整包丢弃 (WSARecvFrom 默认不做部分交付) -> 既不计 truncated
+    //            也不交给 handler
+    // 两边共同的不变量是"超大报文绝不作为完整报文被处理"。
+#ifdef _WIN32
+    EXPECT_EQ(handler_len, -1) << "Windows 上超大数据报被整包丢弃, handler 不该收到任何内容";
+    EXPECT_EQ(server.datagram_count(), 0u) << "Windows 上超大报文不该计入已处理数据报";
+#else
     EXPECT_GE(server.truncated_datagrams(), 1u) << "读满缓冲的数据报没被计入截断观测";
     EXPECT_GE(handler_len, 64) << "handler 应拿到截断后的数据 (而不是零长度或错误)";
+#endif
     server.stop();
 }
 #endif // _WIN32 || io_uring
