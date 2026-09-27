@@ -239,6 +239,10 @@ namespace coro {
             auto write(const char* buf, size_t len) { return write_awaiter{this, buf, len, {}}; }
 
             /// 连到 Unix 路径 (或 @抽象名)。失败返回无效对象并设 errno。
+            /// path 必须按值进帧: 协程参数会被拷进帧, 而调用方的字符串可能在我们从
+            /// connect() 挂起点恢复之前就析构。改成 const& 正好制造悬空引用 ——
+            /// cppcheck 的 passedByValue 建议对普通函数成立, 对协程入口不成立。
+            // cppcheck-suppress passedByValue
             static Task<UnixStream> connect(std::string path) {
                 sockaddr_un addr = make_unix_address(path);
                 int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

@@ -13,6 +13,7 @@
 #include "test_util.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -51,15 +52,23 @@ namespace {
         co_return;
     }
 
+    /// bind/connect 失败时把 errno 带出来。CI 与本机内核不同 (5.10 vs 6.8),
+    /// 只断言 bool 会让"为什么失败"变成要靠猜的问题 —— 上次抽象名用例就是这么卡住的。
+    int g_bind_errno = 0;
+
     coro::Task<> round_trip(const std::string& path, std::string* got, int* accepted_count, int* read_rc) {
         coro::net::UnixListener listener;
-        if (!listener.bind(path))
+        if (!listener.bind(path)) {
+            g_bind_errno = errno;
+            *read_rc = -1000; // 让调用方的断言能区分"没绑上"与"读到 EOF"
             co_return;
+        }
         std::atomic<int> accepted{0};
         auto svc = coro::spawn(echo_once(&listener, &accepted));
 
         auto peer = co_await coro::net::UnixStream::connect(path);
         if (!peer.valid()) {
+            g_bind_errno = errno; // 记下是 connect 失败
             *read_rc = -999;
             co_await std::move(svc);
             co_return;
@@ -142,8 +151,9 @@ TEST(UnixTest, PathRoundTripWithAcceptAndWrite) {
 TEST(UnixTest, AbstractNameRoundTrip) {
     std::string got;
     int accepted = 0, read_rc = 0;
+    g_bind_errno = 0;
     test_util::run_task([&] { return round_trip("@coro-unix-abstract", &got, &accepted, &read_rc); });
-    EXPECT_EQ(got, "pong\n") << "抽象名绑定/连接未走通";
+    EXPECT_EQ(got, "pong\n") << "抽象名绑定/连接未走通, errno=" << g_bind_errno << " read_rc=" << read_rc;
     EXPECT_EQ(accepted, 1);
 }
 

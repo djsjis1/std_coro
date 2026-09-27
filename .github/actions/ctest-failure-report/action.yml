@@ -44,6 +44,14 @@ runs:
           exit 0
         fi
         # 一个 ctest 目标里可能跑几百个用例, 只报目标名定位不到问题 ——
+        # 断言消息本身: gtest 的 [  FAILED  ] 行只有用例名, 而定位真正需要的
+        # 是紧跟 file:line: Failure 之后的期望/实际值 (测试把 errno 打在消息里时,
+        # 不上报这一段就等于白打)。取 Failure 行及其后两行, 逐行截断避免超长。
+        while IFS= read -r line; do
+          detail=$(printf '%s' "$line" | tr -d '\r' | cut -c1-160)
+          [ -n "$detail" ] && echo "::error::$LABEL gtest detail: $detail"
+        done < <(grep -A2 -E '^[^:]+:[0-9]+: Failure' "$log" 2>/dev/null | head -n 40)
+
         # gtest 的失败行与 sanitizer 的诊断行才是可用粒度。
         gtest_failed=$(grep -oE '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' "$log" | sort -u | head -n 12)
         if [ -n "$gtest_failed" ]; then
