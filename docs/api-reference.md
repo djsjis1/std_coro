@@ -20,6 +20,7 @@
 - [字节流 stream.hpp](#字节流-streamhpp)
 - [异步 DNS dns.hpp](#异步-dns-hpp)
 - [Unix 域套接字 unix.hpp](#unix-域套接字-unixhpp)
+- [资源池 pool.hpp](#资源池-poolhpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -479,6 +480,51 @@ if (coro::net::unix_pair(a, b)) { ... }
 - 取消语义与 `net.hpp` 一致：awaiter 提供 `static cancel_op(void*)` 即由 Task 的
   await_transform 自动注册为取消钩子，走 `ASYNC_CANCEL` 让原操作以 `-ECANCELED` 完成，
   保证 CQE 先于协程帧销毁被消费（不需要、也不允许手动给 `uring_op` 赋钩子字段）。
+
+## 资源池 pool.hpp
+
+> 只依赖核心（`task`/`event_loop`/`exceptions`），任何配置都可用；loop-local（与
+> `channel`、`rate_limiter` 一致，不跨线程投递）。`#include <coro/pool.hpp>`。
+
+面向"建立成本高、可复用、会坏"的资源（TCP/Unix 连接、TLS 会话、后端客户端）。工厂本身就是
+协程，所以建连可以是真异步的：
+
+```cpp
+coro::Pool<coro::net::TcpStream>::options o;
+o.max_agents = 8;   // 同时存在的资源上限 (0 = 不限)
+o.max_idle   = 4;   // 空闲保留数, 超出即丢弃
+
+coro::Pool<coro::net::TcpStream> pool(
+    []() -> coro::Task<coro::net::TcpStream> {
+        co_return co_await coro::net::TcpStream::connect("127.0.0.1", 8080);
+    }, o);
+
+auto lease = co_await pool.acquire();   // 复用空闲 → 额度内新建 → 否则排队
+if (!lease.valid()) throw std::runtime_error("pool closed");
+use(**lease);                            // 或 lease->write(...)
+// 离开作用域自动归还; 连接已坏时 lease.discard() 让池少一个成员
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `acquire()` | 协程；优先复用空闲，其次在 `max_agents` 额度内新建，额度满则排队。池已关闭时返回**无效 lease** |
+| `PoolLease`（`*` / `->` / `valid`） | 移动专属；析构即归还（RAII）；对无效 lease 解引用抛 `StructuredConcurrencyError` |
+| `discard()` | 资源不可信时**不归还**并让出名额——忘记调用会让坏连接被下一个借用者拿到，这是连接池最典型的故障模式 |
+| `close()` / `closed()` | 拒绝新的 `acquire`、丢弃空闲资源、唤醒排队者 |
+| `idle_count()` / `in_use_count()` / `waiting_count()` | 观测用 |
+
+四条合同（逐条有测试）：
+
+- **归还靠 RAII**：异常路径与提前 `return` 都不会漏还。
+- **池可以先于借出的句柄析构**：状态在 `shared_ptr<pool_state>` 里，lease 与等待者都持有
+  引用（与 `task_registry`/`TcpServer` 同一范式）。
+- **取消安全**：`acquire` 挂起时被取消，等待节点由 awaiter **析构**摘除（写在
+  `await_resume` 里会因框架的取消检查包装器绕过它而失效），名额随之释放。
+- **不超发**：同时在手的资源数不超过 `max_agents`；建连前先占名额，失败则归还名额并
+  **原样上抛**工厂异常（不伪装成空句柄）。
+
+范围：不做空闲 TTL 淘汰与健康探测——那需要资源侧"还能用吗"的回调，由使用者拿到 lease
+后自行校验并 `discard()` 更诚实；也不做每键多池（按 endpoint 分池由调用方组合）。
 
 ## 并发组合 gather.hpp / wait.hpp
 
