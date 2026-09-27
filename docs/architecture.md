@@ -24,7 +24,9 @@
 9. [多线程模型：线程亲缘与跨线程路由](#9-多线程模型线程亲缘与跨线程路由)
 10. [include 依赖图](#10-include-依赖图)
 11. [八大横切设计模式](#11-八大横切设计模式)
-12. [代码规模与阅读顺序](#12-代码规模与阅读顺序)
+12. [代码模块与阅读顺序](#12-代码模块与阅读顺序)
+13. [刻意的非优化与已知约束](#13-刻意的非优化与已知约束)
+14. [模块边界与 coro::detail 的纪律](#14-模块边界与-corodetail-的纪律)
 
 ---
 
@@ -509,7 +511,7 @@ loop-per-thread），而非 Go 式 work-stealing。收益：
 第 2 层:   task.hpp, sleep.hpp, future.hpp, io.hpp
 第 3 层:   sync.hpp, gather.hpp, schedule.hpp, wait.hpp, task_group.hpp,
            thread.hpp, scheduler.hpp, net.hpp,
-           timer.hpp, context.hpp, channel.hpp, task_registry.hpp  (并发扩展, 不进聚合头)
+           timer.hpp, context.hpp, channel.hpp, select.hpp, task_registry.hpp  (并发扩展, 不进聚合头)
 第 4 层:   queue.hpp, fs.hpp, pipe.hpp, signal.hpp, fs_watch.hpp
 第 5 层:   process.hpp
 第 6 层:   coro.hpp (聚合核心 + 并发; 不含 IO 模块)
@@ -631,3 +633,25 @@ final_suspend 路径）, 收益/风险比暂不划算。代码内留有注释锚
 Linux 分支（含 io_uring 的 net/fs/pipe/fs_watch/process，以及 self-pipe signal）已接入 Ubuntu 的
 GCC/Clang Debug/Release 与 sanitizer CI；Windows 本机结果不能代替这些任务的
 实际状态。发布 Linux 产物前仍需确认对应提交的 CI 全绿，并在目标内核做压力验证。
+
+## 14. 模块边界与 coro::detail 的纪律
+
+本仓库有一批 `coro::detail::` 符号**被跨模块当作契约使用**，其实际可见性远高于名字
+暗示的"内部实现"。这是实测事实，不是设计理想：
+
+| detail 符号 | 定义处 | 跨模块使用者 |
+|---|---|---|
+| `detail::task_registry`、`detail::shutdown_report` | `task_registry.hpp` | `tcp_udp` 组件、服务器生命周期测试 |
+| `detail::commit_gate` | `channel.hpp` | `select.hpp`（多路仲裁协议） |
+| `Task<detail::shutdown_report>` | 服务器 `shutdown()` 返回值 | 出现在**公共签名**上 |
+
+由此确立三条纪律：
+
+1. **被第二个模块引用的 `detail::` 符号视同准公共 API**：改动必须同步所有使用者，
+   不得当成私有实现随手重构。
+2. **使用者达到 3 个就提升身份**：给它具名命名空间（例如 `coro::server_detail::`）或
+   直接公开，而不是继续借 `detail` 的名字规避评审。
+3. **组件之间不得伸手进对方的 detail**：需要共享机制时做一层显式接口。`select` 对
+   `channel` 的 `probe / claim / commit / arm / disarm` 就是用 `friend` 授权给
+   `detail::select_branch<T>` 的**私有**接口 —— 既让 select 能用，也不把通道等待队列的
+   内部不变量升级成对全体用户开放的公共合同。

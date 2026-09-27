@@ -46,6 +46,30 @@ namespace coro {
 
     namespace detail {
 
+        template <typename T> struct select_branch; // 前置声明: 端点用它做 friend 授权
+
+        /// 成交准入闸门。两个方法**必须分开**, 因为"观察"与"申领"是两回事:
+        ///   can_admit(tag) —— 纯查询、无副作用: 该节点所属 select 是否尚未成交。
+        ///                   probe 一类只看不做的路径只许用它, 否则 A 的 probe 会把
+        ///                   B 的 winner 写成 A 的分支号 (跨实例污染), probe 也不再幂等。
+        ///   claim(tag)     —— 原子申领、首个成功者赢: 真正交接元素前必须拿到它。
+        /// 普通 await 不使用闸门 (gate = nullptr), 此时恒可成交。
+        struct commit_gate {
+            virtual ~commit_gate() = default;
+            virtual bool can_admit(int tag) const noexcept = 0;
+            virtual bool claim(int tag) noexcept = 0;
+        };
+
+        /// 只观察
+        inline bool gate_open(const commit_gate* gate, int tag) noexcept {
+            return gate == nullptr || gate->can_admit(tag);
+        }
+
+        /// 要交接了: 先申领
+        inline bool gate_claim(commit_gate* gate, int tag) noexcept {
+            return gate == nullptr || gate->claim(tag);
+        }
+
         template <typename T> struct channel_state;
 
         /// 发送侧等待节点。放堆上并用 shared_ptr 当身份: 容器在 push/erase 后
@@ -53,7 +77,9 @@ namespace coro {
         template <typename T> struct channel_sender_waiter {
             T value;
             std::coroutine_handle<> handle{};
-            bool taken = false; // 值已被搬走 = 交接成功
+            bool taken = false;          // 值已被搬走 = 交接成功
+            commit_gate* gate = nullptr; // select 用: 交接前申领 (tag 是分支号)
+            int tag = -1;
             explicit channel_sender_waiter(T v) : value(std::move(v)) {}
         };
 
@@ -64,7 +90,9 @@ namespace coro {
         template <typename T> struct channel_receiver_waiter {
             std::optional<T> value;
             std::coroutine_handle<> handle{};
-            bool delivered = false; // 区分"值已交到我手上"与"只是被唤醒去看 EOF"
+            bool delivered = false;      // 区分"值已交到我手上"与"只是被唤醒去看 EOF"
+            commit_gate* gate = nullptr; // 同发送侧: 交接前申领
+            int tag = -1;
         };
 
         template <typename T> struct channel_state {
@@ -99,12 +127,18 @@ namespace coro {
         template <typename T> inline bool channel_deliver(channel_state<T>& st, T& value) {
             if (st.receivers.empty())
                 return false;
-            std::shared_ptr<channel_receiver_waiter<T>> node = st.receivers.front();
-            st.receivers.pop_front();
-            node->value = std::move(value);
-            node->delivered = true;
-            channel_wake(st, node->handle);
-            return true;
+            // 按队列顺序找第一个仍可成交的接收者。**被拒的节点绝不摘链** —— 它属于
+            // 另一个尚未完成仲裁的 select, 只能由那个 select 自己撤销; 顺手摘掉会让
+            // 对方永远等不到唤醒 (实测: select 挂死)。
+            for (auto& node : st.receivers) {
+                if (!gate_open(node->gate, node->tag) || !gate_claim(node->gate, node->tag))
+                    continue;
+                node->value = std::move(value);
+                node->delivered = true;
+                channel_wake(st, node->handle);
+                return true;
+            }
+            return false;
         }
 
         /// 接收侧直接从挂起的发送者手里取值: rendezvous (容量 0, 缓冲永远是空的)
@@ -112,6 +146,10 @@ namespace coro {
         /// 的顺序会让双方永远等对方 —— 交接必须是双向可达的。
         template <typename T> inline bool channel_take_pending_sender(channel_state<T>& st, std::optional<T>& into) {
             if (st.senders.empty())
+                return false;
+            // 队头无资格/申领失败: 值留在原处, 不越队, 也绝不摘别人的节点
+            if (!gate_open(st.senders.front()->gate, st.senders.front()->tag) ||
+                !gate_claim(st.senders.front()->gate, st.senders.front()->tag))
                 return false;
             std::shared_ptr<channel_sender_waiter<T>> node = st.senders.front();
             st.senders.pop_front();
@@ -125,6 +163,8 @@ namespace coro {
         template <typename T> inline void channel_promote_senders(channel_state<T>& st) {
             while (!st.senders.empty() && channel_has_room(st)) {
                 std::shared_ptr<channel_sender_waiter<T>> node = st.senders.front();
+                if (!gate_open(node->gate, node->tag) || !gate_claim(node->gate, node->tag))
+                    return; // 队头不可成交: 保持 FIFO 不越队, 也不摘别人的节点
                 st.senders.pop_front();
                 st.buffer.push_back(std::move(node->value));
                 node->taken = true;
@@ -201,6 +241,8 @@ namespace coro {
         /// 发送端句柄: 可拷贝分发给多个生产者, 最后一个释放即关闭发送侧
         class sender {
           public:
+            using value_type = T; // 供 select 等工厂从端点推导元素类型
+
             sender() = default;
             sender(const sender& other) : state_(other.state_) { bump(); }
             sender(sender&& other) noexcept : state_(std::move(other.state_)) {}
@@ -251,6 +293,7 @@ namespace coro {
 
           private:
             friend class channel;
+            template <typename U> friend struct detail::select_branch; // 只向 select 开放以下四个接口
             void require_bound() const {
                 if (state_ == nullptr)
                     throw StructuredConcurrencyError("operation on a default-constructed channel handle");
@@ -268,12 +311,54 @@ namespace coro {
                     detail::channel_close(*state_); // 最后发送端释放 = 发送侧关闭
                 state_.reset();
             }
+            // ---- select 面向的最低接口 (私有), 语义同 receiver ----
+
+            /// 纯观察: 现在就能把值交出去吗 (不做申领)
+            bool probe_can_accept() const {
+                require_bound();
+                auto& st = *state_;
+                if (st.send_closed || st.all_receivers_gone)
+                    return false;
+                for (auto& waiter : st.receivers)
+                    if (detail::gate_open(waiter->gate, waiter->tag))
+                        return true;
+                return detail::channel_has_room(st);
+            }
+
+            /// 真正提交 (只允许在 claim 成功后调用): 直接交接优先, 其次进缓冲
+            bool commit_accept(T& value) const {
+                auto& st = *state_;
+                if (detail::channel_deliver(st, value))
+                    return true;
+                if (detail::channel_has_room(st)) {
+                    st.buffer.push_back(std::move(value));
+                    return true;
+                }
+                return false;
+            }
+
+            std::shared_ptr<detail::channel_sender_waiter<T>>
+            arm_for_select(T value, detail::commit_gate* gate, int tag, std::coroutine_handle<> wake) const {
+                auto node = std::make_shared<detail::channel_sender_waiter<T>>(std::move(value));
+                node->gate = gate;
+                node->tag = tag;
+                node->handle = wake;
+                state_->senders.push_back(node);
+                return node;
+            }
+
+            void disarm_for_select(const std::shared_ptr<detail::channel_sender_waiter<T>>& node) const {
+                detail::channel_drop_sender(*state_, node);
+            }
+
             std::shared_ptr<detail::channel_state<T>> state_;
         };
 
         /// 接收端句柄: 最后一个接收端释放会让发送侧失败并唤醒挂起的发送者
         class receiver {
           public:
+            using value_type = T; // 供 select 等工厂从端点推导元素类型
+
             receiver() = default;
             receiver(const receiver& other) : state_(other.state_) { bump(); }
             receiver(receiver&& other) noexcept : state_(std::move(other.state_)) {}
@@ -323,6 +408,7 @@ namespace coro {
 
           private:
             friend class channel;
+            template <typename U> friend struct detail::select_branch; // 只向 select 开放以下四个接口
             explicit receiver(std::shared_ptr<detail::channel_state<T>> st) : state_(std::move(st)) { bump(); }
 
             /// 默认构造的句柄没有绑定通道: 显式失败, 不解引用空 state_
@@ -341,6 +427,58 @@ namespace coro {
                     detail::channel_note_no_receivers(*state_); // 不会再有人取: 让发送方失败退出
                 state_.reset();
             }
+            // ---- select 面向的最低接口 (私有: 不是公共合同) ----
+            // 顺序必须是 probe -> claim -> commit: 若先提交副作用再回滚, "值已直接交给
+            // 已挂起对侧"的那次提交物理上收不回来, 会出现两个分支都完成副作用。
+
+            /// 纯观察: 现在能不能产出一次结果 (不申领, 不改任何状态)。
+            /// "发送侧已关闭且无存量"也算就绪 —— 它的结果是 EOF(nullopt)。漏掉这条,
+            /// select 会挂在一个再也不会有人交付的节点上 (通道已关闭 = 不会有未来的
+            /// 发送者), 表现为永久挂起; 普通 recv awaiter 靠挂链后自检规避了同一问题。
+            bool probe_has_message() const {
+                require_bound();
+                auto& st = *state_;
+                if (!st.buffer.empty())
+                    return true;
+                if (!st.senders.empty() && detail::gate_open(st.senders.front()->gate, st.senders.front()->tag))
+                    return true;
+                return st.send_closed;
+            }
+
+            /// 产出一个结果 (只允许在 claim 成功后调用): 值 / 排空后的 EOF
+            bool commit_take(std::optional<T>& out) const {
+                auto& st = *state_;
+                if (!st.buffer.empty()) {
+                    out = std::move(st.buffer.front());
+                    st.buffer.pop_front();
+                    detail::channel_promote_senders(st);
+                    return true;
+                }
+                if (detail::channel_take_pending_sender(st, out))
+                    return true;
+                if (st.send_closed) {
+                    out = std::nullopt; // EOF: 结果就是"没有值", 与"取不到"靠返回值区分
+                    return true;
+                }
+                return false;
+            }
+
+            /// 登记带闸门的等待节点; 唤醒目标由调用方给出 (select 自己的句柄)
+            std::shared_ptr<detail::channel_receiver_waiter<T>> arm_for_select(detail::commit_gate* gate, int tag,
+                                                                               std::coroutine_handle<> wake) const {
+                auto node = std::make_shared<detail::channel_receiver_waiter<T>>();
+                node->gate = gate;
+                node->tag = tag;
+                node->handle = wake;
+                state_->receivers.push_back(node);
+                return node;
+            }
+
+            /// 撤销登记; 已被交付则摘不到 = 无害空操作 (按 shared_ptr 身份比较)
+            void disarm_for_select(const std::shared_ptr<detail::channel_receiver_waiter<T>>& node) const {
+                detail::channel_drop_receiver(*state_, node);
+            }
+
             std::shared_ptr<detail::channel_state<T>> state_;
         };
 

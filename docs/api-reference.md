@@ -15,6 +15,7 @@
 - [定时器 timer.hpp](#定时器-timerhpp)
 - [上下文与取消 context.hpp](#上下文与取消-contexthpp)
 - [通道 channel.hpp](#通道-channelhpp)
+- [多路等待 select.hpp](#多路等待-selecthpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -274,6 +275,39 @@ if (auto v = co_await rx.recv()) use(*v);   // 先排空存量, 之后返回 nul
 与 `coro::Queue` 的分工（刻意不合并）：`Queue` 面向 `task_done/join` 的任务完成计数
 模型，没有 rendezvous、没有端点句柄、也没有"关闭后排空再 EOF"；两者合同不同，合并会
 让两边语义都变模糊。
+
+## 多路等待 select.hpp
+
+> 并发扩展（需 `-DCORO_ENABLE_CONCURRENCY_EXT=ON`），不进聚合头：`#include <coro/select.hpp>`。
+> 分支只接受 `channel` 的 send/recv、`after()` 定时器与 `default_nowait()`。
+
+```cpp
+auto r = co_await coro::select(
+    coro::recv_of(rx1),          // 分支 0: 值在 r.value (nullopt = 该通道已 EOF)
+    coro::recv_of(rx2),          // 分支 1
+    coro::send_of(tx, 42),       // 分支 2: 可与 recv 混用, 元素类型须一致
+    coro::after(100ms),          // 分支 3: r.timed_out
+    coro::default_nowait());     // 分支 4: r.defaulted, 绝不挂起
+switch (r.index) { /* ... */ }
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `select(specs...)` | 协程；第一个参数必须是 `recv_of`/`send_of`（由它决定元素类型） |
+| `recv_of(rx)` / `send_of(tx, v)` | 通道分支；所有分支元素类型必须一致（编译期检查） |
+| `after(d)` / `default_nowait()` | 定时器 / 立即分支；`default` 存在时任何情况下都不挂起 |
+| `select_result<T>` | `index`（赢家分支号）+ `value`（recv 载荷，nullopt 即该通道 EOF）+ `timed_out`/`defaulted` |
+
+合同与实现要点：
+
+- **只有一个分支能提交副作用**：内部按 登记 → 仲裁 → 提交 → 撤销 执行，等待节点挂在
+  通道队列上时会先过"成交闸门"，输家不会被交付，撤销即干净退出——**不会发生"落选的
+  recv 其实已经取走了消息"**（这正是它与 `wait_any` 的本质区别：wait_any 的落选任务会
+  继续执行完）。
+- 快速路径按**轮转起点**扫描，多个分支同时就绪时不固定偏向第一个。
+- 关闭的通道分支表现为该分支的 `nullopt`（EOF），不会吞掉其他分支的机会。
+- select 退出后通道上**不残留任何登记**：后到的值照常可被接收。
+- 不支持嵌套 select 与任意 `Task` 参与竞速（有意划小的第一版范围）。
 
 ## 并发组合 gather.hpp / wait.hpp
 
