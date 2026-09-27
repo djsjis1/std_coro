@@ -247,3 +247,19 @@ TEST(ChannelTest, CancelledSenderLeavesNoValueOrSlot) {
 }
 
 #endif // CORO_HAS_CONCURRENCY_EXT
+
+TEST(ChannelTest, DefaultConstructedHandlesFailSafely) {
+    // 端点句柄有 public 默认构造 (用于赋值/复位), 所以"未绑定"必须是可安全观察的状态,
+    // 而不是解引用空 state_ 的未定义行为。
+    coro::channel<int>::receiver rx;
+    EXPECT_FALSE(rx.valid());
+    EXPECT_TRUE(rx.closed());
+    EXPECT_EQ(rx.size(), 0u);
+    int v = 0;
+    EXPECT_THROW(rx.try_recv(v), coro::StructuredConcurrencyError);
+
+    coro::channel<int>::sender tx;
+    EXPECT_FALSE(tx.valid());
+    EXPECT_THROW((void)tx.try_send(1), coro::StructuredConcurrencyError);
+    EXPECT_THROW(tx.close(), coro::StructuredConcurrencyError);
+}

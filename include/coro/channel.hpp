@@ -224,6 +224,7 @@ namespace coro {
             /// 非阻塞发送: true = 已受理 (交接或入缓冲), false = 需要等待。
             /// 通道已关闭时抛 ClosedChannelError。
             bool try_send(T value) const {
+                require_bound();
                 auto& st = *state_;
                 if (st.send_closed || st.all_receivers_gone)
                     throw ClosedChannelError("send on closed channel");
@@ -241,12 +242,20 @@ namespace coro {
 
             /// 主动关闭发送侧: 已挂起的发送者以 ClosedChannelError 退出,
             /// 缓冲里的存量仍可被接收方排空 (先排空再 EOF)。
-            void close() const { detail::channel_close(*state_); }
+            void close() const {
+                require_bound();
+                detail::channel_close(*state_);
+            }
 
             bool valid() const noexcept { return static_cast<bool>(state_); }
 
           private:
             friend class channel;
+            void require_bound() const {
+                if (state_ == nullptr)
+                    throw StructuredConcurrencyError("operation on a default-constructed channel handle");
+            }
+
             explicit sender(std::shared_ptr<detail::channel_state<T>> st) : state_(std::move(st)) { bump(); }
             void bump() {
                 if (state_)
@@ -288,6 +297,7 @@ namespace coro {
             /// 非阻塞接收: 拿到值返回 true 并填 out; 缓冲空 (无论是否关闭) 返回 false。
             /// 是否已 EOF 用 closed() 判断, 不要用"没拿到值"推断。
             bool try_recv(T& out) const {
+                require_bound();
                 auto& st = *state_;
                 if (st.buffer.empty()) {
                     std::optional<T> pending;
@@ -305,13 +315,21 @@ namespace coro {
             /// 阻塞式接收 (协程): 空则挂起; 先排空存量再返回 nullopt 表示 EOF
             Task<std::optional<T>> recv() const;
 
-            bool closed() const noexcept { return state_->send_closed && state_->buffer.empty(); }
-            size_t size() const noexcept { return state_->buffer.size(); }
+            /// 默认构造的空句柄视为"已关闭且无数据": 等待方据此走 EOF 分支,
+            /// 而不是解引用空的 state_ (那是未定义行为)。
+            bool closed() const noexcept { return !state_ || (state_->send_closed && state_->buffer.empty()); }
+            size_t size() const noexcept { return state_ ? state_->buffer.size() : 0u; }
             bool valid() const noexcept { return static_cast<bool>(state_); }
 
           private:
             friend class channel;
             explicit receiver(std::shared_ptr<detail::channel_state<T>> st) : state_(std::move(st)) { bump(); }
+
+            /// 默认构造的句柄没有绑定通道: 显式失败, 不解引用空 state_
+            void require_bound() const {
+                if (state_ == nullptr)
+                    throw StructuredConcurrencyError("operation on a default-constructed channel handle");
+            }
             void bump() {
                 if (state_)
                     ++state_->live_receivers;
@@ -467,10 +485,12 @@ namespace coro {
     } // namespace detail
 
     template <typename T> Task<void> channel<T>::sender::send(T value) const {
+        require_bound();
         return detail::channel_send(state_, std::move(value));
     }
 
     template <typename T> Task<std::optional<T>> channel<T>::receiver::recv() const {
+        require_bound();
         return detail::channel_recv(state_);
     }
 
