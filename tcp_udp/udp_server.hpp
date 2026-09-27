@@ -169,6 +169,10 @@ namespace coro {
         /// 因并发上限或字节上限被丢弃的数据报数
         size_t dropped_datagrams() const noexcept { return state_->registry.rejected() + state_->bytes_dropped.load(); }
 
+        /// 读满接收缓冲的数据报文数: 这类报文**可能被内核截断**, 与"满载丢弃"分开计数,
+        /// 因为两者的处置方式完全不同 —— 丢弃要扩容量, 截断要调大 max_datagram_size。
+        size_t truncated_datagrams() const noexcept { return state_->truncated.load(); }
+
         /// 当前生命周期阶段
         phase current_phase() const noexcept { return state_->phase_value.load(); }
 
@@ -185,6 +189,7 @@ namespace coro {
             std::atomic<phase> phase_value{phase::idle};
             std::atomic<size_t> handled{0};
             std::atomic<size_t> bytes_dropped{0};
+            std::atomic<size_t> truncated{0}; // 读满整个缓冲: 可能被截断 (见下方判定说明)
             std::atomic<size_t> pending_bytes{0};
             std::atomic<int64_t> grace_ms{1000};
             std::atomic<int64_t> cancel_grace_ms{500};
@@ -227,6 +232,14 @@ namespace coro {
                 }
                 // 零长度数据报也是合法输入, 计入并交给 handler (旧实现直接 continue 吞掉)
                 st->handled.fetch_add(1);
+
+                // 截断判定: 读到的字节数正好等于缓冲上限时, 内核很可能已经把剩余部分
+                // 丢掉 (Linux 的 recvfrom 对数据报截断不报错, 只返回截断后的长度)。
+                // 这里刻意用"长度 == 缓冲大小"这个跨平台一致的保守信号, 而不是
+                // msg_flags 的 MSG_TRUNC: 后者只有 recvmsg + msg_controllen 配合才有,
+                // 而 Windows 的 WSARecvFrom 没有等价位, 用它会让两侧语义不对称。
+                if (static_cast<size_t>(n) == recv_buf_.size())
+                    st->truncated.fetch_add(1);
                 if (handler == nullptr)
                     continue;
 

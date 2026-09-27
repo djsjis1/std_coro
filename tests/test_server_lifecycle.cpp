@@ -217,6 +217,37 @@ namespace {
         co_return;
     }
 
+    /// handler 只需把长度记下来, 本体是空协程
+    coro::Task<> udp_noop() {
+        co_return;
+    }
+
+    /// 超过 max_datagram_size 的数据报: 服务端必须能报出"可能被截断",
+    /// 而不是把截断后的数据当成一个完整包静默处理掉。
+    coro::Task<> udp_truncation_scenario(coro::UdpServer* server, int* handler_len) {
+        coro::UdpServer::Config cfg;
+        cfg.max_datagram_size = 64;
+        server->set_config(cfg);
+        server->set_handler([handler_len](const char*, size_t len, const sockaddr_in&) {
+            *handler_len = static_cast<int>(len);
+            return udp_noop();
+        });
+        if (server->start("127.0.0.1", 0) == false)
+            co_return;
+        coro::net::UdpSocket peer;
+        if (peer.bind_listen("127.0.0.1", 0) == false)
+            co_return;
+        sockaddr_in target{};
+        target.sin_family = AF_INET;
+        target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        target.sin_port = htons(server->port());
+        std::vector<char> big(1400, 'A'); // 远超 64 字节的接收缓冲
+        (void)co_await peer.sendto(big.data(), big.size(), target);
+        co_await coro::sleep(std::chrono::milliseconds(80));
+        (void)co_await server->shutdown(std::chrono::milliseconds(30), std::chrono::milliseconds(300));
+        co_return;
+    }
+
 } // namespace
 
 // ---- 空载关停: 立即完成, 且重复关闭幂等 ----
@@ -307,4 +338,13 @@ TEST(ServerLifecycleTest, UdpAcceptsZeroLengthDatagram) {
     server.stop();
 }
 
+// ---- UDP: 读满接收缓冲的数据报必须被识别为"可能截断" ----
+TEST(ServerLifecycleTest, UdpOversizedDatagramIsReportedAsTruncated) {
+    coro::UdpServer server;
+    int handler_len = -1;
+    test_util::run_task([&] { return udp_truncation_scenario(&server, &handler_len); });
+    EXPECT_GE(server.truncated_datagrams(), 1u) << "读满缓冲的数据报没被计入截断观测";
+    EXPECT_GE(handler_len, 64) << "handler 应拿到截断后的数据 (而不是零长度或错误)";
+    server.stop();
+}
 #endif // _WIN32 || io_uring
