@@ -200,6 +200,9 @@ endif()
 if(CORO_ENABLE_CONCURRENCY_EXT)
     add_executable(example_timer_context examples/timer_context.cpp)
     target_link_libraries(example_timer_context PRIVATE coro::coro)
+
+    add_executable(example_channel examples/channel_pipeline.cpp)
+    target_link_libraries(example_channel PRIVATE coro::coro)
 endif()
 
 if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)

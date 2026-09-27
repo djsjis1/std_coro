@@ -14,6 +14,7 @@
 - [时间 sleep.hpp](#时间-sleephpp)
 - [定时器 timer.hpp](#定时器-timerhpp)
 - [上下文与取消 context.hpp](#上下文与取消-contexthpp)
+- [通道 channel.hpp](#通道-channelhpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -235,6 +236,44 @@ src.cancel();                               // 非阻塞, 可从任意线程调�
 - 取消源比令牌/上下文先析构是安全的：取消状态由 `shared_ptr` 共享，不反指回源。
 - 默认构造的 `CancellationToken` 视为**已取消**——它不可能再有人 cancel，定为
   "永不取消"会静默吞掉本该发生的取消。
+
+## 通道 channel.hpp
+
+> 并发扩展（需 `-DCORO_ENABLE_CONCURRENCY_EXT=ON`），不进聚合头：`#include <coro/channel.hpp>`。
+> loop-local：只在创建它的 `EventLoop` 线程内使用，不跨线程投递。
+
+```cpp
+auto ch = coro::channel<int>::bounded(8);   // 或 rendezvous() / unbounded()
+auto tx = ch.make_sender();                 // 端点句柄可拷贝, 分发给多个生产者
+auto rx = ch.make_receiver();
+
+co_await tx.send(42);                       // 满则挂起 (背压), 关闭则抛 ClosedChannelError
+if (auto v = co_await rx.recv()) use(*v);   // 先排空存量, 之后返回 nullopt 表示 EOF
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `bounded(n)` / `rendezvous()` / `unbounded()` | 有界 / 容量 0（只直接交接） / 显式无界 |
+| `make_sender()` / `make_receiver()` | 端点句柄，可拷贝分发给多个生产者/消费者 |
+| `sender::send(T)` | 协程；满则挂起，通道关闭时抛 `ClosedChannelError` |
+| `sender::try_send(T)` | 非阻塞：`true` 已受理，`false` 需要等待；未命中时值仍归调用方 |
+| `receiver::recv()` | 协程；空则挂起，返回 `optional<T>`，`nullopt` 即 EOF |
+| `receiver::try_recv(out)` | 非阻塞取一个值（含直接从挂起发送者手里取） |
+| `close()` / `closed()` / `size()` | 关闭发送侧（存量仍可排空）/ 状态查询 |
+
+关闭与所有权合同：
+
+- **最后一个 `sender` 释放等价于关闭发送侧**；**最后一个 `receiver` 释放**会让挂起的
+  发送者以 `ClosedChannelError` 退出，不会永久等待。
+- 关闭后接收侧**先排空缓冲**再报 EOF；EOF 用 `nullopt` 表示，与"暂时没值"区分靠 `closed()`。
+- **取消安全**：挂起的发送者被取消时，其值随等待节点一起消失（既不残留也不误交给后来者），
+  占用的名额归还。这一点由析构兜底保证——任务被取消时 `CancelledError` 由框架的取消检查
+  包装器抛出，**不会经过本 awaiter 的 `await_resume`**。
+- 支持 move-only 元素：值只在"入队/成功交接"处移动。
+
+与 `coro::Queue` 的分工（刻意不合并）：`Queue` 面向 `task_done/join` 的任务完成计数
+模型，没有 rendezvous、没有端点句柄、也没有"关闭后排空再 EOF"；两者合同不同，合并会
+让两边语义都变模糊。
 
 ## 并发组合 gather.hpp / wait.hpp
 
