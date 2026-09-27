@@ -594,8 +594,15 @@ namespace coro {
             /// 同步关闭监听 (服务器停止用)。
             /// 挂起的 AcceptEx 会以 ERROR_OPERATION_ABORTED 完成包返回,
             /// accept() 立即返回无效流, 不会泄漏 OVERLAPPED。
+            ///
+            /// 先显式 CancelIoEx: closesocket 通常确实会让重叠 I/O  abort,
+            /// 但"关闭带挂起异步操作的句柄"的**完成包投递并不被文档保证**;
+            /// 而本仓库其它取消路径 (cancel_op / UdpSocket::close) 已经统一用
+            /// CancelIoEx, 这里跟进可把行为从"依赖未保证的副作用"变成明确合同。
+            /// 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
             void close() {
                 if (sock_ != INVALID_SOCKET) {
+                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                     closesocket(sock_);
                     sock_ = INVALID_SOCKET;
                 }
@@ -621,16 +628,21 @@ namespace coro {
             }
 
             ~UdpSocket() {
-                if (sock_ != INVALID_SOCKET)
+                if (sock_ != INVALID_SOCKET) {
+                    // 与 TcpListener::close 同理: 挂起的 recvfrom 先显式取消再关句柄
+                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                     closesocket(sock_);
+                }
             }
 
             UdpSocket(UdpSocket&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
 
             UdpSocket& operator=(UdpSocket&& other) noexcept {
                 if (this != &other) {
-                    if (sock_ != INVALID_SOCKET)
+                    if (sock_ != INVALID_SOCKET) {
+                        CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                         closesocket(sock_);
+                    }
                     sock_ = std::exchange(other.sock_, INVALID_SOCKET);
                 }
                 return *this;

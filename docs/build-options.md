@@ -31,6 +31,12 @@ CORO_HAS_URING=0|1                # 由 $<BOOL:${CORO_HAS_URING}> 派生
 CORO_HAS_CONCURRENCY_EXT=0|1      # 由 $<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}> 派生
 ```
 
+> `CORO_ENABLE_CONCURRENCY_EXT` 与 `CORO_HAS_CONCURRENCY_EXT` 的**真实合同**：这两个
+> 开关只控制测试、示例与聚合头可见性。`timer.hpp`、`context.hpp`、`channel.hpp`、
+> `select.hpp` 本身只依赖纯核心，头文件始终随包发布，消费者显式 include 即可使用
+> （header-only 的自然行为）；宏关闭时它们仍可独立编译，由 `coro_header_check` 在
+> `URING=OFF` 配置下验证。不要理解成"关闭后头文件不可用"。
+
 头文件里的平台守卫一律写成：
 
 ```cpp

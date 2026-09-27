@@ -83,15 +83,17 @@ namespace coro {
             std::shared_ptr<cancellation_state> st;
             std::optional<std::chrono::steady_clock::time_point> deadline;
             std::shared_ptr<std::atomic<bool>> timer_token;
+            std::coroutine_handle<> registered{}; // add_waiter 用的句柄 (摘链依据)
 
             bool await_ready() const noexcept { return st->cancelled.load(); }
 
             void await_suspend(std::coroutine_handle<> h) {
                 auto& loop = EventLoop::get();
+                registered = h;
                 st->add_waiter(h, &loop);
                 if (st->cancelled.load()) {
                     // 竞态窗口: 检查之后、挂链之前发生了 cancel, 对方已不再能看到我们
-                    st->drop_waiter(h);
+                    retire();
                     loop.schedule(h);
                     return;
                 }
@@ -104,10 +106,24 @@ namespace coro {
             void await_resume() const {
                 if (timer_token)
                     *timer_token = true; // 本次已消费, 堆里的定时器条目作废
+                retire();                // 正常结束也要摘链, 否则野句柄留在 waiters 里
                 if (st->cancelled.load())
                     throw CancelledError();
                 throw TimeoutError();
             }
+
+            /// 摘链必须挂在生命周期终点, 不能只挂在 await_resume: 任务被取消时
+            /// CancelledError 由框架的取消检查包装器抛出, **绕过本 awaiter 的
+            /// await_resume** —— 于是超时/取消后的协程帧销毁了, waiters 里却仍留着
+            /// 它的句柄, 之后任意一次 source.cancel() 都会对野句柄 schedule。
+            /// drop_waiter 按句柄查找, 摘不到即空操作, 所以移动导致的二次析构与
+            /// await_resume 已摘过的情况都安全。
+            void retire() const {
+                if (registered)
+                    st->drop_waiter(registered);
+            }
+
+            ~context_wait_awaiter() { retire(); }
         };
 
         inline Task<void> context_wait(context_wait_awaiter aw) {

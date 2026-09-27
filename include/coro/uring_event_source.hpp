@@ -61,15 +61,22 @@ namespace coro {
 
     } // namespace detail
 
+// 环深度的单一可覆盖点: 消费者可用 -DCORO_URING_RING_DEPTH=n 或编译定义覆盖
+#ifndef CORO_URING_RING_DEPTH
+#define CORO_URING_RING_DEPTH 256
+#endif
+
     namespace net {
 
 #ifdef CORO_URING_ENABLED
 
         class UringEventSource : public EventSource {
           public:
-            // 完成队列深度 256: 同时挂起的异步操作上限 (可按需调大)
-            UringEventSource() {
-                int ret = io_uring_queue_init(256, &ring_, 0);
+            /// 环深度: 同时挂起的异步操作上限。默认 256 够用且内存友好; 高并发场景
+            /// (上万连接) 可用编译定义 CORO_URING_RING_DEPTH 覆盖, 或构造时传参。
+            /// 深度不足时 io_uring_get_sqe 拿不到槽位, 表现为提交失败而不是静默降速。
+            explicit UringEventSource(unsigned entries = CORO_URING_RING_DEPTH) {
+                int ret = io_uring_queue_init(entries, &ring_, 0);
                 if (ret < 0) {
                     valid_ = false;
                     return; // 初始化失败, 后续操作检查 valid()
@@ -166,12 +173,19 @@ namespace coro {
             int wait_for(std::chrono::milliseconds timeout) override {
                 // 先非阻塞地消费所有已就绪的 CQE
                 int completed = 0;
-                io_uring_cqe* cqe = nullptr;
-                while (io_uring_peek_batch_cqe(&ring_, &cqe, 1) > 0) {
-                    process_cqe(cqe);
-                    io_uring_cqe_seen(&ring_, cqe);
-                    ++completed;
-                    cqe = nullptr;
+                // 一次捞一批: batch=1 等于逐个 peek, 高吞吐下把一轮就绪包拆成多次
+                // 循环。批内只 process + 消费, 不做协程恢复 (on_complete 只入队),
+                // 因此迭代期间处理新到的包是安全的。
+                io_uring_cqe* batch[16];
+                for (;;) {
+                    const unsigned n = io_uring_peek_batch_cqe(&ring_, batch, 16);
+                    if (n == 0)
+                        break;
+                    for (unsigned k = 0; k < n; ++k) {
+                        process_cqe(batch[k]);
+                        io_uring_cqe_seen(&ring_, batch[k]);
+                        ++completed;
+                    }
                 }
                 if (completed)
                     return 1;
@@ -181,6 +195,7 @@ namespace coro {
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 
+                io_uring_cqe* cqe = nullptr;
                 int ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
                 if (ret == -ETIME)
                     return 0; // 超时: 由 EventLoop 处理定时器
@@ -189,6 +204,17 @@ namespace coro {
 
                 process_cqe(cqe);
                 io_uring_cqe_seen(&ring_, cqe);
+                // 等待期间可能又积累了一批, 一并收割, 不留到下一轮
+                for (;;) {
+                    io_uring_cqe* more[16];
+                    const unsigned n = io_uring_peek_batch_cqe(&ring_, more, 16);
+                    if (n == 0)
+                        break;
+                    for (unsigned k = 0; k < n; ++k) {
+                        process_cqe(more[k]);
+                        io_uring_cqe_seen(&ring_, more[k]);
+                    }
+                }
                 return 1;
             }
 
@@ -215,16 +241,21 @@ namespace coro {
                 }
 
                 --pending_ops_; // 挂起计数 -1
-                // 帧已销毁 (awaiter 析构 → untrack_op): 跳过写入, 防止 use-after-free
+                // 存活检查与写入**必须同处一把锁内**: 出锁后另一线程可以 untrack_op
+                // (awaiter 析构) 并销毁协程帧 —— 帧里就嵌着这个 uring_op, 届时再写
+                // op->result / 读 op->continuation 就是 use-after-free。锁内只做检查
+                // 而把写留在锁外, 等于把不变量交给运气。
+                std::coroutine_handle<> continuation{};
                 {
                     std::lock_guard lock(tracked_mutex_);
                     if (tracked_ops_.find(op) == tracked_ops_.end())
-                        return;
+                        return; // 帧已销毁: 完全不碰 op
+                    op->result = cqe->res;
+                    op->error = cqe->res < 0 ? -cqe->res : 0;
+                    continuation = op->continuation;
                 }
-                op->result = cqe->res;
-                op->error = cqe->res < 0 ? -cqe->res : 0;
-                if (op->continuation)
-                    on_complete(op->continuation); // 交还给事件循环
+                if (continuation)
+                    on_complete(continuation); // 只交出句柄, 之后不再触碰 op
             }
 
             // 提交 eventfd POLLIN SQE

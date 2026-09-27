@@ -148,7 +148,13 @@ namespace coro {
             return detail::timer_wait(state_);
         }
 
-        /// 把等待迁移到 now + d。可从任意线程调用。
+        /// 把等待迁移到 now + d。
+        ///
+        /// 线程合同: **只能在拥有本 Timer 的 EventLoop 线程调用**。原因不是懒,
+        /// 而是无等待者分支要普通地写 owner / handle (它们不是原子量, 只有
+        /// token 指向的对象、wait_taken、result 是), 而 await_suspend 在 owner 线程
+        /// 写同一批字段 —— 跨线程调 reset 就是数据竞争。需要跨线程终止请用
+        /// cancel() (它只动原子量并把唤醒投递回 owner loop)。
         ///
         /// 两种情形必须区分, 否则"周期行为由用户循环 reset 表达"不成立:
         ///   - 已有等待者: 只把它的 deadline 往后搬, 不结束等待;

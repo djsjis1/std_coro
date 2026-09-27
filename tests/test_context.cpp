@@ -200,4 +200,53 @@ TEST(ContextTest, TokenOutlivesItsSourceSafely) {
     EXPECT_TRUE(still_ok) << "取消源析构后令牌状态不应变成已取消";
 }
 
+namespace {
+
+    /// 帧局部探针: 计数当前存活的协程帧 (帧销毁即 -1)
+    struct frame_probe {
+        static std::atomic<int> alive;
+        frame_probe() { alive.fetch_add(1); }
+        ~frame_probe() { alive.fetch_sub(1); }
+    };
+    std::atomic<int> frame_probe::alive{0};
+
+    /// 带 deadline 的等待超时结束 -> 协程帧随之销毁。
+    /// 摘链必须发生在销毁之前, 否则之后的 cancel() 会对已释放句柄 schedule。
+    coro::Task<> deadline_then_report_frame_state(coro::CancellationSource* src, int* reason, bool* frame_gone) {
+        auto ctx = coro::Context::from(src->token()).with_deadline(30ms);
+        {
+            frame_probe probe;
+            co_await wait_reason(&ctx, reason);
+        }
+        *frame_gone = frame_probe::alive.load() == 0;
+        co_return;
+    }
+
+    /// 一次干净的"取消唤醒新等待", 用来证明摘链没把状态机搞坏
+    coro::Task<> fresh_wait_still_cancellable(int* reason) {
+        coro::CancellationSource s;
+        auto ctx = coro::Context::from(s.token());
+        auto waiter = coro::spawn(wait_reason(&ctx, reason));
+        co_await coro::yield();
+        s.cancel();
+        co_await std::move(waiter);
+        co_return;
+    }
+
+} // namespace
+
+TEST(ContextTest, CancelAfterTimeoutDoesNotWakeDestroyedFrame) {
+    int reason = 0;
+    bool frame_gone = false;
+    coro::CancellationSource src;
+    test_util::run_task([&] { return deadline_then_report_frame_state(&src, &reason, &frame_gone); });
+    EXPECT_EQ(reason, 2) << "先到原因的应是 deadline";
+    EXPECT_TRUE(frame_gone) << "等待协程帧应已销毁";
+
+    // 帧销毁之后再取消: 旧等待者必须已被摘链, 否则这里会对野句柄 schedule
+    src.cancel();
+    int after = 0;
+    test_util::run_task([&] { return fresh_wait_still_cancellable(&after); });
+    EXPECT_EQ(after, 1) << "取消语义对新等待者仍然正常 (摘链没破坏状态机)";
+}
 #endif // CORO_HAS_CONCURRENCY_EXT
