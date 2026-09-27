@@ -614,6 +614,8 @@ namespace coro::io {
 | `int >= 0`（read/write 类） | 实际字节数 |
 | `int == 0`（read 类） | 对端关闭 / EOF（不是错误） |
 | `int == -1` | 失败：`errno` 已**转换为标准 errno**（`strerror` 可直接用），平台原生码在 `io::last_error()` |
+| 抛 `CancelledError` | 挂起中的 I/O 被取消（任务 `cancel()` 或 `wait_for` 超时联动）——**绝不**以返回 0 表示，否则与 EOF 无法区分 |
+| 抛 `TimeoutError` | 带 deadline 的操作（如 `Context::wait()`）到点而未完成 |
 | `bool == false` | 失败（open 类） |
 | `valid() == false` | 失败（对象类：TcpStream/File/Process/Watcher） |
 
@@ -649,7 +651,9 @@ namespace coro::net {
 ```
 
 - `connect` 失败：socket 已在内部关闭，`valid() == false`；
-- `read` 返回 0 = 对端正常关闭；-1 = 错误；
+- `read` 返回 0 = 对端正常关闭；-1 = 错误（伴 `io::last_error()`）；挂起中被取消则抛
+  `CancelledError`——三种情况互相可区分（`NetTest.ReadAfterLocalCloseIsErrorNotEof` 与
+  `NetTest.CancelledReadIsNotReportedAsEof` 锁住该合同）；
 - Windows 上 socket 构造即关联创建线程的 IOCP；要把连接交给
   其他线程（Scheduler worker）处理：`accept_noattach()` + worker 内
   `reattach()`（Linux io_uring 无此约束，reattach 为空操作）；

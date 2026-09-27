@@ -7,6 +7,8 @@
 
 #include "test_util.h"
 
+#include <memory>
+
 using namespace std::chrono_literals;
 
 #ifdef _WIN32
@@ -332,4 +334,98 @@ TEST(NetTest, UdpDatagramsPreservePayloadAndSender) {
     }
 }
 #endif
+
+// ── 以下用例需要原生 I/O 能力, 故位于文件级门控之内 ──
+// ── EOF / 错误 / 取消 三者必须可区分 (计划 C4) ──
+namespace {
+
+    // 自己 close 之后再读: 属于"错误", 不得与"对端正常关闭 (返回 0)"混为一谈
+    coro::Task<> read_after_local_close(int* rc, int* native_error, bool* bound) {
+        coro::net::TcpListener listener;
+        unsigned short port = 0;
+        for (unsigned short candidate = 19400; candidate < 19420; ++candidate) {
+            if (listener.bind_listen("127.0.0.1", candidate)) {
+                port = candidate;
+                break;
+            }
+        }
+        if (port == 0)
+            co_return;
+        *bound = true;
+
+        coro::net::TcpStream client = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+        if (!client.valid())
+            co_return;
+        client.close();
+        coro::io::clear_error();
+        char buf[8];
+        *rc = co_await client.read(buf, sizeof(buf));
+        *native_error = coro::io::last_error();
+        co_return;
+    }
+
+    coro::Task<> accept_into_slot(coro::net::TcpListener* listener, coro::net::TcpStream* slot) {
+        *slot = co_await listener->accept();
+        co_return;
+    }
+
+    coro::Task<> read_into_until_cancel(coro::net::TcpStream* conn, int* rc, bool* cancelled) {
+        char buf[8];
+        try {
+            *rc = co_await conn->read(buf, sizeof(buf));
+        } catch (const coro::CancelledError&) {
+            *cancelled = true;
+        }
+        co_return;
+    }
+
+    // 挂起中的读被取消: 必须以 CancelledError 形式浮现, 不能伪装成读到 0 字节
+    coro::Task<> cancel_pending_read(int* rc, bool* cancelled, bool* bound) {
+        coro::net::TcpListener listener;
+        unsigned short port = 0;
+        for (unsigned short candidate = 19420; candidate < 19440; ++candidate) {
+            if (listener.bind_listen("127.0.0.1", candidate)) {
+                port = candidate;
+                break;
+            }
+        }
+        if (port == 0)
+            co_return;
+        *bound = true;
+
+        auto* loop = &coro::EventLoop::get();
+        auto server_slot = std::make_shared<coro::net::TcpStream>();
+        auto acceptor = coro::spawn(accept_into_slot(&listener, server_slot.get()));
+        coro::net::TcpStream client = co_await coro::net::TcpStream::connect("127.0.0.1", port);
+        co_await std::move(acceptor);
+        if (!server_slot->valid())
+            co_return;
+
+        auto reader =
+            std::make_shared<coro::Task<>>(coro::spawn(read_into_until_cancel(server_slot.get(), rc, cancelled)));
+        co_await coro::yield();
+        // cancel 必须投递回任务所属循环执行 (跨线程直接 cancel 会把唤醒送错地方)
+        loop->dispatch([reader] { reader->cancel(); });
+        co_await coro::sleep(50ms);
+        co_return;
+    }
+
+} // namespace
+
+TEST(NetTest, ReadAfterLocalCloseIsErrorNotEof) {
+    int rc = 0, native_error = 0;
+    bool bound = false;
+    test_util::run_task([&] { return read_after_local_close(&rc, &native_error, &bound); });
+    ASSERT_TRUE(bound);
+    EXPECT_EQ(rc, -1) << "已关闭 socket 上的读必须报告错误, 不能与对端 EOF (0) 混淆";
+    EXPECT_NE(native_error, 0) << "错误路径要留下可诊断的原生错误码";
+}
+
+TEST(NetTest, CancelledReadIsNotReportedAsEof) {
+    int rc = 0;
+    bool cancelled = false, bound = false;
+    test_util::run_task([&] { return cancel_pending_read(&rc, &cancelled, &bound); });
+    ASSERT_TRUE(bound);
+    EXPECT_TRUE(cancelled) << "取消必须以 CancelledError 浮现, 不能表现为读到 0 字节";
+}
 #endif // _WIN32 || __linux__

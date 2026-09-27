@@ -172,5 +172,8 @@ ctest --preset dev            # 等价于 ctest --test-dir build/dev --output-on
 6. `coro_header_check`（`TESTS=ON` 时随 all 目标构建）在 `URING=OFF` 与原生两种配置下
    都要通过：它给每个公共头生成一个独立 TU，专抓隐式 include 依赖与平台守卫边界外的
    代码；新增公共头无需登记，glob 自动覆盖；
-7. CI 四个 job 的 `-D` 组合与 `ctest` 注册保持一致（Web 自测是通过 `add_test`
-   挂在 `ctest` 下，不是独立步骤）。
+7. **构建验证必须用不带 `--target` 的全目标构建**（`cmake --build <dir>`）。只构建
+   `coro_tests` 会漏掉示例、压测、`web_shutdown_check` 等目标的编译错误——这个漏洞
+   实际让分支连续多个提交在 CI 上编译失败而本地毫无察觉。
+8. CI 四个 job 的 `-D` 组合与 `ctest` 注册保持一致（Web 自测是通过 `add_test`
+   挂在 `ctest` 下，不是独立步骤）；推送后必须回头确认 CI 结论，不能以本机结果代替。
