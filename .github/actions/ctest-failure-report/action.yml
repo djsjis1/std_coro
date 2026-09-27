@@ -40,7 +40,18 @@ runs:
           if [ -f "$c" ]; then log="$c"; break; fi
         done
         if [ -z "$log" ]; then
-          echo "::warning::$LABEL: LastTest.log not found, nothing to report"
+          echo "::warning::$LABEL: LastTest.log not found under $BUILD_DIR/Testing"
+          # 找不到就把实际布局列出来: Windows 两个作业连续两轮只留下 "not found",
+          # 靠猜没有意义。仍然不用 find (Windows 的 bash 里它可能被解析成 find.exe)。
+          for probe in "$BUILD_DIR/Testing" "$BUILD_DIR"*/Testing; do
+            if [ -d "$probe" ]; then
+              for f in "$probe"/*.log "$probe"/*/*.log "$probe"/*/*/*.log; do
+                if [ -e "$f" ]; then
+                  echo "::warning::$LABEL candidate log: $f"
+                fi
+              done
+            fi
+          done
           exit 0
         fi
         # 一个 ctest 目标里可能跑几百个用例, 只报目标名定位不到问题 ——
