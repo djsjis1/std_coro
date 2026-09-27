@@ -166,6 +166,9 @@ ctest --preset dev            # 等价于 ctest --test-dir build/dev --output-on
 1. `-DCORO_ENABLE_URING=OFF -DCORO_BUILD_TESTS=ON`：核心可构建，I/O 测试被跳过；
 2. 默认（`NATIVE_IO=ON`）+ `TESTS=ON`：全量单测；
 3. `-DCORO_ENABLE_WEB=ON`：Web 库/示例/Web 层测试；`URING=OFF` 时该组合必须配置期报错；
+   组件 target（`coro::web`、`coro::tcp_udp`）的**定义**只由能力条件决定，与
+   `CORO_BUILD_EXAMPLES` 无关；示例可执行（`web_server`、`tcp_udp_example`）才受该开关
+   控制。`cmake -S Web` 独立入口未定义该选项时按开处理，保证独立构建仍产出可执行；
 4. `cmake -S Web`：独立构建路径；
 5. `--install` + `tests/package_smoke` 消费安装树；`tests/core_smoke` 以 `coro::core`
    消费，验证纯核心消费者拿不到任何后端依赖；

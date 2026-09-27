@@ -213,14 +213,6 @@ if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
     endif()
 endif()
 
-# Web 服务器示例 (coro 网络层 + llhttp 协议解析, 独立子项目)
-if(CORO_ENABLE_WEB AND NOT CORO_WEB_BOOTSTRAP)
-    add_subdirectory(Web)
-endif()
-if(CORO_HAS_NET)
-    add_subdirectory(tcp_udp)
-endif()
-
 # 协程练习场 (main.cpp 用于练习写协程代码)
 # 练习场当前使用 tcp_udp 组件, 因此与网络能力一同注册: 否则 core-only + EXAMPLES=ON
 # 的配置会因缺少 <tcp_udp/...> 而构建失败 (该组合此前从未被验证)。
@@ -234,6 +226,20 @@ if(CORO_BUILD_BENCHMARKS OR CORO_BUILD_EXAMPLES)
     add_executable(coro_stress tests/stress.cpp)
     target_link_libraries(coro_stress PRIVATE coro::coro)
 endif()
+endif()
+
+# ============================================================================
+# 组件子目录 (定义 target, 与"是否构建示例"无关)
+# ============================================================================
+# 这两个 add_subdirectory 原先误嵌在 if(CORO_BUILD_EXAMPLES) 块内, 于是
+# EXAMPLES=OFF 的配置 (Sanitizer / Coverage 作业) 拿不到 coro::web 与
+# coro::tcp_udp —— 表现为 coro_tests 里的服务器生命周期测试找不到
+# <tcp_udp/tcp_server.hpp>。组件的存在性只应由能力决定, 示例注册才由开关决定。
+if(CORO_ENABLE_WEB AND NOT CORO_WEB_BOOTSTRAP)
+    add_subdirectory(Web)
+endif()
+if(CORO_HAS_NET)
+    add_subdirectory(tcp_udp)
 endif()
 
 # ============================================================================

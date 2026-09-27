@@ -25,9 +25,11 @@ target_include_directories(coro_tcp_udp INTERFACE
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 target_link_libraries(coro_tcp_udp INTERFACE coro::coro)
 
-# TCP/UDP echo 示例 (服务端 + 内置测试客户端)
-add_executable(tcp_udp_example example/main.cpp)
-target_link_libraries(tcp_udp_example PRIVATE coro::tcp_udp)
-if(MSVC)
-    target_compile_options(tcp_udp_example PRIVATE /utf-8)
+# TCP/UDP echo 示例 (服务端 + 内置测试客户端) —— 组件本身始终定义, 示例才受开关控制
+if(CORO_BUILD_EXAMPLES)
+    add_executable(tcp_udp_example example/main.cpp)
+    target_link_libraries(tcp_udp_example PRIVATE coro::tcp_udp)
+    if(MSVC)
+        target_compile_options(tcp_udp_example PRIVATE /utf-8)
+    endif()
 endif()
