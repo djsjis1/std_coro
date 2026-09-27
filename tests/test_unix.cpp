@@ -64,7 +64,11 @@ namespace {
     /// 只断言 bool 会让"为什么失败"变成要靠猜的问题 —— 上次抽象名用例就是这么卡住的。
     int g_bind_errno = 0;
 
-    coro::Task<> round_trip(const std::string& path, std::string* got, int* accepted_count, int* read_rc) {
+    /// path 必须**按值**进帧: 协程的引用参数只是把引用存进帧里, 而调用点
+    /// round_trip("@name", ...) 传的是临时 std::string —— 它在 lambda 返回时就销毁,
+    /// 协程之后从挂起点恢复再读它是悬空引用 (ASan 的 stack-use-after-return 即源于此,
+    /// 也解释了为什么具名变量的文件路径用例能过而抽象名用例只在 CI 炸)。
+    coro::Task<> round_trip(std::string path, std::string* got, int* accepted_count, int* read_rc) {
         coro::net::UnixListener listener;
         if (!listener.bind(path)) {
             g_bind_errno = errno;
