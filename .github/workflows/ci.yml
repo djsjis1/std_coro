@@ -121,14 +121,8 @@ jobs:
 
       - name: Build all targets
         run: |
-          cmake --build build 2>&1 | tee build.log
+          cmake --build build
 
-      # 一次性诊断 (定位后删除): 编译错误只出现在 job 日志里, 外部工具读不到;
-      # 把首条 error 与出错文件回传 annotation, 便于跨编译器定位。
-      - name: Report first build error
-        if: failure()
-        run: |
-          grep -m 6 -E "error:|Error [0-9]+" build.log | sed 's/^/::error::/' || echo "::warning::no error line captured"
 
       - name: Run unit tests
         timeout-minutes: 5
@@ -318,13 +312,8 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
 
       - name: Build (tests only)
-        run: cmake --build build --target coro_tests 2>&1 | tee build.log
+        run: cmake --build build --target coro_tests
 
-      # 一次性诊断 (定位后删除): 编译错误只写在 job 日志里, 外部工具读不到
-      - name: Report first build error
-        if: failure()
-        run: |
-          grep -m 6 -E "error:|Error [0-9]+|internal compiler error" build.log | sed 's/^/::error::/' || echo "::warning::no error line captured"
 
       - name: Run tests with sanitizer
         timeout-minutes: 10
@@ -399,13 +388,8 @@ jobs:
             -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
 
       - name: Build tests
-        run: cmake --build build --target coro_tests 2>&1 | tee build.log
+        run: cmake --build build --target coro_tests
 
-      # 一次性诊断 (定位后删除): 编译错误只写在 job 日志里, 外部工具读不到
-      - name: Report first build error
-        if: failure()
-        run: |
-          grep -m 6 -E "error:|Error [0-9]+|internal compiler error" build.log | sed 's/^/::error::/' || echo "::warning::no error line captured"
 
       - name: Run tests
         timeout-minutes: 5
