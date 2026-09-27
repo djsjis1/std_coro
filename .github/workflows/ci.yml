@@ -123,6 +123,13 @@ jobs:
         run: |
           cmake --build build 2>&1 | tee build.log
 
+      # 一次性诊断 (定位后删除): 编译错误只出现在 job 日志里, 外部工具读不到;
+      # 把首条 error 与出错文件回传 annotation, 便于跨编译器定位。
+      - name: Report first build error
+        if: failure()
+        run: |
+          grep -m 6 -E "error:|Error [0-9]+" build.log | sed 's/^/::error::/' || echo "::warning::no error line captured"
+
       - name: Run unit tests
         timeout-minutes: 5
         run: ctest --test-dir build --output-on-failure --timeout 120
