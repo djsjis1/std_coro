@@ -16,6 +16,7 @@
 - [上下文与取消 context.hpp](#上下文与取消-contexthpp)
 - [通道 channel.hpp](#通道-channelhpp)
 - [多路等待 select.hpp](#多路等待-selecthpp)
+- [限流 rate_limit.hpp](#限流-ratelimithpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -308,6 +309,40 @@ switch (r.index) { /* ... */ }
 - 关闭的通道分支表现为该分支的 `nullopt`（EOF），不会吞掉其他分支的机会。
 - select 退出后通道上**不残留任何登记**：后到的值照常可被接收。
 - 不支持嵌套 select 与任意 `Task` 参与竞速（有意划小的第一版范围）。
+
+## 限流 rate_limit.hpp
+
+> 并发扩展：测试与示例受 `-DCORO_ENABLE_CONCURRENCY_EXT=ON` 门控，头本身只依赖纯核心。
+> `#include <coro/rate_limit.hpp>`。loop-local，与 `channel` 一致不跨线程投递。
+
+```cpp
+coro::rate_limiter rl(100, std::chrono::seconds(1));  // 容量 100, 每 1s 补 100
+co_await rl.acquire();                                // 不足则挂到补充点, 不会失败
+if (!rl.try_acquire()) 走降级分支;                      // 非阻塞
+co_await rl.acquire_n(5);                              // 批量: 要么给 5 个, 要么一个不扣
+auto ms = rl.retry_after<std::chrono::milliseconds>(1); // 给上层回 429 Retry-After
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `rate_limiter(capacity, period[, refill])` | 桶容量（允许的突发）/ 补充周期 / 每周期补充量（缺省 = capacity）；初始满桶 |
+| `acquire()` / `acquire_n(n)` | 协程；不足时挂到下一个补充点；可被取消（抛 `CancelledError`） |
+| `try_acquire(n = 1)` | 非阻塞原子扣减；失败立即返回 `false` 且**不部分扣减** |
+| `available()` | 观测用；不要"读了再扣"（中间有竞态），要判定就用 `try_acquire` |
+| `retry_after<Duration>(n)` | 距下次可满足 n 个的时长；已满足时为 0 |
+| `set_rate(capacity, period[, refill])` | 运行时改速率；调小容量会截断存量，避免长期空转 |
+
+三条设计取舍（同步写在实现注释里）：
+
+- 令牌用**定点整数**（1 令牌 = 1024 份）而非 `double`：`double` 无法原子 CAS，而
+  "结算 + 扣减"必须是单条原子操作，否则并发 `acquire` 会超发。
+- 等待靠 `coro::sleep` 到下一个补充点，**不自建等待队列**：队列要处理取消摘链、帧销毁、
+  惊群唤醒三件事，而 sleep 的 token 作废机制已解决这些。代价是醒来者靠 CAS 抢令牌，
+  抢输的多睡一轮 —— 有界延迟、无死锁、无泄漏。
+- **不保证 FIFO 公平性**：只保证不超发、不永久饿死。
+
+与 `coro::Semaphore` 的分工：Semaphore 限"**同时**在途数量"（并发度），令牌桶限"**速率**"
+并允许突发。要"最多 N 个并发"用 Semaphore，要"每秒 N 次"用 rate_limiter。
 
 ## 并发组合 gather.hpp / wait.hpp
 
