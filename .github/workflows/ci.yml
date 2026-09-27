@@ -243,7 +243,14 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 5
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+        # 上一轮上报证明: build 里有 CTestTestfile.cmake 却没有 Testing/ 目录, 而 CTest
+        # 一运行就会创建 Testing/ —— 说明 ctest 根本没跑到, 失败原因只在它的控制台输出里。
+        # 所以把输出留档 (Tee 会让 pwsh 的最后一条命令变成 Tee-Object, 必须显式回传
+        # ctest 的退出码, 否则作业会被误判为成功)。
+        run: |
+          ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120 2>&1 |
+            Tee-Object -FilePath ctest-console.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 与 Linux 同样接上报通道: 之前 Windows 只有退出码, 定位不到是哪条用例
       - name: Report ctest failures
@@ -252,6 +259,18 @@ jobs:
         with:
           build-dir: build
           label: Windows ${{ matrix.build_type }}
+
+      # ctest 没跑起来时 LastTest.log 不存在, 上面的 action 报不出东西; 这里把控制台
+      # 尾部以 annotation 回传, 一次推送就能拿到真实失败原因。
+      - name: Report ctest console output
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path ctest-console.txt) {
+            Get-Content ctest-console.txt -Tail 20 | ForEach-Object { "::error::Windows console: $_" }
+          } else {
+            "::error::Windows console: ctest-console.txt 不存在 (ctest 未执行到输出阶段)"
+          }
 
       - name: Verify installed package
         run: |
