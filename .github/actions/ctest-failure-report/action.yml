@@ -33,7 +33,7 @@ runs:
         fi
         # 一个 ctest 目标里可能跑几百个用例, 只报目标名定位不到问题 ——
         # gtest 的失败行与 sanitizer 的诊断行才是可用粒度。
-        gtest_failed=$(grep -oE '^\[  FAILED  \] [A-Za-z0-9_./-]+' "$log" | sort -u | head -n 12)
+        gtest_failed=$(grep -oE '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' "$log" | sort -u | head -n 12)
         if [ -n "$gtest_failed" ]; then
           while IFS= read -r g; do
             echo "::error::$LABEL gtest failure: ${g#*] }"

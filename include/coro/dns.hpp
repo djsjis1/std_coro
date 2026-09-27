@@ -76,7 +76,12 @@ namespace coro {
                 std::vector<resolved_endpoint> out;
                 addrinfo hints{};
                 hints.ai_family = AF_INET; // v1 只取 v4 (见文件头范围说明)
-                hints.ai_socktype = SOCK_STREAM;
+                // service 为空时**必须**把 ai_socktype 留 0: MSDN 明确规定 pServiceName
+                // 为 NULL 时 ai_socktype 与 ai_protocol 必须为 0, Windows 的 getaddrinfo
+                // 会直接判失败; Linux 的 glibc 则容忍这个组合 —— 所以这个 bug 只在
+                // Windows CI 上暴露 (数值主机也救不了, 是 API 用法错误)。
+                if (!service.empty())
+                    hints.ai_socktype = SOCK_STREAM;
                 addrinfo* raw = nullptr;
                 const int rc = ::getaddrinfo(host.c_str(), service.empty() ? nullptr : service.c_str(), &hints, &raw);
                 if (rc != 0) {
