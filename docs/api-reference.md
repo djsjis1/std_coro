@@ -19,6 +19,7 @@
 - [限流 rate_limit.hpp](#限流-ratelimithpp)
 - [字节流 stream.hpp](#字节流-streamhpp)
 - [异步 DNS dns.hpp](#异步-dns-hpp)
+- [Unix 域套接字 unix.hpp](#unix-域套接字-unixhpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -439,6 +440,45 @@ auto sock = co_await coro::net::connect(eps[0]);               // 端点直接�
 - 不做结果缓存与 happy-eyeballs 排序（属连接池 / HTTP Client 层策略），不做反向解析。
 - 测试刻意用**非法服务名**触发失败而非"未知主机"：本机存在把任意域名（含 RFC 6761 保留的
   `.invalid`）解析到 198.18.0.8 的拦截器，用主机名断言会变成分环境偶发。
+
+## Unix 域套接字 unix.hpp
+
+> **仅 Linux + io_uring**。其他平台/配置下 `CORO_HAS_UNIX=0`，本头**编译为空**（不提供假实现），
+> 因此非 Linux 消费者零成本：`#include <coro/unix.hpp>`。
+
+```cpp
+coro::net::UnixListener listener;
+listener.bind("/tmp/app.sock");            // 或 listener.bind_abstract("myname") -> "@myname"
+auto conn = co_await listener.accept();
+co_await conn.write(msg, len);
+
+auto peer = co_await coro::net::UnixStream::connect("/tmp/app.sock");
+int n = co_await peer.read(buf, sizeof buf);   // 0 = 对端关闭 (EOF), -1 = 错误 (errno 已设)
+
+coro::net::UnixStream a, b;                     // 无路径的互联端点对 (同机 IPC 最省事)
+if (coro::net::unix_pair(a, b)) { ... }
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `bind(path[, backlog])` | 绑定文件系统路径；bind 前 `unlink` 同名陈旧 inode（否则 `EADDRINUSE`），析构只清理**自己**创建的路径 |
+| `bind_abstract(name[, backlog])` | 抽象命名空间（`@` 前缀），不依赖文件系统权限 |
+| `accept()` | 协程；返回 `UnixStream`，失败为无效对象并设 `errno` |
+| `UnixStream::connect(path)` | 协程；路径或 `@抽象名` |
+| `read` / `write` / `close` | 与 `TcpStream` 同一返回约定：`>=0` 字节数、`0` EOF、`-1` 错误 |
+| `unix_pair(a, b)` | `socketpair` 封装，两端立即可用 |
+
+三条边界（都写在头文件注释里）：
+
+- **关闭必须先 `shutdown` 再 `close`**：挂起的 io_uring `accept`/`recv` 持有 fd 引用，只
+  `close` 不会让它完成，事件循环会永久等待（`TcpListener`/`UdpSocket` 都为此踩过）。因此
+  `UnixListener::close()` / `UnixStream::close()` 都走两步；对应回归用例是
+  `UnixTest.CloseWakesPendingAccept`。
+- **路径过长直接判 `ENAMETOOLONG`**，不做静默截断——截断会连到另一个路径，比报错难查得多。
+- 抽象名的 `sun_path` 长度按名字实际长度计算（不能把尾部 NUL 算进去，否则内核侧是另一个名字）。
+- 取消语义与 `net.hpp` 一致：awaiter 提供 `static cancel_op(void*)` 即由 Task 的
+  await_transform 自动注册为取消钩子，走 `ASYNC_CANCEL` 让原操作以 `-ECANCELED` 完成，
+  保证 CQE 先于协程帧销毁被消费（不需要、也不允许手动给 `uring_op` 赋钩子字段）。
 
 ## 并发组合 gather.hpp / wait.hpp
 
