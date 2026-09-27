@@ -25,8 +25,20 @@ runs:
         # 主 log 固定位于 Testing/Temporary/LastTest.log; 注意不能直接 find -name
         # LastTest.log: 每个测试子目录 Testing/<name>/ 下也有一份该测试单独运行的
         # log, find 命中的第一个很可能不是主 log, 会永远看不到用例结果行。
-        log="$BUILD_DIR/Testing/Temporary/LastTest.log"
-        [ -f "$log" ] || log=$(find "$BUILD_DIR" -path '*/Temporary/LastTest.log' -print -quit 2>/dev/null)
+        # 主 log 固定在 Testing/Temporary/LastTest.log; 注意不能直接 find -name
+        # LastTest.log: 每个测试子目录 Testing/<name>/ 下也有一份该测试单独运行的
+        # log, 命中的第一个很可能不是主 log, 会永远看不到用例结果行。
+        # 也不用外部 find: Windows runner 的 bash 里 `find` 可能被解析成
+        # System32\find.exe (不是 GNU find), 命令失败会让兜底形同不存在 —— CI 上
+        # Windows 两个作业就因此只留下"LastTest.log not found", 报不出用例名。
+        # 改用 shell glob, 同时覆盖 VS 多配置的 Testing/<Config>/Temporary/ 布局。
+        log=""
+        for c in \
+            "$BUILD_DIR/Testing/Temporary/LastTest.log" \
+            "$BUILD_DIR"/Testing/*/Temporary/LastTest.log \
+            "$BUILD_DIR"/*/Testing/Temporary/LastTest.log; do
+          if [ -f "$c" ]; then log="$c"; break; fi
+        done
         if [ -z "$log" ]; then
           echo "::warning::$LABEL: LastTest.log not found, nothing to report"
           exit 0

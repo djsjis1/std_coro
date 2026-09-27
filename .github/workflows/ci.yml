@@ -1,318 +1,280 @@
-# ============================================================================
-# coro — 企业级 CI 流水线
-# ============================================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#coro — 企业级 CI 流水线
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 #
-#  全部并行:
-#    - lint: 只读格式检查
-#    - Linux: GCC 13 + Clang 18 × {Debug, Release}
-#    - macOS: (暂时禁用, 待 kqueue 事件源实现)
-#    - Windows: MSVC × {Debug, Release}
-#    - Sanitizer: ASan+UBSan (GCC), TSan (Clang)
-#    - 静态分析: cppcheck
-#    - 代码覆盖率: gcov + lcov
-# ============================================================================
+#全部并行:
+#- lint : 只读格式检查
+#- Linux : GCC 13 + Clang 18 × {Debug, Release }
+#- macOS : (暂时禁用, 待 kqueue 事件源实现)
+#- Windows : MSVC × {Debug, Release }
+#- Sanitizer : ASan + UBSan(GCC), TSan(Clang)
+#- 静态分析 : cppcheck
+#- 代码覆盖率 : gcov + lcov
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-name: CI
+name : CI
 
-# 控制编译和测试并行度；显式 Bash 保证管道中的失败不会被 tee 掩盖。
-env:
-  CMAKE_BUILD_PARALLEL_LEVEL: "2"
-  CTEST_PARALLEL_LEVEL: "1"
-defaults:
-  run:
-    shell: bash
-permissions:
-  contents: read
+#控制编译和测试并行度；显式 Bash 保证管道中的失败不会被 tee 掩盖。
+           env : CMAKE_BUILD_PARALLEL_LEVEL : "2" CTEST_PARALLEL_LEVEL : "1" defaults : run : shell : bash permissions
+    : contents : read
 
-on:
-  push:
-    # 除 main 外, 未合并的特性/修复分支也自带 CI 证据
-    # (跨平台矩阵无法在本机复现, 分支级验证避开"未验证先入 main")
-    branches: [main, 'feat/**', 'fix/**', 'refactor/**']
-  pull_request:
-    branches: [main]
+                     on : push :
+#除 main 外, 未合并的特性 / 修复分支也自带 CI 证据
+#(跨平台矩阵无法在本机复现, 分支级验证避开 "未验证先入 main")
+    branches : [ main, 'feat/**', 'fix/**', 'refactor/**' ] pull_request : branches : [main]
 
-# 同一 PR 的新 push 自动取消旧的运行
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+#同一 PR 的新 push 自动取消旧的运行
+                                                                                      concurrency : group
+    : ${{github.workflow}} -
+      $ {
+    { github.ref }
+}
+cancel - in -
+        progress : true
 
-jobs:
-  # ============================================================
-  # 代码格式检查（只读门禁）
-  # ============================================================
-  lint:
-    name: Lint (clang-format)
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
+                   jobs :
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#代码格式检查（只读门禁）
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+    lint : name
+    : Lint(clang - format) runs
+      -
+      on : ubuntu - 24.04 permissions : contents : read steps : -uses : actions / checkout @v4
 
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+           -
+           name : Install clang - format run : sudo apt - get update&& sudo apt - get install - y clang - format - 18
 
-      - name: Check formatting
-        run: |
-          find include router examples tests Web/src Web/main.cpp main.cpp \
-            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print0 | \
-          xargs -0 -r clang-format-18 --dry-run --Werror
+                                               -
+                                               name : Check formatting run
+    : |
+      find include router examples tests Web / src Web / main.cpp main.cpp \
+            \(-name '*.cpp' - o - name '*.hpp' - o - name '*.h' \) - print0 |
+      xargs - 0 - r clang - format - 18 --dry -
+          run-- Werror
 
-  # ============================================================
-  # Linux — GCC 13 + Clang 18, Debug + Release
-  # ============================================================
-  build-linux:
-    name: Linux (${{ matrix.label }}, ${{ matrix.build_type }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: "GCC 13"
-            compiler: g++-13
-            cc: gcc-13
-            install: g++-13
-            build_type: Debug
-          - label: "GCC 13"
-            compiler: g++-13
-            cc: gcc-13
-            install: g++-13
-            build_type: Release
-          - label: "Clang 18"
-            compiler: clang++-18
-            cc: clang-18
-            install: clang-18
-            build_type: Debug
-          - label: "Clang 18"
-            compiler: clang++-18
-            cc: clang-18
-            install: clang-18
-            build_type: Release
-    env:
-      CXX: ${{ matrix.compiler }}
-      CC: ${{ matrix.cc }}
-    steps:
-      - uses: actions/checkout@v4
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Linux — GCC 13 + Clang 18, Debug + Release
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+          build
+          - linux : name : Linux(${{matrix.label}}, ${{matrix.build_type}}) runs - on : ubuntu - 24.04 strategy : fail -
+                                                                                                                  fast
+    : false matrix : include : -label : "GCC 13" compiler
+    : g++ -
+      13 cc : gcc - 13 install : g++ - 13 build_type : Debug - label : "GCC 13" compiler : g++ - 13 cc : gcc -
+                                                                                                         13 install
+    : g++ -
+      13 build_type : Release - label : "Clang 18" compiler : clang++ - 18 cc : clang -
+                                                                                18 install
+    : clang
+      -
+      18 build_type : Debug - label : "Clang 18" compiler : clang++ - 18 cc : clang - 18 install : clang -
+                                                                                                   18 build_type
+    : Release env : CXX : $ {
+    { matrix.compiler }
+}
+CC : $ {
+    { matrix.cc }
+}
+steps : -uses : actions / checkout @v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }}
-          "$CXX" --version
-          uname -sr
-          # liburing 不从系统安装: io_uring 后端编译仓库内 thirdparty/liburing 源码
+        - name : Install dependencies run : |
+                                            sudo apt - get update sudo apt - get install - y $ {
+    { matrix.install }
+}
+"$CXX" --version uname - sr
+#liburing 不从系统安装 : io_uring 后端编译仓库内 thirdparty / liburing 源码
 
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+        - name : ccache uses : hendrikmuhs / ccache -
+        action @v1 .2 with : key : linux - ${{matrix.compiler}} - ${{matrix.build_type}}
 
-      - name: Configure CMake
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCORO_REQUIRE_URING=ON \
-            -DCORO_ENABLE_WEB=ON \
-            -DCORO_ENABLE_CONCURRENCY_EXT=ON \
-            -DCORO_BUILD_TESTS=ON \
-            -DCORO_BUILD_EXAMPLES=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                                   -
+                                   name : Configure CMake run : |
+                                                                cmake - B build - DCMAKE_BUILD_TYPE =
+    ${{matrix.build_type}} - DCORO_REQUIRE_URING =
+        ON - DCORO_ENABLE_WEB = ON - DCORO_ENABLE_CONCURRENCY_EXT =
+                                    ON - DCORO_BUILD_TESTS = ON - DCORO_BUILD_EXAMPLES =
+                                                                 ON - DCMAKE_C_COMPILER_LAUNCHER =
+                                                                     ccache - DCMAKE_CXX_COMPILER_LAUNCHER = ccache
 
-      - name: Build all targets
-        run: |
-          cmake --build build
+                                                                                                                 - name
+    : Build all targets run : |
+                              cmake-- build build
 
+                                  - name
+    : Run unit tests timeout -
+      minutes : 5 run : ctest-- test - dir build-- output - on - failure-- timeout 120
 
-      - name: Run unit tests
-        timeout-minutes: 5
-        run: ctest --test-dir build --output-on-failure --timeout 120
+#失败详情默认只存于 job 日志, 外部工具无法读取; 统一复用本地 action
+#把失败用例名以 annotation 报出。
+                        -
+                        name : Report ctest failures if : failure() uses :./.github / actions / ctest - failure -
+                        report with : label : "Linux ${{ matrix.label }} ${{ matrix.build_type }}"
 
-      # 失败详情默认只存于 job 日志, 外部工具无法读取; 统一复用本地 action
-      # 把失败用例名以 annotation 报出。
-      - name: Report ctest failures
-        if: failure()
-        uses: ./.github/actions/ctest-failure-report
-        with:
-          label: "Linux ${{ matrix.label }} ${{ matrix.build_type }}"
+                                              -
+                                              name : Verify installed package run
+    : |
+      cmake-- install build-- prefix "$PWD/build/install-root" cmake - S tests / package_smoke - B build / package -
+          smoke -
+          DCMAKE_BUILD_TYPE = ${{matrix.build_type}} - DCMAKE_PREFIX_PATH =
+                                  "$PWD/build/install-root" cmake-- build build / package - smoke./ build / package -
+                                  smoke / coro_package_smoke
+#纯核心消费者 : 证明带 io_uring 的安装包不会把后端依赖转交给 coro::core
+                                              cmake -
+                                  S tests / core_smoke - B build / core - smoke - DCMAKE_BUILD_TYPE =
+                                      ${{matrix.build_type}} - DCMAKE_PREFIX_PATH =
+                                          "$PWD/build/install-root" cmake-- build build / core - smoke./ build / core -
+                                              smoke / coro_core_smoke
 
-      - name: Verify installed package
-        run: |
-          cmake --install build --prefix "$PWD/build/install-root"
-          cmake -S tests/package_smoke -B build/package-smoke \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_PREFIX_PATH="$PWD/build/install-root"
-          cmake --build build/package-smoke
-          ./build/package-smoke/coro_package_smoke
-          # 纯核心消费者: 证明带 io_uring 的安装包不会把后端依赖转交给 coro::core
-          cmake -S tests/core_smoke -B build/core-smoke \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_PREFIX_PATH="$PWD/build/install-root"
-          cmake --build build/core-smoke
-          ./build/core-smoke/coro_core_smoke
+                                              - name : Verify standalone Web build timeout -
+                                                       minutes : 5 run
+    : |
+      cmake - S Web - B build - web - DCMAKE_BUILD_TYPE = ${{matrix.build_type}} - DCORO_REQUIRE_URING =
+                                                              ON cmake-- build build - web-- target web_server./ build -
+                                                                      web / web_server-- selftest 18083 ./ build -
+                                                                      web / web_server-- stress 2 3
 
-      - name: Verify standalone Web build
-        timeout-minutes: 5
-        run: |
-          cmake -S Web -B build-web \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCORO_REQUIRE_URING=ON
-          cmake --build build-web --target web_server
-          ./build-web/web_server --selftest 18083
-          ./build-web/web_server --stress 2 3
+                                                                      - name : Verify portable core without io_uring if
+    : matrix.label == 'GCC 13' && matrix.build_type ==
+                                                                  'Debug' run
+    : |
+      cmake - B build - core - DCMAKE_BUILD_TYPE = Debug - DCORO_ENABLE_URING =
+                                                       OFF - DCORO_BUILD_TESTS =
+                                                           ON - DCORO_BUILD_EXAMPLES =
+                                                               ON cmake-- build build - core ctest-- test - dir build -
+                                                                       core-- output - on - failure-- timeout 120
 
-      - name: Verify portable core without io_uring
-        if: matrix.label == 'GCC 13' && matrix.build_type == 'Debug'
-        run: |
-          cmake -B build-core \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCORO_ENABLE_URING=OFF \
-            -DCORO_BUILD_TESTS=ON \
-            -DCORO_BUILD_EXAMPLES=ON
-          cmake --build build-core
-          ctest --test-dir build-core --output-on-failure --timeout 120
+                                                                       - name : Run stress test(Release only) if
+    : matrix.build_type == 'Release' timeout - minutes : 5 run :./ build / coro_stress
 
-      - name: Run stress test (Release only)
-        if: matrix.build_type == 'Release'
-        timeout-minutes: 5
-        run: ./build/coro_stress
+                                                                       - name
+    : Upload build and test logs if : failure() uses : actions / upload -
+                                                                       artifact @v4 with : name
+    : linux -
+      ${{matrix.compiler}} - ${{matrix.build_type}} -
+      logs path : |
+                  build.log build / Testing / Temporary / build -
+                      core / Testing / Temporary /
 
-      - name: Upload build and test logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-${{ matrix.compiler }}-${{ matrix.build_type }}-logs
-          path: |
-            build.log
-            build/Testing/Temporary/
-            build-core/Testing/Temporary/
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#macOS — Apple Clang, Debug + Release
+#(暂时禁用 : macOS 缺少 IOCP / io_uring, 待 kqueue 事件源实现后启用)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#build - macos:
+#name : macOS(${{matrix.build_type}})
+#runs - on : macos - 14
+#strategy:
+#fail - fast : false
+#matrix:
+#build_type : [Debug, Release]
+#steps:
+#- uses : actions / checkout @v4
+#- name : ccache
+#uses : hendrikmuhs / ccache - action @v1 .2
+#with:
+#key : macos - ${{matrix.build_type } }
+#- name : Configure CMake
+#run : |
+#cmake - B build # - DCMAKE_BUILD_TYPE = ${{matrix.build_type } } # - DCMAKE_C_COMPILER_LAUNCHER =                     \
+                                               ccache # - DCMAKE_CXX_COMPILER_LAUNCHER = ccache
+#- name : Build all targets
+#run : cmake-- build build - j$(sysctl - n hw.ncpu)
+#- name : Run unit tests
+#run : ctest-- test - dir build - C ${{matrix.build_type } } --output - on - failure-- timeout 120
+#- name : Run stress test(Release only)
+#if : matrix.build_type == 'Release'
+#timeout - minutes : 5
+#run :./ build / coro_stress
 
-  # ============================================================
-  # macOS — Apple Clang, Debug + Release
-  # (暂时禁用: macOS 缺少 IOCP/io_uring, 待 kqueue 事件源实现后启用)
-  # ============================================================
-  # build-macos:
-  #   name: macOS (${{ matrix.build_type }})
-  #   runs-on: macos-14
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       build_type: [Debug, Release]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: ccache
-  #       uses: hendrikmuhs/ccache-action@v1.2
-  #       with:
-  #         key: macos-${{ matrix.build_type }}
-  #     - name: Configure CMake
-  #       run: |
-  #         cmake -B build \
-  #           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-  #           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-  #           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-  #     - name: Build all targets
-  #       run: cmake --build build -j$(sysctl -n hw.ncpu)
-  #     - name: Run unit tests
-  #       run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
-  #     - name: Run stress test (Release only)
-  #       if: matrix.build_type == 'Release'
-  #       timeout-minutes: 5
-  #       run: ./build/coro_stress
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Windows — MSVC, Debug + Release
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+                          build -
+                      windows : name : Windows(${{matrix.build_type}}) runs - on : windows -
+                                                                                   2022 defaults : run : shell
+    : pwsh strategy : fail -
+                      fast : false matrix : build_type : [ Debug, Release ] steps : -uses : actions / checkout @v4
 
-  # ============================================================
-  # Windows — MSVC, Debug + Release
-  # ============================================================
-  build-windows:
-    name: Windows (${{ matrix.build_type }})
-    runs-on: windows-2022
-    defaults:
-      run:
-        shell: pwsh
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: [Debug, Release]
-    steps:
-      - uses: actions/checkout@v4
+                      -
+                      name : Configure CMake run : cmake - B build - DCMAKE_BUILD_TYPE =
+                                                                   ${{matrix.build_type}} - DCORO_ENABLE_WEB =
+                                                                       ON - DCORO_BUILD_TESTS =
+                                                                           ON - DCORO_BUILD_EXAMPLES = ON
 
-      - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCORO_ENABLE_WEB=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON
+                                                                                                       - name
+    : Build all targets run : cmake-- build build-- config ${{matrix.build_type}}
 
-      - name: Build all targets
-        run: cmake --build build --config ${{ matrix.build_type }}
+                              -
+                              name : Run unit tests timeout - minutes : 5 run : ctest-- test - dir build - C $ {
+    { matrix.build_type }
+}
+--output - on - failure-- timeout 120
 
-      - name: Run unit tests
-        timeout-minutes: 5
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+#与 Linux 同样接上报通道 : 之前 Windows 只有退出码, 定位不到是哪条用例
+        - name : Report ctest failures if : failure() uses :./.github / actions / ctest - failure
+        - report with : build - dir : build label : Windows ${{matrix.build_type}}
 
-      # 与 Linux 同样接上报通道: 之前 Windows 只有退出码, 定位不到是哪条用例
-      - name: Report ctest failures
-        if: failure()
-        uses: ./.github/actions/ctest-failure-report
-        with:
-          build-dir: build
-          label: Windows ${{ matrix.build_type }}
+                                                    -
+                                                    name : Verify installed package run : |
+                                                                                          cmake-- install build
+                                                                                          -- config $ {
+    { matrix.build_type }
+}
+--prefix "$env:GITHUB_WORKSPACE\build\install-root" cmake - S tests / package_smoke - B build / package - smoke -
+    DCMAKE_PREFIX_PATH =
+    "$env:GITHUB_WORKSPACE\build\install-root" cmake-- build build / package - smoke-- config ${{matrix.build_type}} &
+    "build\package-smoke\${{ matrix.build_type }}\coro_package_smoke.exe" cmake - S tests / core_smoke -
+        B build / core - smoke - DCMAKE_PREFIX_PATH =
+        "$env:GITHUB_WORKSPACE\build\install-root" cmake-- build build / core - smoke-- config ${{matrix.build_type}} &
+            "build\core-smoke\${{ matrix.build_type }}\coro_core_smoke.exe"
 
-      - name: Verify installed package
-        run: |
-          cmake --install build --config ${{ matrix.build_type }} --prefix "$env:GITHUB_WORKSPACE\build\install-root"
-          cmake -S tests/package_smoke -B build/package-smoke -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-root"
-          cmake --build build/package-smoke --config ${{ matrix.build_type }}
-          & "build\package-smoke\${{ matrix.build_type }}\coro_package_smoke.exe"
-          cmake -S tests/core_smoke -B build/core-smoke -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-root"
-          cmake --build build/core-smoke --config ${{ matrix.build_type }}
-          & "build\core-smoke\${{ matrix.build_type }}\coro_core_smoke.exe"
+                - name : Verify standalone Web build timeout -
+                         minutes : 5 run : |
+                                           cmake - S Web - B build - web cmake-- build build - web-- config $ {
+    { matrix.build_type }
+}
+--target web_server &
+    "build-web\${{ matrix.build_type }}\web_server.exe" --selftest 18083 if ($LASTEXITCODE - ne 0){exit $LASTEXITCODE} &
+    "build-web\${{ matrix.build_type }}\web_server.exe" --stress 2 3 if ($LASTEXITCODE - ne 0){exit $LASTEXITCODE}
 
-      - name: Verify standalone Web build
-        timeout-minutes: 5
-        run: |
-          cmake -S Web -B build-web
-          cmake --build build-web --config ${{ matrix.build_type }} --target web_server
-          & "build-web\${{ matrix.build_type }}\web_server.exe" --selftest 18083
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "build-web\${{ matrix.build_type }}\web_server.exe" --stress 2 3
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            - name : Run stress test(Release only) if : matrix.build_type
+        == 'Release' timeout -
+               minutes : 5 run : build\Release\coro_stress.exe
 
-      - name: Run stress test (Release only)
-        if: matrix.build_type == 'Release'
-        timeout-minutes: 5
-        run: build\Release\coro_stress.exe
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#Sanitizer 构建(Linux)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+                                 sanitizer : name : Sanitizer(${{matrix.name}}) runs
+               - on : ubuntu -
+                      24.04 strategy : fail - fast : false matrix : include : -name : "ASan+UBSan (GCC)" cxx : g++ -
+                                                                                                               13 cc
+    : gcc
+      -
+      13 flags : "-fsanitize=address,undefined -fno-omit-frame-pointer" install
+    : g++ -
+      13 - name : "TSan (Clang)" cxx : clang++ -
+                                       18 cc : clang -
+                                               18 flags : "-fsanitize=thread -fno-omit-frame-pointer" install : clang -
+                                                                                                                18 env
+    : CXX : $ {
+    { matrix.cxx }
+}
+CC : $ {
+    { matrix.cc }
+}
+CXXFLAGS : $ {
+    { matrix.flags }
+}
+CFLAGS : $ {
+    { matrix.flags }
+}
+ASAN_OPTIONS : "detect_leaks=0:abort_on_error=1" TSAN_OPTIONS : "abort_on_error=1" UBSAN_OPTIONS
+    : "print_stacktrace=1:abort_on_error=1" steps : -uses : actions /
+                                                            checkout @v4
 
-  # ============================================================
-  # Sanitizer 构建 (Linux)
-  # ============================================================
-  sanitizer:
-    name: Sanitizer (${{ matrix.name }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: "ASan+UBSan (GCC)"
-            cxx: g++-13
-            cc: gcc-13
-            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
-            install: g++-13
-          - name: "TSan (Clang)"
-            cxx: clang++-18
-            cc: clang-18
-            flags: "-fsanitize=thread -fno-omit-frame-pointer"
-            install: clang-18
-    env:
-      CXX: ${{ matrix.cxx }}
-      CC: ${{ matrix.cc }}
-      CXXFLAGS: ${{ matrix.flags }}
-      CFLAGS: ${{ matrix.flags }}
-      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
-      TSAN_OPTIONS: "abort_on_error=1"
-      UBSAN_OPTIONS: "print_stacktrace=1:abort_on_error=1"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }}
+        - name : Install dependencies run : |
+                                            sudo apt - get update sudo apt - get install - y $ {
+    { matrix.install }
+}
           "$CXX" --version
           uname -sr
 
@@ -333,9 +295,9 @@ jobs:
         with:
           label: "Sanitizer ${{ matrix.name }}"
 
-  # ============================================================
-  # 静态分析 (cppcheck)
-  # ============================================================
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
+#静态分析(cppcheck)
+#== == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
   static-analysis:
     name: Static Analysis (cppcheck)
     runs-on: ubuntu-24.04
@@ -347,14 +309,21 @@ jobs:
 
       - name: Run cppcheck (core library)
         run: |
-          # header-only 库必须显式传入头文件；目录扫描会跳过 .hpp。
+#header - only 库必须显式传入头文件；目录扫描会跳过.hpp。
           headers=(include/coro/*.hpp)
           test -f "${headers[0]}"
           cppcheck --version
           # 隐藏逐文件进度，保留诊断；局部抑制仅用于已说明原因的代码位置。
+          # -I thirdparty/liburing/src/include 与本地保持一致: 缺它会让 io_uring 相关
+          #   头被当作"找不到符号"处理, 诊断集与本地不同。
+          # 抑制 toomanyconfigs: 它是一条 information (cppcheck 默认只检查前 12 个
+          #   #ifdef 组合, 头文件多了就会提示), 不是代码缺陷; 但 --error-exitcode=1
+          #   会把它算成失败。代价是**覆盖确实被截断**, 因此同时打印配置数供人判断,
+          #   需要全量时用 `--force` 单独跑一遍 (耗时数倍, 不适合放在每个 push 上)。
           cppcheck --quiet --enable=warning,performance,portability \
-            --language=c++ --std=c++20 --inline-suppr --suppress=missingIncludeSystem \
-            -I include \
+            --language=c++ --std=c++20 --inline-suppr \
+            --suppress=missingIncludeSystem --suppress=toomanyconfigs \
+            -I include -I thirdparty/liburing/src/include \
             --error-exitcode=1 \
             "${headers[@]}" 2>&1 | tee cppcheck.log
 
