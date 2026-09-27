@@ -43,13 +43,11 @@ runs:
           echo "::warning::$LABEL: LastTest.log not found under $BUILD_DIR/Testing"
           # 找不到就把实际布局列出来: Windows 两个作业连续两轮只留下 "not found",
           # 靠猜没有意义。仍然不用 find (Windows 的 bash 里它可能被解析成 find.exe)。
-          for probe in "$BUILD_DIR/Testing" "$BUILD_DIR"*/Testing; do
-            if [ -d "$probe" ]; then
-              for f in "$probe"/*.log "$probe"/*/*.log "$probe"/*/*/*.log; do
-                if [ -e "$f" ]; then
-                  echo "::warning::$LABEL candidate log: $f"
-                fi
-              done
+          for entry in "$BUILD_DIR" "$BUILD_DIR"/Testing "$BUILD_DIR"/Testing/*; do
+            if [ -e "$entry" ]; then
+              echo "::warning::$LABEL exists: $entry"
+            else
+              echo "::warning::$LABEL missing: $entry"
             fi
           done
           exit 0
@@ -61,7 +59,7 @@ runs:
         while IFS= read -r line; do
           detail=$(printf '%s' "$line" | tr -d '\r' | cut -c1-160)
           [ -n "$detail" ] && echo "::error::$LABEL gtest detail: $detail"
-        done < <(grep -A2 -E '^[^:]+:[0-9]+: Failure' "$log" 2>/dev/null | head -n 40)
+        done < <(grep -A6 -E '^[^:]+:[0-9]+: Failure' "$log" 2>/dev/null | head -n 60)
 
         # gtest 的失败行与 sanitizer 的诊断行才是可用粒度。
         gtest_failed=$(grep -oE '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' "$log" | sort -u | head -n 12)
@@ -70,7 +68,22 @@ runs:
             echo "::error::$LABEL gtest failure: ${g#*] }"
           done <<< "$gtest_failed"
         fi
+        # 只回传首行等于没有回传: 定位需要的是"哪次访问、哪个线程、栈顶在哪一行"。
+        # 因此把 WRITE/READ of size ... by thread 与栈帧行 (#N 0x... in func file:line)
+        # 一起报出, 栈帧只保留函数与源码位置、丢掉地址与偏移避免噪声。
         san_err=$(grep -oE '(ERROR: AddressSanitizer|ERROR: LeakSanitizer|WARNING: ThreadSanitizer|runtime error): [^[:cntrl:]]{0,120}' "$log" | sort -u | head -n 8)
+        san_frames=$(grep -oE '(READ|WRITE) of size [0-9]+ at 0x[0-9a-f]+ by thread T[0-9]+' "$log" | sort -u | head -n 4)
+        san_where=$(grep -oE '^ *#[0-9]+ 0x[0-9a-f]+ in [^(]{1,90}' "$log" | sed 's/^ *//' | head -n 12)
+        if [ -n "$san_frames" ]; then
+          while IFS= read -r f; do
+            echo "::error::$LABEL sanitizer access: $f"
+          done <<< "$san_frames"
+        fi
+        if [ -n "$san_where" ]; then
+          while IFS= read -r w; do
+            echo "::error::$LABEL sanitizer frame: $w"
+          done <<< "$san_where"
+        fi
         if [ -n "$san_err" ]; then
           while IFS= read -r e; do
             echo "::error::$LABEL sanitizer: $e"
