@@ -21,6 +21,7 @@
 - [异步 DNS dns.hpp](#异步-dns-hpp)
 - [Unix 域套接字 unix.hpp](#unix-域套接字-unixhpp)
 - [资源池 pool.hpp](#资源池-poolhpp)
+- [TLS tls.hpp](#tls-tlshpp)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -525,6 +526,53 @@ use(**lease);                            // 或 lease->write(...)
 
 范围：不做空闲 TTL 淘汰与健康探测——那需要资源侧"还能用吗"的回调，由使用者拿到 lease
 后自行校验并 `discard()` 更诚实；也不做每键多池（按 endpoint 分池由调用方组合）。
+
+## TLS tls.hpp
+
+> **需要 `CORO_ENABLE_TLS=ON` 且仓库内存在 `thirdparty/openssl` 源码**（OpenSSL 3.5.8 LTS）。
+> 关闭时 `tls.hpp` 整体编译为空：消费者既不需要 OpenSSL 头文件，也不会被链接 `libssl`。
+> 实现体在 `include/coro/detail/tls.ipp`（唯一 `#include <openssl/*.h>` 的位置）。
+
+```cpp
+coro::tls::TlsContext ctx(coro::tls::TlsContext::role::client);
+if (!ctx.load_system_trust()) throw std::runtime_error("无信任锚: 必须失败, 不得跳过校验");
+
+auto sock = co_await coro::net::TcpStream::connect(ip, 443);
+coro::tls::TlsStream tls(std::move(sock), ctx, "example.com");
+if (!co_await tls.handshake()) throw coro::tls::TlsError(tls.last_error(), 0);
+
+coro::stream_writer w(tls);            // TlsStream 满足 AsyncWritable
+co_await w.write_line("GET / HTTP/1.0\r\n");
+coro::stream_reader r(tls);            // 也满足 AsyncReadable
+auto line = co_await r.read_line();
+const bool clean = co_await tls.shutdown();   // 双向 close_notify
+```
+
+| 接口 | 语义 |
+| --- | --- |
+| `TlsContext(role)` | 持有 `SSL_CTX`；默认最低 TLS 1.2；客户端强制 `SSL_VERIFY_PEER` |
+| `load_system_trust()` / `load_verify_file(path)` | 加载验证锚，**失败返回 false**（不静默降级为不校验） |
+| `use_certificate_file` / `use_private_key_file` | 服务端证书与私钥（私钥会做 `check_private_key` 配对校验） |
+| `set_min_version` / `set_alpn` / `set_hostname_verification` | 版本下限、ALPN（wire format 由实现拼装）、主机名校验开关 |
+| `TlsStream::handshake()` | 协程；返回 `bool`，失败原因见 `last_error()`；可被取消 |
+| `read` / `write` | 协程成员，返回 `Task<int>`，约定与 `TcpStream` 一致（`0` = 干净 EOF，`-1` = 错误） |
+| `shutdown()` | 必须完成**双向** `close_notify` 才返回 true；未完成/协议错误即会话作废 |
+| `peer_verified` / `negotiated_version` / `negotiated_alpn` | 握手结果观测 |
+
+三条设计要点（都在头注释里）：
+
+1. **memory BIO 隧道**：`SSL_set_bio` 挂两个内存 BIO，`WANT_READ` 时从 socket `co_await read`、
+   `WANT_WRITE` 时 `co_await write` 排空，全程不阻塞事件循环线程 —— 因此握手/读写天然可取消。
+   （直接 `SSL_connect` 或用阻塞 BIO 会把整个 loop 卡住。）
+2. **`read`/`write` 是协程成员而非手写 awaiter**：这样自动继承框架的取消注入与异常传播，
+   不必重造挂起/摘链/取消兜底 —— 那是本项目反复出过错的地方。
+3. **未完成 `close_notify` 交换的连接不得回连接池**：`shutdown()` 返回 false 即应 `discard()`；
+   实测踩过的坑是 `SSL_get_shutdown()` 的 `SSL_RECEIVED_SHUTDOWN` 位**只在库处理该记录后**才更新，
+   刚 `BIO_write` 进去就查标志必然为空，会把已成功的交换误判为失败。
+
+前置工具：OpenSSL 的构建脚本需要 **Perl**（CI 与本人都按外部前置处理）；NASM 缺失时统一
+`no-asm`，保证不同机器编出同一套 C 实现。Windows 的 nmake/JOM 编排尚未实现，配置期显式
+`FATAL_ERROR` 而不是静默产出坏库。
 
 ## 并发组合 gather.hpp / wait.hpp
 

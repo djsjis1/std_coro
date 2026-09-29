@@ -26,3 +26,6 @@ cmake_install.cmake
 
 # Plans
 .zcode/plans/
+
+# OpenSSL 源码树已入库 (thirdparty/openssl/), 原始压缩包不入库避免双份体积
+thirdparty/openssl-*.tar.gz
