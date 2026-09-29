@@ -12,7 +12,6 @@
 #include <coroutine>
 #include <cstdint>
 #include <functional>
-#include <iostream>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -145,17 +144,11 @@ namespace coro {
         /// 获取当前等待原语 (网络层需要它关联 socket 到 IOCP)
         EventSource* event_source_ptr() const { return event_source_.get(); }
 
-#ifdef _WIN32
-        /// 当前 loop 的 IOCP 事件源 (构造时缓存, 类型化)。
-        /// IO 层 (net/fs/pipe/process) 每次操作都用它 —— 替代旧的
-        /// dynamic_cast(event_source_ptr()) 每操作一次 RTTI 行走。
-        /// 用户安装了非 IOCP 事件源时为 nullptr (调用方需判空)。
-        net::IocpEventSource* iocp() const noexcept { return iocp_source_; }
-#endif
-#ifdef CORO_URING_ENABLED
-        /// 当前 loop 的 io_uring 事件源 (构造时缓存, 类型化), 语义同 iocp()
-        net::UringEventSource* uring() const noexcept { return uring_source_; }
-#endif
+        // 平台类型化访问已收口到 io 层 (detail::current_iocp / detail::current_uring,
+        // memo 化, 热路径一次指针比较): EventLoop 本体不声明任何平台事件源类型,
+        // 核心与平台细节解耦。仅 make_default_event_source (下方, 组合根职责)
+        // 仍引用平台类型 —— "每个平台默认用哪个事件源"是构造期决策, 去掉它需要
+        // 引入事件源注册机制, 复杂度不值。
 
         /// 跨线程投递一个普通函数到本事件循环执行 (Scheduler 分发用)。
         /// 在事件循环线程以非协程方式执行 —— 供"在正确线程创建协程帧"的场景:
@@ -286,20 +279,13 @@ namespace coro {
             return std::make_shared<CVEventSource>();
         }
 
-        // 安装/重装事件源: 注册完成回调 + 缓存类型化指针
+        // 安装/重装事件源: 注册完成回调
         void install_event_source() {
             // 完成回调: I/O 完成包 → 协程交还给「拥有本事件源的 loop」。
             // 替代旧的全局 detail::scheduler() 函数指针 —— 那个会被每个
-            // 线程构造 loop 时覆写, 多线程同时构造是数据竞争。
+            // 线程构造 loop 时覆写, 多线程同时构造 loop 是数据竞争。
             event_source_->set_completion_handler(
                 this, [](void* ctx, std::coroutine_handle<> h) { static_cast<EventLoop*>(ctx)->schedule(h); });
-            // 类型化缓存 (每 loop 一次 dynamic_cast, 取代 IO 层每操作一次)
-#ifdef _WIN32
-            iocp_source_ = dynamic_cast<net::IocpEventSource*>(event_source_.get());
-#endif
-#ifdef CORO_URING_ENABLED
-            uring_source_ = dynamic_cast<net::UringEventSource*>(event_source_.get());
-#endif
         }
 
         // ---- 定时器堆条目 ----
@@ -416,14 +402,6 @@ namespace coro {
 
         // 等待原语抽象 (默认由构造函数按平台选择)
         std::shared_ptr<EventSource> event_source_;
-
-#ifdef _WIN32
-        // IOCP 事件源类型化缓存 (install_event_source 维护; 零开销访问)
-        net::IocpEventSource* iocp_source_ = nullptr;
-#endif
-#ifdef CORO_URING_ENABLED
-        net::UringEventSource* uring_source_ = nullptr;
-#endif
 
         // 将到期的定时器从堆中移入就绪队列 (仅事件循环线程)。
         // 返回本次使用的时钟点 (run_impl 复用, 省一次 now() 调用)

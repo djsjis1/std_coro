@@ -1,5 +1,19 @@
 #pragma once
 
+#ifdef _WIN32
+// Windows 公共宏的唯一定义点。所有需要 windows.h 的头 (io / net /
+// iocp_event_source 及经它们间接引入者) 都直接或间接包含本文件。
+// 注意: iocp_event_source.hpp 不能改为包含 io.hpp 来取宏 —— 那会形成
+// io → event_loop → iocp_event_source → io 的循环包含 (pragma once 会把
+// 中途的 io.hpp 判为已包含, 宏反而拿不到)。
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX // 防止 windows.h 的 max/min 宏破坏 std::chrono::milliseconds::max()
+#endif
+#endif
+
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>

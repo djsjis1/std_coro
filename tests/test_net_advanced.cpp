@@ -316,7 +316,7 @@ namespace {
 
 TEST(UringFailureTest, FailedSubmitCannotUseFreedBufferOnLaterSubmit) {
     auto& loop = coro::EventLoop::get();
-    auto* source = loop.uring();
+    auto* source = coro::detail::current_uring();
     if (!source)
         GTEST_SKIP() << "当前内核不支持 io_uring";
     int fds[2];

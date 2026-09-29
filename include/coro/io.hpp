@@ -3,8 +3,7 @@
 #include "event_loop.hpp"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+// WIN32_LEAN_AND_MEAN / NOMINMAX 已由 event_source.hpp 单点定义 (经 event_loop.hpp 引入)
 #include <winsock2.h>
 #include <windows.h>
 #elif defined(__linux__)
@@ -12,6 +11,7 @@
 #endif
 
 #include <cerrno>
+#include <utility>
 
 // ============================================================================
 // coro::io — IO 公共底座: 错误模型 + 各 IO 模块 (net/fs/pipe/process) 共享的约定
@@ -33,9 +33,26 @@
 // ============================================================================
 
 namespace coro {
+#ifdef _WIN32
+    namespace detail {
+        /// 当前事件循环的 IOCP 事件源 (memo 化类型化访问器)。
+        /// EventLoop 本体不再声明平台类型 (解耦: 核心不知道平台细节), 类型
+        /// 解析收口在 IO 底座: 热路径 = 1 次 TLS 读 + 1 次指针比较, 与旧的
+        /// EventLoop 成员读同量级; dynamic_cast 只在 memo 未命中时发生,
+        /// 正常运行 = 每线程每事件源恰好一次 (set_event_source 禁止运行中替换,
+        /// 以源指针为键 double 保险)。
+        inline net::IocpEventSource* current_iocp() {
+            EventSource* src = EventLoop::get().event_source_ptr();
+            static thread_local std::pair<EventSource*, net::IocpEventSource*> memo{nullptr, nullptr};
+            if (memo.first != src)
+                memo = {src, dynamic_cast<net::IocpEventSource*>(src)};
+            return memo.second;
+        }
+    } // namespace detail
+#endif
 #ifdef CORO_URING_ENABLED
     namespace detail {
-        /// SQE 提交 + 挂起计数 (所有 io_uring IO 模块共用: net/fs/pipe/process)
+        /// SQE 提交 + 挂起计数 (所有 io_uring IO 模块共用: net/fs/pipe/process/unix)
         inline void uring_submit(net::UringEventSource* u, io_uring_sqe* sqe, detail::uring_op* op) {
             io_uring_sqe_set_data(sqe, op);
             int ret = io_uring_submit(u->handle());
@@ -59,6 +76,23 @@ namespace coro {
             }
             // 内核已消费的操作不能因 submit 返回错误而提前释放。
             u->op_start();
+        }
+
+        /// 当前事件循环的 io_uring 事件源 (memo 化类型化访问器, 语义同 current_iocp)
+        inline net::UringEventSource* current_uring() {
+            EventSource* src = EventLoop::get().event_source_ptr();
+            static thread_local std::pair<EventSource*, net::UringEventSource*> memo{nullptr, nullptr};
+            if (memo.first != src)
+                memo = {src, dynamic_cast<net::UringEventSource*>(src)};
+            return memo.second;
+        }
+
+        /// SQE 提交 + 挂起数统计的薄包装 (转发 uring_submit; ring 参数仅为
+        /// 调用点可读性保留)。net 与 unix 的 awaiter 共用, 原先定义在 net.hpp,
+        /// 曾迫使 unix.hpp 依赖 TCP 头 —— 现收编为 io 层公共设施。
+        inline void uring_submit_op(net::UringEventSource* u, io_uring* ring, detail::uring_op* op, io_uring_sqe* sqe) {
+            (void)ring;
+            uring_submit(u, sqe, op);
         }
     } // namespace detail
 #endif

@@ -2,7 +2,6 @@
 
 #include "event_loop.hpp"
 #include "io.hpp"
-#include "net.hpp"
 #include "task.hpp"
 
 #include <sys/socket.h>
@@ -142,7 +141,7 @@ namespace coro {
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<read_awaiter*>(ptr);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
                             io_uring_submit(u->handle());
@@ -152,7 +151,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -161,7 +160,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_recv(sqe, self->fd_, buf, len, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -198,7 +197,7 @@ namespace coro {
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<write_awaiter*>(ptr);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
                             io_uring_submit(u->handle());
@@ -208,7 +207,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -217,7 +216,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_send(sqe, self->fd_, buf, len, MSG_NOSIGNAL);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -288,6 +287,7 @@ namespace coro {
 
             /// 绑定文件系统路径 (自动 unlink 同名陈旧 inode) 并开始监听
             bool bind(const std::string& path, int backlog = SOMAXCONN) {
+                close(); // 幂等: 释放旧 fd 并 unlink 旧路径, 重复 bind 不泄漏
                 sockaddr_un addr = make_unix_address(path);
                 if (addr.sun_family != AF_UNIX)
                     return false; // 路径过长: errno 已由 make_unix_address 设好
@@ -339,13 +339,17 @@ namespace coro {
                 ~accept_awaiter() {
                     if (uring_)
                         uring_->untrack_op(&op);
+                    // accept 成功与取消竞态时 await_resume 可能被跳过;
+                    // 此时 CQE 里的新 fd 仍由本 awaiter 负责关闭 (同 net.hpp)。
+                    if (uring_ && !op.error && op.result >= 0)
+                        ::close(op.result);
                 }
 
                 bool await_ready() const noexcept { return false; }
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<accept_awaiter*>(ptr);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
                             io_uring_submit(u->handle());
@@ -355,7 +359,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -364,7 +368,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_accept(sqe, self->fd_, nullptr, nullptr, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -383,7 +387,8 @@ namespace coro {
                         errno = static_cast<int>(-op.result);
                         return UnixStream{};
                     }
-                    return UnixStream{op.result};
+                    // exchange 清零: 防止析构兜底 (取消竞态关 fd) 二次关闭已交接的 fd
+                    return UnixStream{std::exchange(op.result, -1)};
                 }
             };
 

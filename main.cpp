@@ -1,129 +1,201 @@
+// ============================================================================
+// main.cpp — 高并发多线程 TCP 回显服务器 (单端口, SO_REUSEPORT)
+// ============================================================================
+// 协议: [4字节长度(网络序)] + [N字节数据]
+//   服务器按消息边界读取完整消息后原样回显, 避免 TCP 流合并导致的数据错乱
+// ============================================================================
 #include <coro/coro.hpp>
 #include <coro/sleep.hpp>
-#include <tcp_udp/udp_server.hpp>
-#include <map>
-#include <cstring>
+#include <tcp_udp/tcp_server.hpp>
+
+#include <atomic>
 #include <chrono>
-using coro::Task;
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 using namespace std::chrono_literals;
 
-// ============================================================================
-// UDP 分片重组: 按客户端地址维护会话缓冲区
-// ============================================================================
-//
-// UDP 虽然保留消息边界, 但应用层协议可能把一条逻辑消息拆成多个数据报发送
-// (例如超过 MTU 时, 或自定义分片协议)。
-//
-// 常见重组策略 (按协议选择):
-//   1. 长度前缀: 前 N 字节 = 整条消息长度, 攒够长度后交付
-//   2. 分隔符:   遇到特定字节序列 (如 '\n' 或 '\0') 视为一条消息结束
-//   3. 序号+总数: 每个分片带 (seq, total), 收齐 total 个后按序拼装
-//
-// 下面以 "2 字节大端长度前缀 + 载荷" 为例演示策略 1。
-// ============================================================================
+static std::atomic<bool> g_running{true};
 
-// 会话超时时间: 超过此时间无数据到达, 视为"连接断开"
-static constexpr auto SESSION_TIMEOUT = 30s;
-// 清理协程的扫描间隔
-static constexpr auto CLEANUP_INTERVAL = 10s;
-
-// 客户端会话: 标识一个 (IP, port) 对应的连接状态
-struct ClientSession {
-    std::vector<char> buffer;                          // 累积的原始字节, 尚未凑够完整消息
-    std::chrono::steady_clock::time_point last_active; // 最后一次收到数据的时间
-};
-
-// 用 (ip, port) 作为会话 key
-struct SockAddrKey {
-    uint32_t ip;
-    uint16_t port;
-    bool operator<(const SockAddrKey& o) const { return ip < o.ip || (ip == o.ip && port < o.port); }
-};
-
-static SockAddrKey make_key(const sockaddr_in& addr) {
-    return {addr.sin_addr.s_addr, addr.sin_port};
+static void on_signal(int) {
+    g_running.store(false, std::memory_order_release);
 }
 
-// 从 buffer 头部解析 2 字节大端长度前缀, 返回消息总长 (含前缀本身)
-// buffer 不足 2 字节时返回 0, 表示还需要更多数据
-static size_t peek_message_length(const std::vector<char>& buf) {
-    if (buf.size() < 2)
-        return 0;
-    auto hi = static_cast<uint8_t>(buf[0]);
-    auto lo = static_cast<uint8_t>(buf[1]);
-    return static_cast<size_t>((hi << 8) | lo) + 2; // +2 是前缀本身
+struct WorkerStats {
+    size_t handled = 0;
+    size_t rejected = 0;
+};
+
+// 精确读取 n 字节, 返回实际读到的字节数 (0=对端关闭)
+static coro::Task<int> read_exact(coro::net::TcpStream& conn, char* buf, int n) {
+    int total = 0;
+    while (total < n) {
+        int r = co_await conn.read(buf + total, n - total);
+        if (r <= 0) co_return total;
+        total += r;
+    }
+    co_return total;
 }
 
-Task<> main_task() {
-    // 会话表: 每个客户端地址对应一个累积缓冲区
-    std::map<SockAddrKey, ClientSession> sessions;
+static WorkerStats worker_func(int id, unsigned short port) {
+    auto& loop = coro::EventLoop::get();
+    auto server = std::make_unique<coro::TcpServer>();
 
-    coro::UdpServer server;
+    coro::TcpServer::Config cfg;
+    cfg.bind_addr = "0.0.0.0";
+    cfg.port = port;
+    cfg.max_concurrent_handlers = 10000;
+    cfg.shutdown_grace = 2s;
+    cfg.cancel_grace = 1s;
+    server->set_config(cfg);
 
-    // ------------------------------------------------------------------
-    // 后台清理协程: 定期扫描 sessions, 踢掉超时的会话释放内存
-    // ------------------------------------------------------------------
-    auto cleanup = [&sessions]() -> Task<> {
+    static std::atomic<int> conn_count{0};
+    server->set_handler([id](coro::net::TcpStream conn) -> coro::Task<> {
+        int n = conn_count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 10)
+            std::printf("[worker-%d] connection #%d accepted\n", id, n);
+
+        // 协议: [4字节 uint32 网络序长度] + [数据]
+        char len_buf[4];
+        char data_buf[65536];
+
         while (true) {
-            co_await coro::sleep(CLEANUP_INTERVAL); // 每 10s 扫一次
+            // 1. 读 4 字节长度头
+            int r = co_await read_exact(conn, len_buf, 4);
+            if (r < 4) break;
 
-            auto now = std::chrono::steady_clock::now();
-            for (auto it = sessions.begin(); it != sessions.end();) {
-                if (now - it->second.last_active > SESSION_TIMEOUT) {
-                    // 超时: 可选地通知应用层 (如日志记录)
-                    std::cout << "[cleanup] session expired, removing" << std::endl;
-                    it = sessions.erase(it); // 释放该会话的 buffer 内存
-                } else {
-                    ++it;
-                }
+            uint32_t msg_len = ntohl(*(uint32_t*)len_buf);
+            if (msg_len == 0 || msg_len > sizeof(data_buf)) break;
+
+            // 2. 读完整消息体
+            r = co_await read_exact(conn, data_buf, msg_len);
+            if (r < (int)msg_len) break;
+
+            // 3. 回显: 先发长度头, 再发数据体
+            uint32_t net_len = htonl(msg_len);
+            int w1 = co_await conn.write((const char*)&net_len, 4);
+            if (w1 <= 0) break;
+
+            int written = 0;
+            while (written < (int)msg_len) {
+                int nw = co_await conn.write(data_buf + written, msg_len - written);
+                if (nw <= 0) break;
+                written += nw;
             }
+            if (written < (int)msg_len) break;
         }
-    };
-    spawn(cleanup()).detach(); // 启动后台清理, detach 自持有
-
-    // ------------------------------------------------------------------
-    // handler: 每收到一个 UDP 数据报调用一次
-    // ------------------------------------------------------------------
-    server.set_handler([&sessions, &server](const char* data, size_t size, const sockaddr_in& addr) -> Task<> {
-        auto key = make_key(addr);
-        auto& session = sessions[key];
-
-        // 更新活跃时间 (每次收到数据都刷新)
-        session.last_active = std::chrono::steady_clock::now();
-
-        // 1) 追加本次数据报到会话缓冲区
-        session.buffer.insert(session.buffer.end(), data, data + size);
-
-        // 2) 循环尝试从缓冲区中提取完整消息 (可能一次收到多个完整消息)
-        while (true) {
-            size_t msg_len = peek_message_length(session.buffer);
-            if (msg_len == 0 || session.buffer.size() < msg_len)
-                break; // 数据不够, 等下一个数据报
-
-            // 3) 提取一条完整消息
-            std::string payload(session.buffer.begin() + 2, session.buffer.begin() + msg_len);
-            session.buffer.erase(session.buffer.begin(), session.buffer.begin() + msg_len);
-
-            // 4) 处理这条完整消息
-            std::cout << "[" << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port) << "] complete message ("
-                      << payload.size() << " bytes): " << payload << std::endl;
-        }
-
         co_return;
     });
 
-    server.set_error_handler([](const std::string& error) { std::cout << "Error: " << error << std::endl; });
+    server->set_error_handler(
+        [id](const std::string& msg) { std::fprintf(stderr, "[worker-%d] error: %s\n", id, msg.c_str()); });
 
-    server.run_forever("0.0.0.0", 8080);
+    auto* srv = server.get();
 
-    co_return;
+    if (!srv->start()) {
+        std::fprintf(stderr, "[worker-%d] start() failed on port %u\n", id, port);
+        return {};
+    }
+ 
+    std::printf("[worker-%d] ready on 0.0.0.0:%u\n", id, srv->port());
+
+    auto watchdog = [id, &loop, srv]() -> coro::Task<> {
+        while (g_running.load(std::memory_order_acquire))
+            co_await coro::sleep(std::chrono::milliseconds(100));
+        auto report = co_await srv->shutdown();
+        std::printf("[worker-%d] shutdown: drained=%s, unfinished=%zu, total_conn=%zu\n", id,
+                    report.drained ? "yes" : "no", report.unfinished, srv->total_connections());
+        loop.stop();
+        co_return;
+    };
+
+    auto wt = watchdog();
+    wt.start();
+    loop.run();
+
+    WorkerStats s;
+    s.handled = srv->total_connections();
+    s.rejected = srv->rejected_connections();
+    server.reset();
+    return s;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 #endif
-    coro::run(main_task());
+
+    unsigned short port = 9000;
+    size_t num_workers = std::thread::hardware_concurrency();
+    if (num_workers == 0) num_workers = 4;
+
+    if (argc > 1) port = static_cast<unsigned short>(std::atoi(argv[1]));
+    if (argc > 2) num_workers = static_cast<size_t>(std::atoi(argv[2]));
+
+    std::printf("==========================================================\n");
+    std::printf("  高并发多线程 TCP 回显服务器 (长度前缀协议)\n");
+    std::printf("==========================================================\n");
+    std::printf("  端口:       %u (所有 worker 共享, SO_REUSEPORT)\n", port);
+    std::printf("  Worker 数:  %zu\n", num_workers);
+    std::printf("  并发上限:   10000 connections / worker\n");
+    std::printf("  协议:       [4B length][payload]\n");
+    std::printf("==========================================================\n");
+
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    std::vector<std::thread> threads;
+    std::vector<WorkerStats> stats(num_workers);
+    threads.reserve(num_workers);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    for (size_t i = 0; i < num_workers; ++i) {
+        threads.emplace_back([&stats, i, port] { stats[i] = worker_func(static_cast<int>(i), port); });
+    }
+
+    std::this_thread::sleep_for(1s);
+
+    std::printf("==========================================================\n");
+    std::printf("  %zu workers 就绪, 端口 %u, Ctrl+C 退出\n", num_workers, port);
+    std::printf("==========================================================\n");
+
+    while (g_running.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(200ms);
+
+    std::printf("\n[main] 收到退出信号, 等待 worker 优雅关闭...\n");
+
+    for (auto& t : threads)
+        t.join();
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+    size_t total_handled = 0, total_rejected = 0;
+    std::printf("\n==========================================================\n");
+    std::printf("  Worker 统计\n");
+    std::printf("==========================================================\n");
+    for (size_t i = 0; i < num_workers; ++i) {
+        std::printf("  worker-%zu  connections=%-8zu  rejected=%zu\n", i, stats[i].handled, stats[i].rejected);
+        total_handled += stats[i].handled;
+        total_rejected += stats[i].rejected;
+    }
+    std::printf("----------------------------------------------------------\n");
+    std::printf("  合计      connections=%-8zu  rejected=%zu\n", total_handled, total_rejected);
+    std::printf("  运行时间: %lld ms\n", (long long)elapsed);
+    std::printf("==========================================================\n");
+
     return 0;
 }

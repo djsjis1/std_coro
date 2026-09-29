@@ -73,6 +73,29 @@ target_link_libraries(my_app PRIVATE coro::coro)
 
 安装与平台验证边界见 [质量基线与发布说明](docs/quality-status.md)。
 
+## 头文件与模块边界
+
+`coro.hpp` **只聚合核心层**（Task/EventLoop/gather/Future/sync/Queue/wait/TaskGroup/to_thread/Scheduler 等，零平台依赖），**不含** IO 层与并发扩展——按需单独 include：
+
+| 需要什么 | include |
+|---|---|
+| TCP / UDP socket | `<coro/net.hpp>` |
+| 异步文件 | `<coro/fs.hpp>` |
+| 管道 / fd 轮询 | `<coro/pipe.hpp>` |
+| Unix domain socket | `<coro/unix.hpp>` |
+| DNS / 子进程 / 信号 / 目录监视 | `<coro/dns.hpp>` / `<coro/process.hpp>` / `<coro/signal.hpp>` / `<coro/fs_watch.hpp>` |
+| 流式读写适配（read_line/write_all…） | `<coro/stream.hpp>` |
+| channel / select / Timer / Context(取消) / rate_limiter / Pool | `<coro/channel.hpp>` / `<coro/select.hpp>` / `<coro/timer.hpp>` / `<coro/context.hpp>` / `<coro/rate_limit.hpp>` / `<coro/pool.hpp>` |
+| 高级服务框架 | `<coro/tcp_udp/tcp_server.hpp>`、`<coro/tcp_udp/udp_server.hpp>` |
+
+能力宏（由 CMake 目标定义注入，header-only 消费者无需关心）：
+
+| 宏 | 含义 | 缺失时的行为 |
+|---|---|---|
+| `CORO_HAS_URING` | Linux 上启用 io_uring 事件源 | 事件源回退 condition_variable，IO awaiter 返回 `-ENOTSUP` |
+| `CORO_HAS_UNIX` | 由 `CORO_HAS_URING` 派生 | unix.hpp 编译为空 |
+| `CORO_HAS_CONCURRENCY_EXT` | 并发扩展层随构建参与编译 | 头文件仍可 include（构建级门控，非 API 门控） |
+
 ## Python asyncio → C++20 映射速查
 
 | Python | coro (本库) |

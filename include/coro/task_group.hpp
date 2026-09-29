@@ -4,7 +4,6 @@
 #include "exceptions.hpp"
 
 #include <atomic>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -157,6 +156,29 @@ namespace coro {
                 if (!exceptions.empty()) {
                     throw ExceptionGroup(std::move(exceptions));
                 }
+            }
+
+            /// 等待者被取消/销毁 (框架的取消注入会绕过 await_resume):
+            /// 1) 摘除 waiter —— 否则最后一个 monitor 完成时会 schedule 一个
+            ///    已销毁 (或已 catch 取消继续跑) 的句柄, 前者是 UB, 后者是错误唤醒;
+            /// 2) 取消传染给全部子任务 —— 对齐 Python TaskGroup:
+            ///    `async with tg` 所在任务被取消时, 子任务一并被取消。
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                std::vector<std::shared_ptr<Task<void>>> to_cancel;
+                {
+                    std::lock_guard lock(st->mutex);
+                    if (st->waiter == h) {
+                        st->waiter = nullptr;
+                        st->waiter_loop = nullptr;
+                    }
+                    for (auto& m : st->monitors) {
+                        if (m && !m->is_ready())
+                            to_cancel.push_back(m);
+                    }
+                }
+                // 取消动作放在锁外 (与 record_failure 的约定一致, 避免锁反转)
+                for (auto& m : to_cancel)
+                    m->cancel();
             }
         };
 

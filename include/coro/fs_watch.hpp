@@ -98,7 +98,7 @@ namespace coro {
             /// 接管已打开的目录句柄 (正常用法: co_await fs::watch(...))
             explicit DirectoryWatcher(HANDLE dir, bool recursive) : dir_(dir), recursive_(recursive) {
                 if (valid()) {
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp || !iocp->associate(dir_)) {
                         fail(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
                     }
@@ -145,7 +145,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp) {
                         op.error = ERROR_NOT_SUPPORTED;
                         EventLoop::get().schedule(h);
@@ -375,7 +375,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -386,7 +386,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);

@@ -6,6 +6,7 @@
 #include <coroutine>
 #include <deque>
 #include <optional>
+#include <utility>
 
 // ============================================================================
 // coro::sync — 协程同步原语 (Lock / Semaphore / Event)
@@ -21,6 +22,19 @@
 // ============================================================================
 
 namespace coro {
+
+    namespace detail {
+        /// 从等待队列摘除指定句柄 (协程帧销毁/被取消时的僵尸清理)。
+        /// Lock / Event / Condition 的 on_waiter_destroyed 共用。
+        inline void erase_waiter(std::deque<std::coroutine_handle<>>& waiters, std::coroutine_handle<> h) noexcept {
+            for (auto it = waiters.begin(); it != waiters.end();) {
+                if (*it == h)
+                    it = waiters.erase(it);
+                else
+                    ++it;
+            }
+        }
+    } // namespace detail
 
     // ============================================================================
     // Lock — 互斥锁 (支持同一协程递归获取)
@@ -77,6 +91,10 @@ namespace coro {
                 --recursion_count_;
                 return;
             }
+            // 未持有而调用 release: 按文档为无操作 (Python asyncio.Lock 在此抛
+            // RuntimeError; C++ 侧 release 无调用者身份, 只能选择不破坏状态)
+            if (!locked_)
+                return;
             // 清除所有者
             owner_ = nullptr;
             if (!waiters_.empty()) {
@@ -95,13 +113,14 @@ namespace coro {
 
         /// 等待者协程帧被销毁时, 从等待队列摘除僵尸句柄
         /// (否则 release 时 schedule 已销毁的帧 → UB)
+        ///
+        /// 额外职责: 若本协程已被 release() 点名为「下一任持有者」但在接管前
+        /// 被取消, 必须把锁继续传下去 —— 否则锁永远停留在已死协程名下,
+        /// 后续所有 acquire 永久挂起 (对齐 asyncio: 取消不得泄漏锁)。
         void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
-            for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (*it == h)
-                    it = waiters_.erase(it);
-                else
-                    ++it;
-            }
+            detail::erase_waiter(waiters_, h);
+            if (owner_ == h.address())
+                release(); // 把锁交给队首下一位 (或解锁)
         }
 
         // ==================================================================
@@ -146,6 +165,9 @@ namespace coro {
                 return true;
             }
             Guard await_resume() noexcept { return Guard{lock}; }
+
+            /// 挂起期间被取消/销毁: 摘链 + 若已被点名移交则把锁传下去 (同 Lock)
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { lock->on_waiter_destroyed(h); }
         };
 
         guard_awaiter guard() noexcept { return {this}; }
@@ -172,6 +194,12 @@ namespace coro {
     // 典型场景:
     //   - 限制同时发起的 HTTP 连接数
     //   - 限制数据库连接池中的并发请求
+    //
+    // 取消安全 (与 Queue 相同的「预留」协议):
+    //   release() 把许可直接点名交给队首等待者 (reserved = true) 并调度它。
+    //   若该等待者在接管前被取消 (on_waiter_destroyed 而非 await_resume),
+    //   许可必须传给下一位或归还计数 —— 否则一次取消就永久损失一个许可,
+    //   信号量会随取消次数慢慢「漏干」直至死锁。
     // ============================================================================
     class Semaphore {
       public:
@@ -180,40 +208,63 @@ namespace coro {
         Semaphore(const Semaphore&) = delete;
         Semaphore& operator=(const Semaphore&) = delete;
 
-        bool await_ready() noexcept {
-            if (permits_ > 0) {
-                --permits_;
-                return true;
+        /// 获取许可的 awaiter 基础: 句柄 + 预留标记。
+        /// acquire 与 guard 两种等待者共用同一队列, 因此抽出公共基类。
+        struct waiter {
+            std::coroutine_handle<> h{};
+            bool reserved = false; // 许可已被点名交给我 (取消时必须传下去)
+        };
+
+        struct acquire_awaiter : waiter {
+            Semaphore* sem;
+
+            explicit acquire_awaiter(Semaphore* s) noexcept : sem(s) {}
+
+            bool await_ready() noexcept {
+                if (sem->permits_ > 0) {
+                    --sem->permits_;
+                    return true;
+                }
+                return false;
             }
-            return false;
-        }
 
-        void await_suspend(std::coroutine_handle<> h) { waiters_.push_back(h); }
+            void await_suspend(std::coroutine_handle<> h) {
+                this->h = h;
+                sem->waiters_.push_back(this);
+            }
 
-        bool await_resume() const noexcept { return true; }
+            bool await_resume() noexcept { return true; }
+
+            /// 取消/销毁路径: 摘链; 已被点名的许可传给下一位
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept { sem->remove_waiter(this); }
+        };
+
+        /// 获取许可。如果有可用许可, await_ready 返回 true 立即通过;
+        /// 否则挂起等待。注意: await_ready 在可用时负责递减 permits_
+        acquire_awaiter acquire() { return acquire_awaiter{this}; }
 
         void release() {
             if (!waiters_.empty()) {
-                auto h = waiters_.front();
+                auto* w = waiters_.front();
                 waiters_.pop_front();
-                EventLoop::get().schedule(h);
+                w->reserved = true; // 许可直接移交给它 (permits_ 保持 0)
+                EventLoop::get().schedule(w->h);
             } else {
                 ++permits_;
             }
         }
 
-        /// 获取许可。如果有可用许可, await_ready 返回 true 立即通过;
-        /// 否则挂起等待。
-        /// 注意: await_ready 在可用时负责递减 permits_
-        Semaphore& acquire() { return *this; }
-
-        /// 等待者协程帧被销毁时, 从等待队列摘除僵尸句柄
-        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
-            for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (*it == h)
-                    it = waiters_.erase(it);
-                else
-                    ++it;
+        /// 等待者被取消/销毁时的收尾 (按身份精确处理, 与 Queue 相同)
+        void remove_waiter(waiter* w) {
+            if (std::exchange(w->reserved, false)) {
+                release(); // 许可已点名给我而我没能接管: 传给下一位或归还
+            } else {
+                for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
+                    if (*it == w) {
+                        waiters_.erase(it);
+                        break;
+                    }
+                }
             }
         }
 
@@ -229,8 +280,10 @@ namespace coro {
             Guard& operator=(const Guard&) = delete;
         };
 
-        struct guard_awaiter {
+        struct guard_awaiter : waiter {
             Semaphore* sem;
+
+            explicit guard_awaiter(Semaphore* s) noexcept : sem(s) {}
 
             bool await_ready() noexcept {
                 if (sem->permits_ > 0) {
@@ -239,17 +292,23 @@ namespace coro {
                 }
                 return false;
             }
-            void await_suspend(std::coroutine_handle<> h) { sem->waiters_.push_back(h); }
+            void await_suspend(std::coroutine_handle<> h) {
+                this->h = h;
+                sem->waiters_.push_back(this);
+            }
             Guard await_resume() noexcept { return Guard{sem}; }
+
+            /// 同 acquire_awaiter: 摘链 + 预留许可的传递
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept { sem->remove_waiter(this); }
         };
 
-        guard_awaiter guard() noexcept { return {this}; }
+        guard_awaiter guard() noexcept { return guard_awaiter{this}; }
 
         int available() const noexcept { return permits_; }
 
       private:
         int permits_;
-        std::deque<std::coroutine_handle<>> waiters_;
+        std::deque<waiter*> waiters_;
     };
 
     // ============================================================================
@@ -285,14 +344,7 @@ namespace coro {
         Event& wait() { return *this; }
 
         /// 等待者协程帧被销毁时, 从等待队列摘除僵尸句柄
-        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
-            for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (*it == h)
-                    it = waiters_.erase(it);
-                else
-                    ++it;
-            }
-        }
+        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { detail::erase_waiter(waiters_, h); }
 
         /// 触发事件: 唤醒所有等待者
         void set() {
@@ -414,14 +466,7 @@ namespace coro {
         // ---- 清理 ----
 
         /// 等待者协程帧被销毁时, 摘除僵尸句柄
-        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
-            for (auto it = waiters_.begin(); it != waiters_.end();) {
-                if (*it == h)
-                    it = waiters_.erase(it);
-                else
-                    ++it;
-            }
-        }
+        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { detail::erase_waiter(waiters_, h); }
 
       private:
         Lock* lock_;                                  // 关联的互斥锁

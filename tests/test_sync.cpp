@@ -5,6 +5,10 @@
 
 #include "test_util.h"
 
+#include <atomic>
+#include <chrono>
+#include <memory>
+
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -246,4 +250,100 @@ TEST(SyncTest, QueueNowait) {
     test_util::run_task([&] { return nowait_scenario(&empty_gets, &rejected_puts); });
     EXPECT_EQ(empty_gets, 1);
     EXPECT_EQ(rejected_puts, 1);
+}
+
+// ============================================================================
+// 取消与等待队列的交互 (回归: sync.hpp 的 erase_waiter / 预留点名协议)
+//
+// 这两条测试针对的是"取消不得把原语弄成永久卡死"的不变量:
+//   - 排队中的等待者被取消后, 持有者释放时绝不能去调度已销毁的协程帧;
+//   - 被取消的等待者不能吞掉锁/许可 —— 否则一次取消就让后续所有人永久挂起。
+// 用 sleep 建立确定性的先后关系, 不用单次 yield 假定跨任务时序。
+// ============================================================================
+
+namespace {
+
+    coro::Task<> lock_holder(coro::Lock* lk, std::atomic<bool>* held, std::atomic<bool>* released) {
+        auto guard = co_await lk->guard();
+        held->store(true);
+        co_await coro::sleep(30ms); // 持锁期间让别人排队
+        released->store(true);
+        co_return; // guard 在此析构 -> release()
+    }
+
+    coro::Task<> lock_taker(coro::Lock* lk, std::atomic<bool>* got) {
+        auto guard = co_await lk->guard();
+        got->store(true);
+        co_return;
+    }
+
+    /// 排队者被取消 -> 持有者释放 -> 第三个人必须仍能拿到锁
+    coro::Task<> cancelled_queued_lock_waiter(bool* third_got, bool* holder_done) {
+        coro::Lock lk;
+        std::atomic<bool> held{false}, released{false}, b_got{false}, c_got{false};
+
+        auto holder = coro::spawn(lock_holder(&lk, &held, &released));
+        co_await coro::sleep(10ms); // 确保持有者已持锁
+
+        auto b = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &b_got)));
+        co_await coro::sleep(5ms);  // B 已挂进等待队列
+        auto c = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &c_got)));
+        co_await coro::sleep(5ms);  // C 也挂进队列 (排在 B 之后)
+
+        auto* loop = &coro::EventLoop::get();
+        loop->dispatch([b] { b->cancel(); });
+        co_await coro::sleep(60ms); // 等持有者释放并把锁交给 C
+
+        co_await std::move(holder);
+        *holder_done = released.load();
+        *third_got = c_got.load();
+        EXPECT_FALSE(b_got.load()) << "被取消的等待者不该最终拿到锁";
+        co_return;
+    }
+
+    coro::Task<> sem_holder(coro::Semaphore* sm, std::atomic<bool>* acquired, int hold_ms) {
+        co_await sm->acquire();
+        acquired->store(true);
+        co_await coro::sleep(std::chrono::milliseconds(hold_ms));
+        sm->release();
+        co_return;
+    }
+
+    /// 信号量: 排队者被取消后许可不该被吞掉
+    coro::Task<> cancelled_queued_semaphore_waiter(bool* third_got) {
+        coro::Semaphore sm(1);
+        std::atomic<bool> a{false}, b{false}, c{false};
+
+        auto holder = coro::spawn(sem_holder(&sm, &a, 30));
+        co_await coro::sleep(10ms); // A 已占住唯一许可
+
+        auto vb = std::make_shared<coro::Task<>>(coro::spawn(sem_holder(&sm, &b, 1)));
+        co_await coro::sleep(5ms);
+        auto vc = std::make_shared<coro::Task<>>(coro::spawn(sem_holder(&sm, &c, 1)));
+        co_await coro::sleep(5ms);
+
+        auto* loop = &coro::EventLoop::get();
+        loop->dispatch([vb] { vb->cancel(); });
+        co_await coro::sleep(60ms); // A 释放后许可应落到 C
+
+        co_await std::move(holder);
+        *third_got = c.load();
+        EXPECT_FALSE(b.load()) << "被取消的等待者不该最终拿到许可";
+        co_return;
+    }
+
+} // namespace
+
+TEST(SyncTest, CancelledQueuedLockWaiterDoesNotStallTheQueue) {
+    bool third_got = false;
+    bool holder_done = false;
+    test_util::run_task([&] { return cancelled_queued_lock_waiter(&third_got, &holder_done); });
+    EXPECT_TRUE(holder_done);
+    EXPECT_TRUE(third_got) << "排队者被取消后, 锁队列卡死了 (第三个人永远拿不到锁)";
+}
+
+TEST(SyncTest, CancelledQueuedSemaphoreWaiterDoesNotLeakPermits) {
+    bool third_got = false;
+    test_util::run_task([&] { return cancelled_queued_semaphore_waiter(&third_got); });
+    EXPECT_TRUE(third_got) << "取消的等待者吞掉了许可, 信号量漏干";
 }

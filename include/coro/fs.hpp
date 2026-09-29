@@ -106,7 +106,7 @@ namespace coro {
             /// (正常用法是 co_await fs::open(), 手动构造用于接管外部句柄)
             explicit File(HANDLE h) : handle_(h) {
                 if (valid()) {
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp || !iocp->associate(handle_)) {
                         io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
                         close();
@@ -154,7 +154,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp) {
                         op.error = ERROR_NOT_SUPPORTED;
                         EventLoop::get().schedule(h);
@@ -214,7 +214,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp) {
                         op.error = ERROR_NOT_SUPPORTED;
                         EventLoop::get().schedule(h);
@@ -381,7 +381,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_at_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -392,7 +392,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -443,7 +443,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_at_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -454,7 +454,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -501,7 +501,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<fsync_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -512,7 +512,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -580,7 +580,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<open_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -591,7 +591,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);

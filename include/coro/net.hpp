@@ -12,8 +12,7 @@
 #include <coroutine>
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+// WIN32_LEAN_AND_MEAN / NOMINMAX 已由 event_source.hpp 单点定义 (经 io.hpp/event_loop.hpp 引入)
 #include <mswsock.h>
 #include <winsock2.h>
 #include <windows.h>
@@ -79,15 +78,10 @@ namespace coro {
             (void)done;
         }
 
-        /// 获取当前事件循环的 IOCP 事件源 (供 awaiter 统计挂起操作)。
-        /// EventLoop 构造时已缓存类型化指针 —— 这里只是一次指针读取,
-        /// 替代旧的 dynamic_cast (每操作一次 RTTI 层级行走)。
-        inline IocpEventSource* current_iocp() {
-            return EventLoop::get().iocp();
-        }
-
+        /// 获取当前事件循环的 IOCP 事件源: 类型化访问已收口到 io 层
+        /// (detail::current_iocp, memo 化)。这里只保留 net 语义的两个便捷封装。
         inline bool associate_current_iocp(SOCKET socket) {
-            auto* iocp = current_iocp();
+            auto* iocp = detail::current_iocp();
             if (iocp && iocp->associate(socket))
                 return true;
             io::set_error(iocp ? (int)GetLastError() : (int)WSAEOPNOTSUPP);
@@ -95,11 +89,23 @@ namespace coro {
         }
 
         inline IocpEventSource* require_current_iocp(detail::iocp_op& op, std::coroutine_handle<> h) {
-            if (auto* iocp = current_iocp())
+            if (auto* iocp = detail::current_iocp())
                 return iocp;
             op.error = WSAEOPNOTSUPP;
             EventLoop::get().schedule(h);
             return nullptr;
+        }
+
+        /// getsockname + ntohs: 回查 socket 实际绑定的端口。
+        /// bind 到端口 0 时由系统分配, 调用方靠它拿到真实端口。
+        inline unsigned short local_port_of(SOCKET s) {
+            if (s == INVALID_SOCKET)
+                return 0;
+            sockaddr_in name{};
+            int len = static_cast<int>(sizeof(name));
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&name), &len) == SOCKET_ERROR)
+                return 0;
+            return ntohs(name.sin_port);
         }
 
         // ==================================================================
@@ -118,17 +124,13 @@ namespace coro {
                     close();
             }
 
-            ~TcpStream() {
-                if (sock_ != INVALID_SOCKET)
-                    closesocket(sock_);
-            }
+            ~TcpStream() { close(); }
 
             TcpStream(TcpStream&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
 
             TcpStream& operator=(TcpStream&& other) noexcept {
                 if (this != &other) {
-                    if (sock_ != INVALID_SOCKET)
-                        closesocket(sock_);
+                    close();
                     sock_ = std::exchange(other.sock_, INVALID_SOCKET);
                 }
                 return *this;
@@ -386,6 +388,11 @@ namespace coro {
 
             void close() {
                 if (sock_ != INVALID_SOCKET) {
+                    // 与 TcpListener::close / UdpSocket 同一合同: 挂起的重叠
+                    // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
+                    // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
+                    // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
+                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                     closesocket(sock_);
                     sock_ = INVALID_SOCKET;
                 }
@@ -437,15 +444,7 @@ namespace coro {
 
             /// 绑定并监听 (同步, 一次性; 零配置: 自动关联 IOCP)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const {
-                if (sock_ == INVALID_SOCKET)
-                    return 0;
-                sockaddr_in name{};
-                int len = static_cast<int>(sizeof(name));
-                if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&name), &len) == SOCKET_ERROR)
-                    return 0;
-                return ntohs(name.sin_port);
-            }
+            unsigned short local_port() const { return local_port_of(sock_); }
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 ensure_winsock(); // 必须先初始化 Winsock
@@ -627,22 +626,13 @@ namespace coro {
                     close();
             }
 
-            ~UdpSocket() {
-                if (sock_ != INVALID_SOCKET) {
-                    // 与 TcpListener::close 同理: 挂起的 recvfrom 先显式取消再关句柄
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    closesocket(sock_);
-                }
-            }
+            ~UdpSocket() { close(); }
 
             UdpSocket(UdpSocket&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
 
             UdpSocket& operator=(UdpSocket&& other) noexcept {
                 if (this != &other) {
-                    if (sock_ != INVALID_SOCKET) {
-                        CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                        closesocket(sock_);
-                    }
+                    close();
                     sock_ = std::exchange(other.sock_, INVALID_SOCKET);
                 }
                 return *this;
@@ -653,15 +643,7 @@ namespace coro {
 
             /// 绑定本地地址 (同步, 一次性)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const {
-                if (sock_ == INVALID_SOCKET)
-                    return 0;
-                sockaddr_in name{};
-                int len = static_cast<int>(sizeof(name));
-                if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&name), &len) == SOCKET_ERROR)
-                    return 0;
-                return ntohs(name.sin_port);
-            }
+            unsigned short local_port() const { return local_port_of(sock_); }
 
             bool bind_listen(const char* ip, unsigned short port) {
                 ensure_winsock();
@@ -795,6 +777,9 @@ namespace coro {
 
             void close() {
                 if (sock_ != INVALID_SOCKET) {
+                    // 与 TcpListener::close 同理: 挂起的 recvfrom 先显式取消再关句柄,
+                    // 保证完成包一定投递 (仅 closesocket 不承诺)。
+                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                     closesocket(sock_);
                     sock_ = INVALID_SOCKET;
                 }
@@ -820,19 +805,19 @@ namespace coro {
         //   - 无论同步/异步完成, 一定有 CQE
         //
         // 需要 liburing: sudo apt install liburing-dev
-        // 注意: 需要 Linux 环境编译验证, 本仓库在 Windows 上开发。
+        // 事件源获取与 SQE 提交统一走 io 层 (detail::current_uring /
+        // detail::uring_submit_op), 与 fs/pipe/unix 共用同一套设施。
         // ==================================================================
 
-        /// 获取当前事件循环的 io_uring 事件源 (供 awaiter 提交操作)。
-        /// EventLoop 构造时已缓存类型化指针 (同 current_iocp)。
-        inline UringEventSource* current_uring() {
-            return EventLoop::get().uring();
-        }
-
-        // 提交 SQE 并统计挂起数 (转发到 detail::uring_submit, 与 fs/pipe/process 共用)
-        inline void uring_submit_op(UringEventSource* u, io_uring* ring, detail::uring_op* op, io_uring_sqe* sqe) {
-            (void)ring;
-            detail::uring_submit(u, sqe, op);
+        /// getsockname + ntohs: 回查 fd 实际绑定的端口 (bind 到 0 时系统分配)。
+        inline unsigned short local_port_of(int fd) {
+            if (fd < 0)
+                return 0;
+            sockaddr_in name{};
+            socklen_t len = sizeof(name);
+            if (::getsockname(fd, reinterpret_cast<sockaddr*>(&name), &len) != 0)
+                return 0;
+            return ntohs(name.sin_port);
         }
 
         // ==================================================================
@@ -843,17 +828,13 @@ namespace coro {
             TcpStream() = default;
             explicit TcpStream(int fd) : fd_(fd) {}
 
-            ~TcpStream() {
-                if (fd_ >= 0)
-                    ::close(fd_);
-            }
+            ~TcpStream() { close(); }
 
             TcpStream(TcpStream&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
 
             TcpStream& operator=(TcpStream&& other) noexcept {
                 if (this != &other) {
-                    if (fd_ >= 0)
-                        ::close(fd_);
+                    close();
                     fd_ = std::exchange(other.fd_, -1);
                 }
                 return *this;
@@ -884,7 +865,7 @@ namespace coro {
                 /// 保证 op 在协程帧销毁前被 CQE 消费 (安全)。
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -896,7 +877,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             // 提交队列满: 无法提交, 立即报错
@@ -905,7 +886,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_recv(sqe, stream->fd_, buf, len, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -945,7 +926,7 @@ namespace coro {
                 /// 取消挂起的写 (同 read_awaiter::cancel_op)
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -956,7 +937,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -964,7 +945,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_send(sqe, stream->fd_, buf, len, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1012,7 +993,7 @@ namespace coro {
                 /// 取消挂起的连接 (同 read_awaiter::cancel_op)
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<connect_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -1023,7 +1004,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -1031,7 +1012,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_connect(sqe, fd, (sockaddr*)&addr, sizeof(addr));
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1069,12 +1050,16 @@ namespace coro {
 
             void close() {
                 if (fd_ >= 0) {
+                    // 与 TcpListener/UdpSocket 同一合同: 挂起的 recv/send SQE
+                    // 持有文件引用, 仅 close 不会让它们完成 (事件循环会永久等待);
+                    // 先 shutdown 解除收发, 再释放描述符。
+                    ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
                 }
             }
 
-            /// 中止收发但不关闭 fd；用于跨线程唤醒挂起 I/O，避免 fd 重用竞态。
+            /// 中止收发但不关闭 fd；用于跨线程唤醒挂起 I/O，避免 fd 复用竞态。
             void shutdown() noexcept {
                 if (fd_ >= 0)
                     ::shutdown(fd_, SHUT_RDWR);
@@ -1093,17 +1078,13 @@ namespace coro {
           public:
             TcpListener() = default;
 
-            ~TcpListener() {
-                if (fd_ >= 0)
-                    ::close(fd_);
-            }
+            ~TcpListener() { close(); }
 
             TcpListener(TcpListener&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
 
             TcpListener& operator=(TcpListener&& other) noexcept {
                 if (this != &other) {
-                    if (fd_ >= 0)
-                        ::close(fd_);
+                    close();
                     fd_ = std::exchange(other.fd_, -1);
                 }
                 return *this;
@@ -1114,17 +1095,10 @@ namespace coro {
 
             /// 绑定并监听 (同步, 一次性; 零配置)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const {
-                if (fd_ < 0)
-                    return 0;
-                sockaddr_in name{};
-                socklen_t len = sizeof(name);
-                if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&name), &len) != 0)
-                    return 0;
-                return ntohs(name.sin_port);
-            }
+            unsigned short local_port() const { return local_port_of(fd_); }
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
+                close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
                 fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                 if (fd_ < 0)
                     return false;
@@ -1132,16 +1106,23 @@ namespace coro {
                 // 允许端口复用: 防止 TIME_WAIT 状态导致 bind 失败
                 int opt = 1;
                 ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
                 addr.sin_addr.s_addr = inet_addr(ip);
 
-                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0)
+                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                    close();
                     return false;
-                if (::listen(fd_, backlog) < 0)
+                }
+                if (::listen(fd_, backlog) < 0) {
+                    close();
                     return false;
+                }
                 return true;
             }
 
@@ -1172,7 +1153,7 @@ namespace coro {
                 /// 取消挂起的 accept (同 read_awaiter::cancel_op)
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<accept_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -1183,7 +1164,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -1191,7 +1172,7 @@ namespace coro {
                             return;
                         }
                         io_uring_prep_accept(sqe, listener->fd_, nullptr, nullptr, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1238,17 +1219,13 @@ namespace coro {
             UdpSocket() = default;
             explicit UdpSocket(int fd) : fd_(fd) {}
 
-            ~UdpSocket() {
-                if (fd_ >= 0)
-                    ::close(fd_);
-            }
+            ~UdpSocket() { close(); }
 
             UdpSocket(UdpSocket&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
 
             UdpSocket& operator=(UdpSocket&& other) noexcept {
                 if (this != &other) {
-                    if (fd_ >= 0)
-                        ::close(fd_);
+                    close();
                     fd_ = std::exchange(other.fd_, -1);
                 }
                 return *this;
@@ -1259,31 +1236,29 @@ namespace coro {
 
             /// 绑定本地地址 (同步, 一次性)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const {
-                if (fd_ < 0)
-                    return 0;
-                sockaddr_in name{};
-                socklen_t len = sizeof(name);
-                if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&name), &len) != 0)
-                    return 0;
-                return ntohs(name.sin_port);
-            }
+            unsigned short local_port() const { return local_port_of(fd_); }
 
             bool bind_listen(const char* ip, unsigned short port) {
+                close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
                 fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                 if (fd_ < 0)
                     return false;
 
                 int opt = 1;
                 ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
                 addr.sin_addr.s_addr = inet_addr(ip);
 
-                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0)
+                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                    close();
                     return false;
+                }
                 return true;
             }
 
@@ -1311,7 +1286,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<recvfrom_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -1323,7 +1298,7 @@ namespace coro {
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
                     from_len = sizeof(sockaddr_in);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -1338,7 +1313,7 @@ namespace coro {
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
                         io_uring_prep_recvmsg(sqe, socket->fd_, &msg_, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1384,7 +1359,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<sendto_awaiter*>(self);
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -1395,7 +1370,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    if (auto* u = current_uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
                             op.result = -ENOBUFS;
@@ -1410,7 +1385,7 @@ namespace coro {
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
                         io_uring_prep_sendmsg(sqe, socket->fd_, &msg_, 0);
-                        uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit_op(u, u->handle(), &op, sqe);
                         uring_ = u;
                         u->track_op(&op);
                     } else {

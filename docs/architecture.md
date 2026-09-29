@@ -519,10 +519,12 @@ loop-per-thread），而非 Go 式 work-stealing。收益：
 ```
 
 要点：**coro.hpp 是"核心 + 高级并发"**；IO 六件套（net/fs/pipe/
-process/fs_watch/signal）按需单独 include。`io.hpp` 虽定位为 IO 底座，
-include 的是 event_loop.hpp（取 `EventLoop::get().iocp()/uring()`），
-Linux 部分直接引用 `net::UringEventSource`（经 event_loop.hpp 条件
-包含获得）。
+process/fs_watch/signal）按需单独 include。`io.hpp` 是 IO 唯一公共
+底座：错误模型（errno 双通道）、共用的 `detail::uring_submit` 提交
+路径、以及 memo 化类型化事件源访问器 `detail::current_iocp()/
+current_uring()`（每线程每事件源一次 dynamic_cast，热路径一次指针
+比较）。EventLoop 本体不声明任何平台事件源类型；unix.hpp 也因此不再
+依赖 net.hpp —— 各 IO 模块统一只依赖「核心 + io.hpp」。
 
 ---
 

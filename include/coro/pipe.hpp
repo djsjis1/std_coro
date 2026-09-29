@@ -57,7 +57,7 @@ namespace coro {
             /// 接管已打开的 OVERLAPPED 管道句柄并关联当前 loop 的 IOCP
             explicit PipeEnd(HANDLE h) : handle_(h) {
                 if (valid()) {
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp || !iocp->associate(handle_)) {
                         io::set_error(iocp ? (int)GetLastError() : (int)ERROR_NOT_SUPPORTED);
                         close();
@@ -102,7 +102,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp) {
                         op.error = ERROR_NOT_SUPPORTED;
                         EventLoop::get().schedule(h);
@@ -156,7 +156,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* iocp = EventLoop::get().iocp();
+                    auto* iocp = detail::current_iocp();
                     if (!iocp) {
                         op.error = ERROR_NOT_SUPPORTED;
                         EventLoop::get().schedule(h);
@@ -189,9 +189,11 @@ namespace coro {
             // ---- 同步操作 ----
 
             /// 关闭本端。读端关闭后, 对端 write 报错; 写端关闭后, 对端 read 得 0。
-            /// 有挂起 IO 时不可调用 (生命周期约定同 net/fs)。
+            /// 与 net 层同一合同: 先显式取消挂起的重叠 I/O 再关句柄
+            /// (仅 CloseHandle 不承诺完成包投递); 无挂起 IO 时 CancelIoEx 无副作用。
             void close() {
                 if (valid()) {
+                    CancelIoEx(handle_, nullptr);
                     CloseHandle(handle_);
                     handle_ = INVALID_HANDLE_VALUE;
                 }
@@ -293,7 +295,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -304,7 +306,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -350,7 +352,7 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_awaiter*>(self);
-                    if (auto* u = EventLoop::get().uring()) {
+                    if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (sqe) {
                             io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -361,7 +363,7 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
-                    auto* u = EventLoop::get().uring();
+                    auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
                         EventLoop::get().schedule(h);
@@ -446,7 +448,7 @@ namespace coro {
 
             static void cancel_op(void* self) {
                 auto* aw = static_cast<poll_awaiter*>(self);
-                if (auto* u = EventLoop::get().uring()) {
+                if (auto* u = detail::current_uring()) {
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (sqe) {
                         io_uring_prep_cancel(sqe, &aw->op, 0);
@@ -457,7 +459,7 @@ namespace coro {
 
             void await_suspend(std::coroutine_handle<> h) {
                 op.continuation = h;
-                auto* u = EventLoop::get().uring();
+                auto* u = detail::current_uring();
                 if (!u) {
                     op.result = -ENOTSUP;
                     EventLoop::get().schedule(h);
@@ -475,7 +477,20 @@ namespace coro {
                 u->track_op(&op);
             }
 
-            uint32_t await_resume() { return (uint32_t)op.result; }
+            uint32_t await_resume() {
+                // 错误 (如 fd 已关的 EBADF): 负 errno 直接转 uint32_t 会变成
+                // 带虚假位的掩码 (0xFFFFFF83 甚至含 POLLIN 位), 调用方会误判就绪。
+                // 统一记错误码并返回 0 (= 无事件)。
+                if (op.error) {
+                    io::set_error(op.error);
+                    return 0;
+                }
+                if (op.result < 0) {
+                    io::set_error(-op.result);
+                    return 0;
+                }
+                return (uint32_t)op.result;
+            }
         };
 
         inline poll_awaiter poll(int fd, short events) {

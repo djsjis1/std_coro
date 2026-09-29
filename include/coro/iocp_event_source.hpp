@@ -3,8 +3,7 @@
 #include "event_source.hpp"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX // 防止 windows.h 的 max/min 宏破坏 std::chrono::milliseconds::max()
+// WIN32_LEAN_AND_MEAN / NOMINMAX 已由 event_source.hpp 单点定义
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
