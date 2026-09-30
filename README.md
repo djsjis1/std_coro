@@ -540,3 +540,7 @@ for (int i = 0; i < 3; ++i)
 
 需要 fire-and-forget 时优先使用命名函数或无捕获 lambda，把所有权对象作为
 按值参数传入协程帧；不要指望捕获 `shared_ptr` 能延长临时闭包自身的生命周期。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
