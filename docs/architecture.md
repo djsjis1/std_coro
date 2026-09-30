@@ -14,6 +14,7 @@
 ## 目录
 
 1. [全景图](#1-全景图)
+1b. [分层 Target 架构与依赖图](#1b-分层-target-架构与依赖图)
 2. [事件源抽象 EventSource 与三大实现](#2-事件源抽象-eventsource-与三大实现)
 3. [事件循环 EventLoop](#3-事件循环-eventloop)
 4. [Task 的 promise_type 设计](#4-task-的-promise_type-设计)
@@ -23,7 +24,7 @@
 8. [IO 层：Proactor 统一完成路径](#8-io-层proactor-统一完成路径)
 9. [多线程模型：线程亲缘与跨线程路由](#9-多线程模型线程亲缘与跨线程路由)
 10. [include 依赖图](#10-include-依赖图)
-11. [八大横切设计模式](#11-八大横切设计模式)
+11. [横切设计模式](#11-横切设计模式)
 12. [代码模块与阅读顺序](#12-代码模块与阅读顺序)
 13. [刻意的非优化与已知约束](#13-刻意的非优化与已知约束)
 14. [模块边界与 coro::detail 的纪律](#14-模块边界与-corodetail-的纪律)
@@ -65,6 +66,50 @@ coro 是一个 **Proactor 模型**的单线程协作式调度框架（每线程�
   → 1s 后醒来: process_timers() 把 H 弹入就绪队列
   → 批量 resume: H 从挂起点继续执行
 ```
+
+---
+
+## 1b. 分层 Target 架构与依赖图
+
+coro 的构建产物按依赖方向分为四层，每层是一个 CMake INTERFACE 或 STATIC target：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ coro::coro  (兼容聚合入口)                                      │
+│   = coro::io + coro::tls(可选) + coro::http_protocol(可选)      │
+├─────────────────────────────────────────────────────────────────┤
+│ coro::tls          coro::http_client       coro::web             │
+│   └→ coro::io        └→ coro::io            └→ coro::io         │
+│   └→ OpenSSL          └→ coro::tls(https)    └→ http::http      │
+├─────────────────────────────────────────────────────────────────┤
+│ coro::io                                                        │
+│   = coro::core + 平台 I/O 后端                                  │
+│   └→ coro::core                                                 │
+│   └→ liburing (Linux) / ws2_32 (Windows)                       │
+│   暴露: net / fs / pipe / signal / fs_watch / process / unix    │
+│         / dns / stream / pool                                    │
+├─────────────────────────────────────────────────────────────────┤
+│ coro::core                                                      │
+│   纯协程核心, 零第三方依赖, 仅 pthread                          │
+│   暴露: Task / EventLoop / Scheduler / gather / wait /          │
+│         TaskGroup / Future / Lock / Semaphore / Event /         │
+│         Condition / Queue / to_thread / sleep / yield           │
+│   并发扩展 (CORO_ENABLE_CONCURRENCY_EXT, 仍只依赖 core):       │
+│         channel / context / select / timer / rate_limiter /     │
+│         task_registry / shutdown                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**依赖方向单向**：上层可以引用下层，下层不知道上层存在。核心 (`coro::core`)
+不得因可选子系统（Web/HTTP/TLS）而被牵连进依赖链。
+
+**src/ 目录**：TLS 与 HTTP 客户端的实现从 header-only 移出为独立编译单元
+（`src/tls.cpp`、`src/http_client.cpp`、`src/detail/http_transport.hpp`），
+OpenSSL 头文件不进入公共头。这是项目从纯 header-only 向「核心 header-only +
+可选编译单元」演进的第一步。
+
+**能力门控三件套**：每个可选模块必须配套 CMake option + 派生编译宏 + 关闭时
+的负例验证。例如 `CORO_ENABLE_TLS` → `CORO_HAS_TLS` → 头文件 `#if defined(CORO_HAS_TLS) && CORO_HAS_TLS` 守卫。
 
 ---
 
@@ -586,13 +631,24 @@ task.hpp         → promise_type 五件套 + 取消包装器 (第 4、5 节)
 sync.hpp/queue.hpp → 无锁单线程等待队列怎么写
 future.hpp       → 跨线程路由 + lost-wakeup 二次检查
 gather.hpp/wait.hpp/task_group.hpp → monitor 模式三连
+timer.hpp        → 一次性可取消定时器
+context.hpp      → 结构化取消传播 (CancellationSource/Token)
+channel.hpp      → Go 风格有界通道
+select.hpp       → 多路等待 (依赖 channel 的 commit_gate 协议)
+rate_limit.hpp   → 令牌桶限流
 io.hpp → net.hpp → fs.hpp → pipe.hpp → signal.hpp → fs_watch.hpp
                  → Proactor 路径的六个变奏
+dns.hpp          → to_thread 桥接阻塞 API 的范本
+unix.hpp         → Unix Domain Socket (仅 Linux io_uring)
+stream.hpp       → 流式读写适配
+pool.hpp         → 通用资源池
+tls.hpp          → TLS 会话 (OpenSSL memory BIO 隧道)
+http_client.hpp  → 协程 HTTP/HTTPS 客户端
 process.hpp      → 组合技 (pipe + future + 平台进程 API)
 scheduler.hpp/thread.hpp → 多核层
 ```
 
-配套的测试（当前 `tests/test_*.cpp` 有 24 个测试源）是行为的最佳注解——
+配套的测试（当前 `tests/test_*.cpp` 有 38 个测试源）是行为的最佳注解——
 每个头文件都有同名测试，改代码前先跑
 `ctest --test-dir build -C Debug --output-on-failure`。
 

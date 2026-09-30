@@ -21,9 +21,11 @@ TLS 实现编译为独立静态库，OpenSSL 头文件不进入公共头；Windo
 Linux 的 io_uring 为可选依赖。核心能力：
 
 - **asyncio 完整对标**:`sleep`/`spawn`/`gather`/`wait_for`/`wait_tasks`/`TaskGroup`(结构化并发)/`ExceptionGroup`/`Future`/`Lock`/`Semaphore`/`Event`/`Condition`/`Queue`(含 join)/`to_thread`
+- **并发工具集**:`channel<T>`(Go 风格有界通道) / `Context`(结构化取消传播) / `select`(多路等待) / `Timer`(可取消可重置定时器) / `rate_limiter`(令牌桶限流) / `task_registry`(服务组件任务登记表) / `shutdown`(优雅关停)
 - **多核并行**:每线程独立事件循环(对标 asyncio 的 loop-per-thread),跨线程唤醒自动路由
 - **取消语义**:`cancel()` 注入 `CancelledError`,RAII 清理、循环终止、取消保护全部对标 Python
-- **网络**:TCP(IOCP / io_uring)
+- **网络**:TCP/UDP(IOCP / io_uring) / DNS / Unix Domain Socket / TLS(OpenSSL 3.5 LTS)
+- **HTTP**:HTTP 协议解析 / HTTP 客户端(http+https) / Web 服务框架
 - **IO 扩展**:异步文件 IO / 管道 / 信号 / 目录监视 / 子进程(与网络同一条完成路径)
 - **性能基线**：当前 Windows/IOCP Release 压测中，10 万协程
   `sleep(1ms)` 约 141ms、400 万次 `yield` 约 807ms、Scheduler 分发 40 万任务约
@@ -140,6 +142,8 @@ target_link_libraries(my_app PRIVATE coro::coro)
 | `f = asyncio.Future()` | `coro::Promise<T> p; auto f = p.get_future();` |
 | `f.set_result(x)` | `p.set_value(x);` |
 | `asyncio.Lock / Semaphore / Event / Condition / Queue` | `coro::Lock / Semaphore / Event / Condition / Queue` |
+| `asyncio.Channel` (third-party) | `coro::channel<T>` (有界通道) |
+| `asyncio.with contextlib.cancel_scope()` | `coro::Context` / `CancellationSource` |
 | `async with lock:` | `auto g = co_await lock.guard();` |
 | `q.task_done() / q.join()` | `q.task_done() / co_await q.join()` |
 | `asyncio.run(main())` | `coro::run(main_task())` |

@@ -25,11 +25,13 @@
 
 | 阶段 | 当前代码 | 下一步 |
 |---|---|---|
+| 架构重构 | 分层 target (core→io→tls→coro) 已落地；src/ 目录承接 TLS/HTTP 编译单元；342 tests / 43 suites 全特性通过 | CI 矩阵同步新分层；安装包消费验证 |
+| 并发工具集 | channel / context / select / timer / rate_limiter / task_registry / shutdown 全部实现并测试通过 | 补充教程文档与示例 |
 | M4 | stream、dns、unix、pool 已实现 | 更新这四组模块的 lint/覆盖率基线 |
-| M5 TLS | 内置 OpenSSL；TlsContext/TlsStream；安装路径与严格开关修复；tls_demo 已写 | 按验证计划跑迁移安装包消费，然后增加 Linux TLS CI |
+| M5 TLS | 内置 OpenSSL 3.5.8；TlsContext/TlsStream；src/tls.cpp 编译单元；tls_demo 已写 | 按验证计划跑迁移安装包消费，然后增加 Linux TLS CI |
 | Windows | 非 TLS CI 失败原因待取 annotation；OpenSSL 包装层仍 FATAL | 先修 CI 实际失败，再独立实现 nmake/JOM 和多配置/CRT 编排 |
 | HTTP 协议层 | 已独立为 coro::http_protocol，支持构建/安装；仅依赖 llhttp | 纯协议配置与安装包消费待验证；Web 数据类型仍在 Web/ |
-| HttpClient | 尚未实现 | 协议层独立后先支持 http://，TLS 通过验证后再加 https:// |
+| HttpClient | `include/coro/http_client.hpp` + `src/http_client.cpp` 已实现；支持 http:// 与 https:// | 补充 CI 集成测试与真实服务器对接 |
 | servers | HTTPS 与按连接属性分池尚未完成 | 按 scheme/host/port/TLS 配置隔离；开始 shutdown 后无论结果都必须 discard |
 | AsyncGenerator | 暂缓 | 先补 await_ready 方向和“终态且有值不 resume 已结束帧”两条回归 |
 | macOS/kqueue | 尚不支持原生 I/O | 独立后端与目标平台 CI 之后再宣称支持 |
