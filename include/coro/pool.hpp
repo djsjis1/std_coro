@@ -301,7 +301,7 @@ namespace coro {
         /// 自由协程 (不是成员协程): 帧只捕获 shared_ptr, 不捕获 Pool 的 this
         static Task<PoolLease<T>> acquire_impl(std::shared_ptr<detail::pool_state<T>> st) {
             for (;;) {
-                if (!st || st->closed)
+                if (st->closed)
                     co_return PoolLease<T>{};
                 if (!st->idle.empty()) {
                     T resource = std::move(st->idle.front());

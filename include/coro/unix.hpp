@@ -4,10 +4,6 @@
 #include "io.hpp"
 #include "task.hpp"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <coroutine>
 #include <cstring>
@@ -18,6 +14,12 @@
 #define CORO_HAS_UNIX 1
 #else
 #define CORO_HAS_UNIX 0
+#endif
+
+#if CORO_HAS_UNIX
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 // ============================================================================

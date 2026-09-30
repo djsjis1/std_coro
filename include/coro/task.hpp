@@ -360,7 +360,8 @@ namespace coro {
     // ============================================================================
     // Task<T> — 主模板（T 非 void）
     // ============================================================================
-    template <typename T> class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task {
+    template <typename T>
+    class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task {
       public:
         // ==================================================================
         // promise_type — 编译器要求的嵌套类型
@@ -547,7 +548,7 @@ namespace coro {
 
         /// 移动构造: 转移所有权, 更新 promise 中的 task_ 指针。
         /// handle_ 非空即帧存活 (见析构注释), 无需额外标志判断。
-        Task(Task&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
+        Task(Task && other) noexcept(std::is_nothrow_move_constructible_v<T>)
             : handle_(std::exchange(other.handle_, nullptr)), result_(std::move(other.result_)),
               exception_(std::move(other.exception_)), ready_(other.ready_), started_(other.started_) {
             if (handle_) {
@@ -650,8 +651,12 @@ namespace coro {
         // 公开 API
         // ==================================================================
 
-        bool is_ready() const noexcept { return ready_; }
-        bool is_started() const noexcept { return started_; }
+        bool is_ready() const noexcept {
+            return ready_;
+        }
+        bool is_started() const noexcept {
+            return started_;
+        }
 
         /// 显式启动协程 (不通过 co_await)
         /// 用于 spawn 模式: 立即让协程在后台运行, 后续再 await
@@ -665,12 +670,14 @@ namespace coro {
         }
 
         /// 获取底层的 coroutine_handle (供内部使用)
-        std::coroutine_handle<promise_type> handle() const { return handle_; }
+        std::coroutine_handle<promise_type> handle() const {
+            return handle_;
+        }
 
         /// 绑定目标事件循环 (Scheduler 分发用)。
         /// 必须在 start()/首次 co_await 之前调用; 之后协程的调度/定时器/
         /// 取消唤醒都路由到该 loop。nullptr 重置为"当前线程的 loop"。
-        void bind_loop(EventLoop* loop) noexcept {
+        void bind_loop(EventLoop * loop) noexcept {
             if (handle_)
                 handle_.promise().target_loop_ = loop;
         }
@@ -841,7 +848,7 @@ namespace coro {
             }
         }
 
-        Task(Task&& other) noexcept
+        Task(Task && other) noexcept
             : handle_(std::exchange(other.handle_, nullptr)), exception_(std::move(other.exception_)),
               ready_(other.ready_), started_(other.started_) {
             if (handle_)
@@ -881,7 +888,9 @@ namespace coro {
         Task& operator=(const Task&) = delete;
 
         // ---- Awaitable ----
-        bool await_ready() const noexcept { return ready_; }
+        bool await_ready() const noexcept {
+            return ready_;
+        }
         void await_suspend(std::coroutine_handle<> continuation) {
             assert(handle_);
             handle_.promise().continuation_ = continuation;
@@ -900,8 +909,12 @@ namespace coro {
         }
 
         // ---- API ----
-        bool is_ready() const noexcept { return ready_; }
-        bool is_started() const noexcept { return started_; }
+        bool is_ready() const noexcept {
+            return ready_;
+        }
+        bool is_started() const noexcept {
+            return started_;
+        }
         void start() {
             if (!started_ && handle_) {
                 started_ = true;
@@ -910,10 +923,12 @@ namespace coro {
                 loop.schedule(handle_);
             }
         }
-        std::coroutine_handle<promise_type> handle() const { return handle_; }
+        std::coroutine_handle<promise_type> handle() const {
+            return handle_;
+        }
 
         /// 绑定目标事件循环 (同 Task<T>::bind_loop)
-        void bind_loop(EventLoop* loop) noexcept {
+        void bind_loop(EventLoop * loop) noexcept {
             if (handle_)
                 handle_.promise().target_loop_ = loop;
         }

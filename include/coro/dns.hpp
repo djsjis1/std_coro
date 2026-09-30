@@ -129,7 +129,7 @@ namespace coro {
 
         /// 按解析结果建立连接: 把 endpoint 适配回 net.hpp 的 (ip, port) 接口, 调用方不必
         /// 自己拆字段。ip 为空视为无效结果。
-        inline Task<TcpStream> connect(resolved_endpoint ep) {
+        inline Task<TcpStream> connect(const resolved_endpoint& ep) {
             co_return co_await TcpStream::connect(ep.address.c_str(), ep.port);
         }
 #endif // CORO_HAS_DNS
