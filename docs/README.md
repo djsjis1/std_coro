@@ -45,8 +45,9 @@
 ### 参考
 
 - **[API 参考手册](api-reference.md)** — 全部公开类型的签名、语义、错误约定、线程安全性，
-  按头文件组织：task / sleep / gather / wait / task_group / sync / queue / future /
-  thread / schedule / scheduler / net / fs / pipe / signal / fs_watch / process / io。
+  按头文件组织：task / sleep / timer / context / channel / select / rate_limit / stream /
+  dns / unix / pool / tls / http / http_client / gather / wait / task_group / sync / queue /
+  future / thread / schedule / scheduler / net / fs / pipe / signal / fs_watch / process / io。
 - **[架构与源码剖析](architecture.md)** — 事件循环主循环逐行讲解、Task 的 promise_type 设计、
   取消机制的完整链条、三大事件源（IOCP / io_uring / CV）、include 依赖图、
   八大横切设计模式。想给库贡献代码或学习协程框架设计必读。
@@ -79,17 +80,20 @@
 
 ```
 coro/                     # 项目根
-├── include/coro/         # ★ 库本体（header-only，可整体复制到别的项目）
-├── CMakeLists.txt        #   库目标 coro::coro + 安装导出
-├── examples/             # 8 个可运行示例
-├── tests/                # googletest 单元测试（当前 24 个测试源）+ 高并发压测 stress.cpp
-├── Web/                  # HTTP 服务器框架（llhttp 解析 + 路由 + 多线程 worker）
-├── router/               # 独立的泛型基数树路由 radix_router<T>（header-only）
+├── include/coro/         # ★ 库本体公共头 (38 个头文件)
+├── src/                  # 可选编译单元 (tls.cpp / http_client.cpp / detail/)
+├── CMakeLists.txt        #   分层 target: coro::core / coro::io / coro::tls / coro::coro
+├── examples/             # 示例代码 (basic / gather / channel / select / timer / tls_demo …)
+├── tests/                # googletest 单元测试 (38 个测试源) + 高并发压测 stress.cpp
+├── Web/                  # HTTP 服务器框架 (llhttp 解析 + 路由 + 多线程 worker)
+├── router/               # 独立的泛型基数树路由 radix_router<T> (header-only)
+├── tcp_udp/              # TCP/UDP 服务封装 (task_registry + 状态机 + 优雅关停)
+├── thirdparty/           # 第三方源码 (OpenSSL 3.5 / liburing / googletest / llhttp / spdlog …)
 ├── docs/                 # 本文档中心
-│   ├── tutorial/         #   使用教程（10 讲）
-│   └── cpp20-coroutines-course/  #   C++20 协程语言课程（14 讲）
-├── main.cpp              # 协程练习场（改完直接编译运行）
-└── CMakeLists.txt        # 开发仓库根 CMake
+│   ├── tutorial/         #   使用教程 (10 讲)
+│   └── cpp20-coroutines-course/  #   C++20 协程语言课程 (14 讲)
+├── main.cpp              # 协程练习场
+└── CMakePresets.json     # 预置构建配置 (core / native / web / tls / dev)
 ```
 
 ## 推荐学习路线

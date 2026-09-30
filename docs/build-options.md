@@ -15,6 +15,8 @@
 | `CORO_REQUIRE_TLS` | `OFF` | 要求 TLS 实际启用；开关、网络后端或源码不满足时配置失败 |
 | `CORO_ENABLE_WEB`                 | `OFF`                             | `coro::web` 静态库、`web_server` 示例与 Web 层测试的唯一开关                         |
 | `CORO_ENABLE_HTTP` | `OFF` | 独立 HTTP 协议库；Web 开启时自动引入，不依赖协程或原生 I/O |
+| `CORO_ENABLE_HTTP_CLIENT` | `OFF` | 协程 HTTP 客户端 (`http_client.hpp`)；依赖 `coro::io`，https additionally 依赖 `coro::tls`。实现体在 `src/http_client.cpp` |
+| `CORO_ENABLE_HTTP_SERVER` | `OFF` | HTTP 服务端扩展 (预留，当前未实现) |
 | `CORO_ENABLE_TLS` | `OFF` | 构建 `coro::tls`；只用仓库内 `thirdparty/openssl` 源码，配置期不联网、不查系统 OpenSSL |
 | `CORO_ENABLE_CONCURRENCY_EXT`     | `OFF`                             | 并发工具扩展（`timer.hpp`/`context.hpp`/后续的 Channel、select 等）与其测试；只依赖纯核心，零第三方 |
 | `CORO_BUILD_TESTS`                | `OFF`                             | googletest 与`coro_tests`                                                            |

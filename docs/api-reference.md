@@ -22,6 +22,8 @@
 - [Unix 域套接字 unix.hpp](#unix-域套接字-unixhpp)
 - [资源池 pool.hpp](#资源池-poolhpp)
 - [TLS tls.hpp](#tls-tlshpp)
+- [HTTP 协议 http.hpp](#http-协议-httphpp)
+- [HTTP 客户端 http_client.hpp](#http-客户端-http_clienthpp)
 - [TCP/UDP 服务与关闭结果](#tcpudp-服务与关闭结果)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
@@ -595,6 +597,72 @@ Context 配置在 Stream 构造时快照；Context 随后移动或析构不影�
 前置工具：OpenSSL 的构建脚本需要 **Perl**（CI 与本人都按外部前置处理）；NASM 缺失时统一
 `no-asm`，保证不同机器编出同一套 C 实现。Windows 的 nmake/JOM 编排尚未实现，配置期显式
 `FATAL_ERROR` 而不是静默产出坏库。
+
+## HTTP 协议 http.hpp
+
+> 始终可用，零第三方协程依赖。`HttpHeaders` / `HttpResponse` / `HttpError` 定义在
+> `<coro/http.hpp>`，同时被 HTTP 客户端与 Web 层使用。
+
+```cpp
+coro::HttpHeaders h = {{"Content-Type", "application/json"}};
+coro::HttpResponse resp;
+resp.status = 200;
+resp.headers = h;
+resp.body = R"({"ok":true})";
+auto ct = resp.header("content-type");   // 大小写不敏感查找 → "application/json"
+```
+
+| 类型 | 语义 |
+|---|---|
+| `HttpHeaders` | `vector<pair<string,string>>`；保留顺序与重复字段 |
+| `HttpResponse` | `status` / `version` / `headers` / `trailers` / `body` / `keep_alive` |
+| `HttpResponse::header(name)` | 大小写不敏感首次匹配，返回 `string_view`，未找到返回空 |
+| `HttpError` | `runtime_error` 子类；连接失败、协议错误、超时均抛此异常 |
+
+## HTTP 客户端 http_client.hpp
+
+> **需要 `CORO_ENABLE_HTTP_CLIENT=ON`**。链接 `coro::http_client`（依赖 `coro::io`；
+> https  additionally 依赖 `coro::tls`，TLS 未启用时 `supports_tls()` 返回 false）。
+> 实现体在 `src/http_client.cpp`，公共头不泄漏 OpenSSL 类型。
+
+```cpp
+coro::HttpClient::Options opts;
+opts.request_timeout = std::chrono::milliseconds{5000};
+opts.max_connections_per_origin = 16;
+coro::HttpClient client(opts);
+
+// 简单 GET
+auto resp = co_await client.get("https://example.com/api");
+if (resp.status == 200) { /* resp.body */ }
+
+// 自定义请求
+coro::HttpRequest req;
+req.method = "POST";
+req.url = "https://api.example.com/submit";
+req.headers = {{"Content-Type", "application/json"}};
+req.body = R"({"key":"value"})";
+auto resp2 = co_await client.request(std::move(req));
+
+client.close();   // 拒绝新请求，释放空闲连接
+```
+
+| 接口 | 语义 |
+|---|---|
+| `HttpClient()` / `HttpClient(Options)` | 构造客户端；Options 控制超时、连接池上限、请求体上限等 |
+| `get(url) → Task<HttpResponse>` | 快捷 GET |
+| `request(HttpRequest) → Task<HttpResponse>` | 通用请求；方法/URL/头部/正文/keep-alive 均可控 |
+| `close()` | 拒绝新工作，唤醒连接池等待者，丢弃空闲连接；在途请求按各自 deadline 完成 |
+| `closed()` | 是否已关闭 |
+| `supports_tls()` | 静态方法；构建时是否启用了 TLS（https:// 能力） |
+
+**连接池隔离**：按 scheme + host + port + TLS 配置隔离。不自动重试、不跟随重定向、
+不做代理/解压缩/协议升级。`max_idle_per_origin=0` 禁用连接缓存（每次请求新建连接）。
+
+**超时模型**：`request_timeout` 覆盖全链路（排队 + DNS + 连接 + 正文），0 表示不限时。
+超时抛 `HttpError`，连接可能被 discard 而非回池。
+
+**安全限制**：`max_body_bytes`（默认 8MB）、`max_header_bytes`（64KB）、
+`max_header_count`（100）、`max_response_wire_bytes`（16MB）防止对端喂垃圾耗尽内存。
 
 ## TCP/UDP 服务与关闭结果
 

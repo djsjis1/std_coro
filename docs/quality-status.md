@@ -20,14 +20,13 @@
 | 调度与阻塞卸载 | 工厂捕获生命周期、构造异常时线程回收、move-only to_thread、worker 内 wait_all 拒绝自锁 | 异常、并发与仅可移动工厂回归 |
 
 Windows OpenSSL 编排仍不支持，TLS 必须关闭；历史 Windows CI 红灯需先读取失败
-步骤及 annotation，不能由 Testing 目录缺失单独判断原因。HTTPS/HttpClient 尚未完成。
+步骤及 annotation，不能由 Testing 目录缺失单独判断原因。HTTP 客户端已实现并测试通过（342 tests / 43 suites 全特性通过，含 http+https）。
 
 ## 历史基线（不代表本轮改动已验证）
 
 - Windows / MSVC：`coro_tests` 全部通过；测试覆盖取消、Future、跨线程调度、
   TCP、管道、文件、进程、信号、路由和等待组合器。
-- 构建目标是 C++20；核心 `coro::coro` 仍为 header-only，Web/llhttp 是可选的
-  独立子项目。
+- 构建目标是 C++20；核心 `coro::coro` 已拆分为分层 target（`coro::core` → `coro::io` → `coro::tls` → `coro::coro`），重型实现（TLS、HTTP 客户端）移至 `src/` 编译单元；Web/llhttp 是可选的独立子项目。
 - Future 的等待者按所属事件循环路由；Task 收尾、移动和析构按目标 loop 处理。
 - 未完成的 Promise 析构会以 `BrokenPromiseError` 完成 Future；动态等待组合器支持
   仅可移动构造、不可默认构造/不可赋值的结果类型。
