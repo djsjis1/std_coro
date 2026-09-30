@@ -286,9 +286,9 @@ namespace {
         co_await coro::sleep(10ms); // 确保持有者已持锁
 
         auto b = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &b_got)));
-        co_await coro::sleep(5ms); // B 已挂进等待队列
+        co_await coro::sleep(5ms);  // B 已挂进等待队列
         auto c = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &c_got)));
-        co_await coro::sleep(5ms); // C 也挂进队列 (排在 B 之后)
+        co_await coro::sleep(5ms);  // C 也挂进队列 (排在 B 之后)
 
         auto* loop = &coro::EventLoop::get();
         loop->dispatch([b] { b->cancel(); });

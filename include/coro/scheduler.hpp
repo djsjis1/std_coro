@@ -190,7 +190,9 @@ namespace coro {
         }
 
       private:
-        template <typename F> static Task<> run_factory(F factory) { co_await factory(); }
+        template <typename F> static Task<> run_factory(F factory) {
+            co_await factory();
+        }
 
         /// 选择「活跃协程最少」的 worker, 返回其索引。
         /// 两级选择:
@@ -224,8 +226,7 @@ namespace coro {
             Worker() = default;
             Worker(Worker&& other) noexcept
                 : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)),
-                  started(other.started.load(std::memory_order_relaxed)),
-                  startup_error(std::move(other.startup_error)) {}
+                  started(other.started.load(std::memory_order_relaxed)), startup_error(std::move(other.startup_error)) {}
             Worker& operator=(Worker&& other) noexcept {
                 thread = std::move(other.thread);
                 loop.store(other.loop.load(std::memory_order_relaxed), std::memory_order_relaxed);

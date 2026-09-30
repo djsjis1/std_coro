@@ -539,7 +539,7 @@ namespace coro {
         const auto previous_task = detail::t_current_task;
         running_ = true;
         awake_.store(true, std::memory_order_seq_cst);
-        bind(this); // 当前线程绑定本 loop:
+        bind(this);                                // 当前线程绑定本 loop:
         detail::t_current_task = nullptr;
         loop_thread_id_ = std::this_thread::get_id(); // 事件源回调等内部路径路由正确
 
