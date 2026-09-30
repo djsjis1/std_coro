@@ -360,7 +360,7 @@ namespace coro {
     // ============================================================================
     // Task<T> — 主模板（T 非 void）
     // ============================================================================
-    template <typename T> class Task {
+    template <typename T> class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task {
       public:
         // ==================================================================
         // promise_type — 编译器要求的嵌套类型
@@ -680,18 +680,17 @@ namespace coro {
         ///   协程体立即终止 (栈上对象析构 = 清理逻辑), 任务带异常完成。
         ///   任何 co_await 此 Task 的协程将在 await_resume 时收到 CancelledError。
         ///   若协程尚未启动, 直接标记为已完成(带异常)并销毁帧。
-        ///   注意: 请在事件循环线程调用 (wait_for 的定时器等内部路径已满足)。
+        ///
+        ///   请在所属事件循环线程调用, 与 Task<void> 保持一致。
+        ///   cancelled_ 的原子性不保护 handle_/ready_ 或 promise 的其他状态。
+        ///   跨线程请求应由调用方 dispatch 到所属 loop, 并保证 Task 活到回调结束。
         void cancel() {
             if (handle_ && !ready_) {
                 auto& p = handle_.promise();
                 p.cancelled_.store(true, std::memory_order_release);
                 if (!started_) {
-                    // 尚未启动: 存异常结果 → 清回指 → 销毁帧 (防止泄漏)。
-                    // 顺序要点:
-                    //   - release_handle 会清空 task_ 指向的 Task 的 handle_
-                    //     (此处即本 Task 自身), 且只能在本帧销毁前调用
-                    //     (之后 promise 悬空) → 先保存帧句柄副本再 destroy
-                    auto h = handle_; // 帧句柄副本 (release_handle 会清空 handle_)
+                    // 同步存结果并清回指: 不让延迟回调引用可能已析构/移动的 Task。
+                    auto h = handle_;
                     p.store_result();
                     p.release_handle();
                     h.destroy();
@@ -704,8 +703,7 @@ namespace coro {
                     p.cancel_hook_(p.cancel_hook_self_);
                 } else if (p.suspended_) {
                     // 挂起在时间/同步/任务等待上: 强制唤醒,
-                    // 协程恢复时在 await_resume 处抛出 CancelledError
-                    // 调度到目标 loop (而非调用者线程的 loop), 同 Task<void>
+                    // 协程恢复时在 await_resume 处抛出 CancelledError。
                     EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();
                     loop.schedule(handle_);
                 }
@@ -761,7 +759,7 @@ namespace coro {
     //   - 不需要 result_ 成员 (没有返回值)
     //   - await_resume() 返回 void
     // ============================================================================
-    template <> class Task<void> {
+    template <> class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task<void> {
       public:
         struct promise_type {
             Task get_return_object() { return Task{std::coroutine_handle<promise_type>::from_promise(*this)}; }

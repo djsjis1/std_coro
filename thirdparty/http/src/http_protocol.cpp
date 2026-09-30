@@ -301,7 +301,7 @@ http_protocol &http_protocol::body(const std::string &body)
     return *this;
 }
 
-std::string http_protocol::build() const
+std::string http_protocol::build(bool include_body) const
 {
     std::string text;
     text.reserve(start_line_.size() + body_.size() + headers_.size() * 40 + 4);
@@ -320,7 +320,8 @@ std::string http_protocol::build() const
         text += "\r\n";
     }
     text += "\r\n"; // 头部与消息体之间的空行
-    text += body_;
+    if (include_body)
+        text += body_;
     return text;
 }
 

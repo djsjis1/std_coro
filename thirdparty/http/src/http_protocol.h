@@ -67,7 +67,9 @@ public:
     http_protocol &body(const std::string &body);
 
     // 生成完整报文:起始行 + 头部 + 空行 + 消息体
-    std::string build() const;
+    // include_body=false serializes headers (including the representation length)
+    // without payload, for HEAD responses.
+    std::string build(bool include_body = true) const;
 
     // 清空所有内容,可复用
     void clear();

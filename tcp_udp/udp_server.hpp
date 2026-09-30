@@ -1,13 +1,18 @@
 #pragma once
 
-#include <coro/coro.hpp>
+#include <coro/event_loop.hpp>
+#include <coro/sleep.hpp>
 #include <coro/net.hpp>
 #include <coro/task_registry.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -40,6 +45,8 @@
 //   max_pending_bytes       —— 在途 handler 持有的缓冲总量上限, 超限同样丢弃并计数
 //   两条策略都在"数据报已被取出"的时刻生效: 内核侧的 socket 缓冲由 OS 负责, 本类不假装能管住它。
 //
+// 线程亲缘: 配置、启动和关闭在所属 EventLoop 线程执行; 跨线程请用 loop.dispatch()。
+// Server 必须存活到 shutdown() 返回; handler 若引用 socket() 则必须全部结束后才能析构。
 // 特性:
 //   - 每数据报一协程, 每数据报独立缓冲拷贝 (异步 handler 期间不会被下一个包覆盖)
 //   - 优雅关闭可 await, 有真实排空与未完成报告
@@ -72,7 +79,7 @@ namespace coro {
         UdpServer(const UdpServer&) = delete;
         UdpServer& operator=(const UdpServer&) = delete;
 
-        /// 注册数据报处理协程 — 每收到一个 UDP 数据报调用一次
+        /// 注册数据报处理协程; 在下一次 start() 时取快照, 运行中修改不替换现有处理器。
         void set_handler(handler_t handler) { handler_ = std::move(handler); }
 
         /// 注册错误回调 — bind 失败 / recvfrom 出错 / handler 抛异常时触发
@@ -80,8 +87,14 @@ namespace coro {
 
         /// 应用配置; 上限对后续数据报立即生效。接收缓冲在 start() 时按配置分配。
         void set_config(Config config) {
+            if (config.max_datagram_size == 0 || config.max_datagram_size > 65535)
+                throw std::invalid_argument("max_datagram_size must be between 1 and 65535");
+            if (config.shutdown_grace.count() < 0 || config.cancel_grace.count() < 0)
+                throw std::invalid_argument("shutdown grace periods must be non-negative");
             config_ = std::move(config);
             state_->registry.set_capacity(config_.max_concurrent_handlers);
+            state_->grace_ms.store(config_.shutdown_grace.count());
+            state_->cancel_grace_ms.store(config_.cancel_grace.count());
         }
 
         const Config& config() const noexcept { return config_; }
@@ -100,6 +113,10 @@ namespace coro {
                 return false;
             if (handler_ == nullptr)
                 return false;
+            // A timed-out shutdown still owns unfinished handlers and entry tasks.
+            if (!state_->registry.empty() || (recv_task_.is_started() && !recv_task_.is_ready()) ||
+                (supervisor_task_.is_started() && !supervisor_task_.is_ready()))
+                return false;
 
             // 接收缓冲按配置分配: 旧实现硬编码 65535, Config 里的上限形同虚设。
             if (recv_buf_.size() != config_.max_datagram_size)
@@ -114,11 +131,21 @@ namespace coro {
             if (actual != 0)
                 config_.port = actual;
 
+            last_report_ = {};
+            state_->grace_ms.store(config_.shutdown_grace.count());
+            state_->cancel_grace_ms.store(config_.cancel_grace.count());
             state_->phase_value.store(phase::running);
             // 入口协程由本对象持有 (不登记进 handler 的 registry): 否则 supervisor
             // 等待排空时会等待自己, 形成自锁。
-            recv_task_ = spawn(recv_loop());
-            supervisor_task_ = spawn(supervisor());
+            try {
+                recv_task_ = spawn(recv_loop(handler_));
+                supervisor_task_ = spawn(supervisor());
+            } catch (...) {
+                socket_.close();
+                recv_task_.cancel();
+                state_->phase_value.store(phase::stopped);
+                throw;
+            }
             return true;
         }
 
@@ -140,21 +167,39 @@ namespace coro {
         /// 兼容入口: 停止接入并立即请求取消在途 handler (不再停止所属 EventLoop)
         void stop() {
             stop_request();
+            if (state_->phase_value.load() == phase::draining)
+                state_->phase_value.store(phase::cancelling);
             state_->registry.request_cancel_all();
         }
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"
-        Task<detail::shutdown_report> shutdown(std::chrono::milliseconds grace,
-                                               std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
+                                      std::chrono::milliseconds cancel_grace) {
+            if (grace.count() < 0 || cancel_grace.count() < 0)
+                throw std::invalid_argument("shutdown grace periods must be non-negative");
+            if (state_->phase_value.load() == phase::idle) {
+                last_report_ = {true, 0};
+                state_->phase_value.store(phase::stopped);
+                co_return last_report_;
+            }
             state_->grace_ms.store(grace.count());
             state_->cancel_grace_ms.store(cancel_grace.count());
             stop_request();
             while (state_->phase_value.load() != phase::stopped)
                 co_await coro::sleep(std::chrono::milliseconds(5));
+            // Closing a descriptor requests cancellation; its completion may still
+            // refer to the listener/receive buffer. Join the entry tasks before return.
+            while ((recv_task_.is_started() && !recv_task_.is_ready()) ||
+                   (supervisor_task_.is_started() && !supervisor_task_.is_ready()))
+                co_await coro::sleep(std::chrono::milliseconds(5));
             co_return last_report_;
         }
 
-        Task<detail::shutdown_report> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
+            return shutdown(grace, config_.cancel_grace);
+        }
+
+        Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
         /// 本服务绑定的端口; 传 0 时返回系统实际分配的端口
         unsigned short port() const noexcept { return config_.port; }
@@ -164,6 +209,9 @@ namespace coro {
 
         /// 当前在途 handler 数
         size_t active_handlers() const noexcept { return state_->registry.size(); }
+
+        /// 当前 handler 持有的数据报字节数, 不限流时也保持准确计数。
+        size_t pending_bytes() const noexcept { return state_->pending_bytes.load(); }
 
         /// 因并发上限或字节上限被丢弃的数据报数
         size_t dropped_datagrams() const noexcept { return state_->registry.rejected() + state_->bytes_dropped.load(); }
@@ -181,7 +229,7 @@ namespace coro {
         phase current_phase() const noexcept { return state_->phase_value.load(); }
 
         /// 最近一次收尾结果
-        detail::shutdown_report last_shutdown_report() const noexcept { return last_report_; }
+        ShutdownReport last_shutdown_report() const noexcept { return last_report_; }
 
         /// 获取底层 UdpSocket — 供 handler 调用 sendto 回复数据
         net::UdpSocket& socket() { return socket_; }
@@ -206,11 +254,10 @@ namespace coro {
 
             /// 预留待处理字节额度; limit = 0 表示不限制。失败即调用方应丢弃该数据报。
             bool reserve_bytes(size_t need, size_t limit) {
-                if (limit == 0)
-                    return true;
                 size_t current = pending_bytes.load();
                 for (;;) {
-                    if (current + need > limit)
+                    const size_t ceiling = limit == 0 ? (std::numeric_limits<size_t>::max)() : limit;
+                    if (current > ceiling || need > ceiling - current)
                         return false;
                     if (pending_bytes.compare_exchange_weak(current, current + need))
                         return true;
@@ -220,12 +267,33 @@ namespace coro {
             void release_bytes(size_t freed) { pending_bytes.fetch_sub(freed); }
         };
 
+        // Construct before handing the task to the registry. Even a rejected
+        // factory or a coroutine destroyed before its first resume returns the budget.
+        struct byte_reservation {
+            std::shared_ptr<state> st;
+            size_t bytes;
+            byte_reservation(std::shared_ptr<state> owner, size_t n) : st(std::move(owner)), bytes(n) {}
+            byte_reservation(byte_reservation&& other) noexcept
+                : st(std::move(other.st)), bytes(other.bytes) {}
+            byte_reservation(const byte_reservation&) = delete;
+            ~byte_reservation() {
+                if (st)
+                    st->release_bytes(bytes);
+            }
+        };
+
         void report_error(const std::string& message) { state_->note_error(message); }
 
         /// 接收主循环 — 每收到一个数据报就拷贝独立缓冲并登记处理协程
-        Task<> recv_loop() {
+        Task<> recv_loop(handler_t handler) {
             auto st = state_;
-            handler_t handler = handler_; // 复制进帧: 协程可能活过本对象
+            struct entry_scope {
+                std::shared_ptr<state> st;
+                ~entry_scope() {
+                    auto running = phase::running;
+                    st->phase_value.compare_exchange_strong(running, phase::draining);
+                }
+            } entry{st};
             while (st->phase_value.load() == phase::running) {
                 sockaddr_in sender{}; // 内核填入发送方 IP 与端口
                 int n = co_await socket_.recvfrom(recv_buf_.data(), recv_buf_.size(), &sender);
@@ -234,6 +302,8 @@ namespace coro {
                         report_error("recvfrom failed");
                     break;
                 }
+                if (st->phase_value.load() != phase::running)
+                    break;
                 // 零长度数据报也是合法输入, 计入并交给 handler (旧实现直接 continue 吞掉)
                 st->handled.fetch_add(1);
 
@@ -253,25 +323,18 @@ namespace coro {
                     st->bytes_dropped.fetch_add(1); // 在途数据量已达上限: 显式丢弃并计数
                     continue;
                 }
-                auto leased =
-                    st->registry.spawn([data = std::move(data), handler, sender, st, bytes]() mutable -> Task<> {
-                        return datagram_handler(std::move(data), handler, sender, st, bytes);
+                byte_reservation budget{st, bytes};
+                auto leased = st->registry.spawn(
+                    [data = std::move(data), budget = std::move(budget), handler, sender, st]() mutable -> Task<> {
+                        return datagram_handler(std::move(data), handler, sender, st, std::move(budget));
                     });
-                if (!leased.valid())
-                    st->release_bytes(bytes); // 容量拒绝时 registry 已计入 rejected, 这里只归还额度
             }
             co_return;
         }
 
         /// 单个数据报的处理协程 (static: 不触碰 Server 的 this); 字节额度由 RAII 归还
         static Task<> datagram_handler(std::vector<char> data, handler_t handler, sockaddr_in sender,
-                                       std::shared_ptr<state> st, size_t bytes) {
-            struct byte_scope {
-                std::shared_ptr<state> st;
-                size_t bytes;
-                ~byte_scope() { st->release_bytes(bytes); }
-            } budget{st, bytes};
-
+                                       std::shared_ptr<state> st, [[maybe_unused]] byte_reservation budget) {
             try {
                 co_await handler(data.data(), data.size(), sender);
             } catch (const CancelledError&) {
@@ -316,7 +379,7 @@ namespace coro {
         net::UdpSocket socket_;
         handler_t handler_;
         std::shared_ptr<state> state_ = std::make_shared<state>();
-        detail::shutdown_report last_report_{};
+        ShutdownReport last_report_{};
         // 接收缓冲必须先于任务声明: 逆序析构时任务先析构, 挂起的 recvfrom 会在缓冲
         // 仍存活时被取消并标记帧废弃。
         std::vector<char> recv_buf_ = std::vector<char>(config_.max_datagram_size, '\0');

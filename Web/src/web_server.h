@@ -77,6 +77,11 @@ class web_server {
     /// 阻塞等待所有连接协程完成(析构前调用, 防止挂起帧泄漏)
     void wait_all();
 
+    /// 析构: 先 stop + wait_all 确保 worker 完成, 再销毁成员。
+    /// 注意: serve() 如果在外部 loop 上运行, 调用方必须在 web_server
+    /// 析构前确保 serve 已完成 (例如 co_await serve 或先 stop 再等 loop 排空)。
+    ~web_server();
+
     size_t worker_count() const { return scheduler_.worker_count(); }
 
   private:
@@ -104,7 +109,6 @@ class web_server {
     } stats_;
     bool stats_route_registered_ = false; // 只在启动线程访问, 重启时不重复注册冻结的路由
 
-    coro::Scheduler scheduler_; // worker 池 (构造即启动, 析构自动 join)
     coro::net::TcpListener listener_;
     router router_;
     std::atomic<bool> running_ = false;
@@ -115,4 +119,6 @@ class web_server {
     std::atomic<long long> write_timeout_ms_{30000};
     size_t max_body_ = 8 * 1024 * 1024;
     bool verbose_ = true;
+    // 最后构造、最先析构: join worker 时其余被访问的成员仍存活。
+    coro::Scheduler scheduler_;
 };

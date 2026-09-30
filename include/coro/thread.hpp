@@ -5,10 +5,12 @@
 
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // ============================================================================
@@ -47,19 +49,17 @@ namespace coro {
             explicit ThreadPool(size_t n = std::thread::hardware_concurrency()) {
                 if (n == 0)
                     n = 1;
-                for (size_t i = 0; i < n; ++i)
-                    workers_.emplace_back([this] { worker_loop(); });
+                try {
+                    for (size_t i = 0; i < n; ++i)
+                        workers_.emplace_back([this] { worker_loop(); });
+                } catch (...) {
+                    // A failed constructor does not run ~ThreadPool.
+                    stop_and_join();
+                    throw;
+                }
             }
 
-            ~ThreadPool() {
-                {
-                    std::lock_guard lk(mtx_);
-                    stopping_ = true;
-                }
-                cv_.notify_all();
-                for (auto& w : workers_)
-                    w.join(); // 等待所有已提交任务完成
-            }
+            ~ThreadPool() { stop_and_join(); }
 
             ThreadPool(const ThreadPool&) = delete;
             ThreadPool& operator=(const ThreadPool&) = delete;
@@ -76,6 +76,17 @@ namespace coro {
             size_t worker_count() const noexcept { return workers_.size(); }
 
           private:
+            void stop_and_join() {
+                {
+                    std::lock_guard lk(mtx_);
+                    stopping_ = true;
+                }
+                cv_.notify_all();
+                for (auto& worker : workers_)
+                    if (worker.joinable())
+                        worker.join();
+            }
+
             void worker_loop() {
                 while (true) {
                     std::function<void()> task;
@@ -124,26 +135,28 @@ namespace coro {
     //
     // 异常: func 抛出的异常在工作线程被捕获, 在 co_await 处重新抛出。
     // ============================================================================
-    template <typename F> Task<std::invoke_result_t<F>> to_thread(F func) {
-        using R = std::invoke_result_t<F>;
+    template <typename F> Task<std::invoke_result_t<F&>> to_thread(F func) {
+        using R = std::invoke_result_t<F&>;
 
         auto promise = std::make_shared<Promise<R>>();
+        auto callable = std::make_shared<F>(std::move(func));
+        auto result = detail::to_thread_impl<R>(promise);
 
         // 工作线程任务 (普通 lambda, 非协程): 执行 func → 完成 Promise
-        detail::default_thread_pool().submit([promise, f = std::move(func)]() mutable {
+        detail::default_thread_pool().submit([promise, callable] {
             try {
                 if constexpr (std::is_void_v<R>) {
-                    f();
+                    std::invoke(*callable);
                     promise->set_value();
                 } else {
-                    promise->set_value(f());
+                    promise->set_value(std::invoke(*callable));
                 }
             } catch (...) {
                 promise->set_exception(std::current_exception());
             }
         });
 
-        return detail::to_thread_impl<R>(promise);
+        return result;
     }
 
 } // namespace coro

@@ -2,6 +2,7 @@
 
 #include "event_loop.hpp"
 #include "sleep.hpp"
+#include "shutdown.hpp"
 #include "task.hpp"
 
 #include <atomic>
@@ -10,6 +11,8 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // ============================================================================
@@ -36,17 +39,21 @@
 namespace coro {
     namespace detail {
 
-        /// settle() 的结果: 供调用方决定要不要继续等待/上报
-        struct shutdown_report {
-            bool drained = false;  // 是否全部任务真正结束
-            size_t unfinished = 0; // 到点仍未结束的任务数 (不配合取消的业务代码)
-        };
+        // Compatibility for existing callers; public service APIs use ShutdownReport.
+        using shutdown_report = ShutdownReport;
 
         /// 单个任务的身份与所有权: 帧由登记表持有, owner 记录取消唤醒要投递到哪个循环。
         struct registry_entry {
             std::shared_ptr<Task<void>> task;
             EventLoop* owner = nullptr;
             std::atomic<bool> finished{false};
+        };
+
+        struct registry_body {
+            // Members are destroyed in reverse order: captures outlive the Task,
+            // including destruction before its first resume.
+            std::shared_ptr<void> factory_lifetime;
+            Task<void> task;
         };
 
         /// 登记表与所有任务帧共享的状态。所有者复制的是 shared_ptr, 因此即使 Server
@@ -62,6 +69,8 @@ namespace coro {
             void finish(const std::shared_ptr<registry_entry>& e) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    if (e->finished.exchange(true))
+                        return;
                     for (auto it = entries.begin(); it != entries.end(); ++it) {
                         if (*it == e) {
                             entries.erase(it);
@@ -69,7 +78,6 @@ namespace coro {
                         }
                     }
                 }
-                e->finished.store(true);
                 active.fetch_sub(1);
             }
         };
@@ -124,20 +132,31 @@ namespace coro {
             /// 调用方因此能安全地继续使用/回收已准备好的资源 (如已 accept 的连接)。
             template <typename Factory> lease spawn(Factory&& factory) {
                 auto e = std::make_shared<registry_entry>();
+                auto holder = std::make_shared<Task<void>>();
+                // Publish an immutable task pointer before other threads can cancel it.
+                e->task = holder;
+                e->owner = &EventLoop::get();
                 {
                     std::lock_guard<std::mutex> lock(state_->mutex);
                     if (state_->capacity != 0 && state_->entries.size() >= state_->capacity) {
                         ++state_->rejected;
                         return lease{};
                     }
-                    e->owner = &EventLoop::get();
                     state_->entries.push_back(e);
                     state_->active.fetch_add(1);
                 }
-                auto holder = std::make_shared<Task<void>>();
-                e->task = holder;
-                *holder = runner(state_, e, factory());
-                holder->start();
+                try {
+                    // Keep coroutine-lambda captures alive, but invoke the factory now:
+                    // callers may transfer resources referenced by the factory.
+                    auto keep_alive = std::make_shared<std::decay_t<Factory>>(std::forward<Factory>(factory));
+                    auto body = (*keep_alive)();
+                    *holder = runner(state_, e, registry_body{std::move(keep_alive), std::move(body)});
+                    holder->start();
+                } catch (...) {
+                    state_->finish(e);
+                    holder->cancel();
+                    throw;
+                }
                 return lease(e);
             }
 
@@ -208,7 +227,7 @@ namespace coro {
             /// 包装协程: 正常结束 / 被取消 / 抛异常, 都必须摘除自己并计数 ——
             /// 这是"用户 handler 抛异常也不漏计数与资源释放"的保证点。
             static Task<void> runner(std::shared_ptr<registry_state> st, std::shared_ptr<registry_entry> e,
-                                     Task<void> body) {
+                                     registry_body work) {
                 struct scope {
                     std::shared_ptr<registry_state> st;
                     std::shared_ptr<registry_entry> e;
@@ -216,7 +235,7 @@ namespace coro {
                 } s{st, e};
 
                 try {
-                    co_await std::move(body);
+                    co_await std::move(work.task);
                 } catch (const CancelledError&) {
                     // 由 stop_request()/cancel() 触发的正常退出, 不算故障
                 } catch (...) {

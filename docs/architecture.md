@@ -6,7 +6,7 @@
 > 语言机制请看 [C++20 协程课程](cpp20-coroutines-course/README.md)；
 > 构建开关与模块解耦约定请看 [构建选项与模块解耦约定](build-options.md)。
 >
-> 库本体：`include/coro/` 下的 24 个 header-only 头文件；文档刻意不固化行数，
+> 库本体：`include/coro/` 的公共头与可选的 `src/tls.cpp` 实现；HTTP 协议组件在 `thirdparty/http/`，
 > 避免每次实现调整都产生无意义的文档漂移。
 > 行文自底向上：事件源 → 事件循环 → Task → 取消 → 并发组合 → IO 层 →
 > 多线程模型 → 横切设计模式。
@@ -644,9 +644,9 @@ GCC/Clang Debug/Release 与 sanitizer CI；Windows 本机结果不能代替这�
 
 | detail 符号 | 定义处 | 跨模块使用者 |
 |---|---|---|
-| `detail::task_registry`、`detail::shutdown_report` | `task_registry.hpp` | `tcp_udp` 组件、服务器生命周期测试 |
+| `detail::task_registry` | `task_registry.hpp` | `tcp_udp` 组件、服务器生命周期测试 |
 | `detail::commit_gate` | `channel.hpp` | `select.hpp`（多路仲裁协议） |
-| `Task<detail::shutdown_report>` | 服务器 `shutdown()` 返回值 | 出现在**公共签名**上 |
+| `ShutdownReport` | `shutdown.hpp` | 服务器 `shutdown()` 的正式公共结果类型；旧 `detail::shutdown_report` 保留别名兼容 |
 
 由此确立三条纪律：
 

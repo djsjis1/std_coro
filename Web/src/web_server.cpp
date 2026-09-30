@@ -77,7 +77,7 @@ bool web_server::listen(const char* ip, unsigned short port) {
 
 void web_server::stop() {
     running_.store(false, std::memory_order_release); // 通知 serve() 且阻止新连接注册
-    listener_.close(); // 关键: 仅设 flag 不够, 因为 accept 正阻塞在 IOCP 上等待新连接.
+    listener_.close();                                // 关键: 仅设 flag 不够, 因为 accept 正阻塞在 IOCP 上等待新连接.
     // 关闭监听 socket 后, 挂起的 AcceptEx 会立即以错误完成包返回,
     // 这样 accept_noattach() 才会解除挂起, serve() 循环才能检查到 running_==false 并退出
 
@@ -181,6 +181,18 @@ coro::Task<> web_server::serve() {
 
 void web_server::wait_all() {
     scheduler_.wait_all();
+}
+
+web_server::~web_server() {
+    // 1. 停止 accept 循环 + 关闭全部活动连接 (唤醒 worker 上的挂起 I/O)
+    stop();
+    // 2. 等待所有 worker 协程完成 (确保 handle_connection 不再访问 router_/stats_)
+    wait_all();
+    // 3. scheduler_ 声明在最后, 最先析构并 join; 随后才销毁连接表、路由等成员。
+    //
+    // 注意: serve() 如果在外部 loop 上作为 detached 协程运行, 此处的
+    // stop() 会让它在下次 accept 失败后退出, 但无法同步等待它实际结束。
+    // 调用方应在析构前 co_await serve() 或确保 serve 已完成。
 }
 
 bool web_server::register_connection(const std::shared_ptr<coro::net::TcpStream>& conn) {

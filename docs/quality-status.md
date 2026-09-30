@@ -4,7 +4,25 @@
 生产环境保证。下列历史基线保留原平台背景；当前变更的 CI 绿灯状态
 仍以对应提交的 GitHub Actions 运行记录为准，不能由本地结果推断。
 
-## 当前基线
+## 2026-09-30 代码收口（待维护者验证）
+
+本轮按要求未运行构建、测试、lint 或覆盖率。以下为源码状态，不是通过记录；
+执行步骤与验收条件见 [TLS 与生命周期验证计划](tls-validation-plan.md)。
+
+| 范围 | 实现状态 | 待完成 |
+|---|---|---|
+| M4 流、DNS、Unix socket、通用 pool | 已有头文件与对应测试源码 | 双平台回归、新模块覆盖率与 lint 基线 |
+| M5 TLS | 独立 coro::tls 静态库与 coro::io；OpenSSL 隔离在实现文件；修正验证深度、ALPN、错误读取与关闭状态；补齐 tls_demo | Linux 实测、迁移安装包消费、TLS CI 行 |
+| Task 取消 | 移除不安全的延迟帧销毁；T/void 统一要求所属线程调用 | 未启动取消、移动与析构回归 |
+| EventLoop/Web 生命周期 | loop 退出恢复原线程上下文；Web scheduler 最先析构 | 异常恢复、外部 serve 完成后的析构回归 |
+| 公共接口与解耦 | HTTP 可独立构建/安装为 coro::http_protocol；router 正式导出；ShutdownReport 脱离 detail | 独立组件与组合消费验证 |
+| 服务关闭与资源池 | 未启动关闭、关闭宽限期、重启限制、UDP 字节额度、池取消/关闭和缓存淘汰路径已修正 | 生命周期与取消边界回归 |
+| 调度与阻塞卸载 | 工厂捕获生命周期、构造异常时线程回收、move-only to_thread、worker 内 wait_all 拒绝自锁 | 异常、并发与仅可移动工厂回归 |
+
+Windows OpenSSL 编排仍不支持，TLS 必须关闭；历史 Windows CI 红灯需先读取失败
+步骤及 annotation，不能由 Testing 目录缺失单独判断原因。HTTPS/HttpClient 尚未完成。
+
+## 历史基线（不代表本轮改动已验证）
 
 - Windows / MSVC：`coro_tests` 全部通过；测试覆盖取消、Future、跨线程调度、
   TCP、管道、文件、进程、信号、路由和等待组合器。
@@ -64,10 +82,11 @@ find_package(coro CONFIG REQUIRED)
 target_link_libraries(app PRIVATE coro::coro)
 ```
 
-Linux 下 `coro::coro` 会连带导出仓库内构建的 `coro::uring`（静态），消费者无需
-额外的依赖解析。`router::router`、`coro::web`、Web/llhttp 和测试依赖仍属于
-源码树组件；`find_package(coro)` 只承诺核心 `coro::coro`，应用需要 Web 时应
-显式加入源码子目录。
+Linux 下 `coro::coro` 会连带导出仓库内构建的 `coro::uring`（静态），TLS 构建中还会
+链接随包安装的 OpenSSL 静态库；`coro::core` 不传递这些链接依赖。`coro::io` 提供
+不带 TLS 的原生 I/O；`coro::tls` 单独提供 TLS。安装目标还包括 `coro::router`、
+网络可用时的 `coro::tcp_udp`，以及开启 HTTP/Web 后的 `coro::http_protocol`。
+`coro::web` 与测试依赖仍属于源码树组件，应用需要 Web 时应显式加入源码子目录。
 
 ## 尚未宣称的能力
 

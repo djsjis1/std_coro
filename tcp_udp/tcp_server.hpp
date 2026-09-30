@@ -1,6 +1,7 @@
 #pragma once
 
-#include <coro/coro.hpp>
+#include <coro/event_loop.hpp>
+#include <coro/sleep.hpp>
 #include <coro/net.hpp>
 #include <coro/task_registry.hpp>
 
@@ -8,6 +9,9 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 // ============================================================================
 // coro::TcpServer — 高级 TCP 服务端框架
@@ -34,6 +38,8 @@
 //                      **不再调用 EventLoop::stop()**: 同一进程里的其他服务/任务
 //                      不该因为本服务关停而被连带终止 (旧行为)。
 //
+// 线程亲缘: 配置、启动和关闭在所属 EventLoop 线程执行; 跨线程请用 loop.dispatch()。
+// Server 必须存活到 shutdown() 返回; unfinished 非零时仍需继续驱动所属循环。
 // 所有权: 连接任务全部登记在 task_registry 中, 不再 spawn(...).detach();
 //         handler 与错误回调通过 shared state 传递, 因此 Server 对象可以先于
 //         滞留的 handler 协程析构而不会让协程访问悬空 this。
@@ -70,7 +76,7 @@ namespace coro {
         TcpServer(const TcpServer&) = delete;
         TcpServer& operator=(const TcpServer&) = delete;
 
-        /// 注册连接处理协程 — 每个新连接到达时调用一次
+        /// 注册连接处理协程; 在下一次 start() 时取快照, 运行中修改不替换现有处理器。
         void set_handler(handler_t handler) { handler_ = std::move(handler); }
 
         /// 注册错误回调 — bind 失败 / accept 出错 / handler 抛异常时触发
@@ -78,8 +84,12 @@ namespace coro {
 
         /// 应用配置; 并发上限对后续 accept 立即生效
         void set_config(Config config) {
+            if (config.shutdown_grace.count() < 0 || config.cancel_grace.count() < 0)
+                throw std::invalid_argument("shutdown grace periods must be non-negative");
             config_ = std::move(config);
             state_->registry.set_capacity(config_.max_concurrent_handlers);
+            state_->grace_ms.store(config_.shutdown_grace.count());
+            state_->cancel_grace_ms.store(config_.cancel_grace.count());
         }
 
         const Config& config() const noexcept { return config_; }
@@ -98,6 +108,10 @@ namespace coro {
                 return false;
             if (handler_ == nullptr)
                 return false;
+            // A timed-out shutdown still owns unfinished handlers and entry tasks.
+            if (!state_->registry.empty() || (accept_task_.is_started() && !accept_task_.is_ready()) ||
+                (supervisor_task_.is_started() && !supervisor_task_.is_ready()))
+                return false;
 
             if (!listener_.bind_listen(config_.bind_addr.c_str(), config_.port, config_.backlog)) {
                 report_error("bind_listen failed");
@@ -108,11 +122,21 @@ namespace coro {
             if (actual != 0)
                 config_.port = actual;
 
+            last_report_ = {};
+            state_->grace_ms.store(config_.shutdown_grace.count());
+            state_->cancel_grace_ms.store(config_.cancel_grace.count());
             state_->phase_value.store(phase::running);
             // 入口协程由本对象持有 (不登记进 handler 的 registry): 否则 supervisor
             // 等待排空时会等待自己, 形成自锁。
-            accept_task_ = spawn(accept_loop());
-            supervisor_task_ = spawn(supervisor());
+            try {
+                accept_task_ = spawn(accept_loop(handler_));
+                supervisor_task_ = spawn(supervisor());
+            } catch (...) {
+                listener_.close();
+                accept_task_.cancel();
+                state_->phase_value.store(phase::stopped);
+                throw;
+            }
             return true;
         }
 
@@ -136,22 +160,40 @@ namespace coro {
         /// 与旧行为的差别: 不再停止所属 EventLoop, 因此不会连带终止同进程的其他服务。
         void stop() {
             stop_request();
+            if (state_->phase_value.load() == phase::draining)
+                state_->phase_value.store(phase::cancelling);
             state_->registry.request_cancel_all();
         }
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"。
         /// 排空状态机只有一处实现 (supervisor), 不让两条路径各自等待同一份计数。
-        Task<detail::shutdown_report> shutdown(std::chrono::milliseconds grace,
-                                               std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
+                                      std::chrono::milliseconds cancel_grace) {
+            if (grace.count() < 0 || cancel_grace.count() < 0)
+                throw std::invalid_argument("shutdown grace periods must be non-negative");
+            if (state_->phase_value.load() == phase::idle) {
+                last_report_ = {true, 0};
+                state_->phase_value.store(phase::stopped);
+                co_return last_report_;
+            }
             state_->grace_ms.store(grace.count());
             state_->cancel_grace_ms.store(cancel_grace.count());
             stop_request();
             while (state_->phase_value.load() != phase::stopped)
                 co_await coro::sleep(std::chrono::milliseconds(5));
+            // Closing a descriptor requests cancellation; its completion may still
+            // refer to the listener/receive buffer. Join the entry tasks before return.
+            while ((accept_task_.is_started() && !accept_task_.is_ready()) ||
+                   (supervisor_task_.is_started() && !supervisor_task_.is_ready()))
+                co_await coro::sleep(std::chrono::milliseconds(5));
             co_return last_report_;
         }
 
-        Task<detail::shutdown_report> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
+            return shutdown(grace, config_.cancel_grace);
+        }
+
+        Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
         /// 本服务绑定的端口; 传 0 时返回系统实际分配的端口
         unsigned short port() const noexcept { return config_.port; }
@@ -169,7 +211,7 @@ namespace coro {
         phase current_phase() const noexcept { return state_->phase_value.load(); }
 
         /// 最近一次收尾结果 (排空是否完成、还有几个任务未结束)
-        detail::shutdown_report last_shutdown_report() const noexcept { return last_report_; }
+        ShutdownReport last_shutdown_report() const noexcept { return last_report_; }
 
       private:
         /// 与协程共享的服务状态: 让 handler 协程只依赖 state, 不依赖 Server 的 this。
@@ -191,14 +233,24 @@ namespace coro {
         void report_error(const std::string& message) { state_->note_error(message); }
 
         /// accept 主循环 — 每有新连接就登记一个 handler 协程
-        Task<> accept_loop() {
+        Task<> accept_loop(handler_t handler) {
             auto st = state_;
-            handler_t handler = handler_; // 复制进帧: 协程可能活过本对象
+            struct entry_scope {
+                std::shared_ptr<state> st;
+                ~entry_scope() {
+                    auto running = phase::running;
+                    st->phase_value.compare_exchange_strong(running, phase::draining);
+                }
+            } entry{st};
             while (st->phase_value.load() == phase::running) {
                 auto conn = co_await listener_.accept();
                 if (!conn.valid()) {
                     if (st->phase_value.load() == phase::running)
                         report_error("accept failed");
+                    break;
+                }
+                if (st->phase_value.load() != phase::running) {
+                    conn.close();
                     break;
                 }
                 st->handled.fetch_add(1);
@@ -259,7 +311,7 @@ namespace coro {
         net::TcpListener listener_; // 必须比 accept_task_ 后析构
         handler_t handler_;
         std::shared_ptr<state> state_ = std::make_shared<state>();
-        detail::shutdown_report last_report_{};
+        ShutdownReport last_report_{};
         Task<void> accept_task_;     // accept 主循环句柄 (入口任务, 由本对象持有)
         Task<void> supervisor_task_; // 收尾协程句柄
     };

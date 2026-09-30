@@ -9,6 +9,8 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <type_traits>
 #include <utility>
 
 // ============================================================================
@@ -83,32 +85,28 @@ namespace coro {
         template <typename T> struct pool_acquire_awaiter {
             std::shared_ptr<pool_state<T>> st;
             std::shared_ptr<std::coroutine_handle<>> node; // 挂在 waiters 里的凭证
-            bool ready = false;                            // 无需挂起即可推进
+            bool resumed = false;
 
             pool_acquire_awaiter(std::shared_ptr<pool_state<T>> s) : st(std::move(s)) {}
 
             ~pool_acquire_awaiter() {
                 // 取消路径绕过 await_resume, 所以摘链必须在这里兜底
-                if (node && *node)
+                if (node) {
                     drop();
+                    // 已选中的等待者可能在 await_resume 之前被取消, 不能吞掉这次唤醒。
+                    if (!resumed && (!st->idle.empty() || st->can_create()))
+                        st->wake_one();
+                }
             }
 
             bool await_ready() noexcept {
                 // 有现成的空闲资源, 或还能新建 → 不需要挂起
-                if (!st->idle.empty()) {
-                    ready = true;
-                    return true;
-                }
-                if (st->can_create()) {
-                    ready = true;
-                    return true;
-                }
-                return false; // 池关闭且无空闲 → 也走这条, 由 await_resume 给出"无效"结果
+                return st->closed || !st->idle.empty() || st->can_create();
             }
 
             /// 被唤醒后不做任何事: 回到 acquire_impl 的循环顶部重新竞争资源
             /// (可能已被别的等待者抢走, 所以必须重判而不是假定轮到自己)。
-            void await_resume() const noexcept {}
+            void await_resume() noexcept { resumed = true; }
 
             void await_suspend(std::coroutine_handle<> h) {
                 if (st->closed && st->idle.empty()) {
@@ -133,6 +131,19 @@ namespace coro {
             }
         };
 
+        // 工厂挂起期间 acquire 帧可能被直接销毁, 此时 catch 不会执行。
+        // 用 RAII 归还预留名额, lease 构造成功后再转移名额所有权。
+        template <typename T> struct pool_reservation {
+            std::shared_ptr<pool_state<T>> state;
+            bool active = true;
+            ~pool_reservation() {
+                if (active) {
+                    --state->in_use;
+                    state->wake_one();
+                }
+            }
+        };
+
     } // namespace detail
 
     template <typename T> class Pool;
@@ -144,15 +155,17 @@ namespace coro {
         PoolLease(const PoolLease&) = delete;
         PoolLease& operator=(const PoolLease&) = delete;
 
-        PoolLease(PoolLease&& other) noexcept
+        PoolLease(PoolLease&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
             : res_(std::move(other.res_)), st_(std::move(other.st_)), valid_(other.valid_) {
             other.valid_ = false;
         }
 
-        PoolLease& operator=(PoolLease&& other) noexcept {
+        PoolLease& operator=(PoolLease&& other) noexcept(std::is_nothrow_move_constructible_v<T>) {
             if (this != &other) {
                 release(); // 自我赋值前先把旧资源还回去
-                res_ = std::move(other.res_);
+                res_.reset();
+                if (other.res_)
+                    res_.emplace(std::move(*other.res_));
                 st_ = std::move(other.st_);
                 valid_ = other.valid_;
                 other.valid_ = false;
@@ -209,25 +222,21 @@ namespace coro {
                 throw StructuredConcurrencyError("PoolLease used after release/invalid lease");
         }
 
-        void release() {
+        void release() noexcept {
             if (!valid_ || !st_)
                 return;
             auto st = st_;
             valid_ = false;
-            if (res_) {
-                if (st->closed || st->idle.size() >= st->max_idle) {
-                    res_.reset(); // 池已关或空闲够多: 直接丢弃资源
-                    st->in_use -= st->in_use > 0 ? 1 : 0;
-                } else {
+            if (res_ && !st->closed && st->idle.size() < st->max_idle) {
+                try {
                     st->idle.push_back(std::move(*res_));
-                    res_.reset();
-                    st->in_use -= st->in_use > 0 ? 1 : 0;
-                    st->wake_one(); // 有新空闲资源: 放行一个等待者
+                } catch (...) {
+                    // 缓存分配或 T 的移动失败时丢弃, 析构不能传播异常。
                 }
-            } else {
-                st->in_use -= st->in_use > 0 ? 1 : 0;
-                st->wake_one();
             }
+            res_.reset();
+            --st->in_use;
+            st->wake_one(); // 缓存与丢弃都会腾出借用名额, 两条路径都必须唤醒。
             st_ = nullptr;
         }
 
@@ -245,7 +254,7 @@ namespace coro {
 
         struct options {
             std::size_t max_agents = 8; ///< 同时存在的资源上限 (0 = 不限制)
-            std::size_t max_idle = 4;   ///< 空闲保留数, 超出的归还即丢弃
+            std::size_t max_idle = 4;   ///< 空闲保留数, 0 = 不缓存, 超出的归还即丢弃
         };
 
         Pool(factory_fn factory, options opts = {}) : st_(std::make_shared<detail::pool_state<T>>()) {
@@ -253,34 +262,35 @@ namespace coro {
                 throw StructuredConcurrencyError("Pool requires a non-null factory");
             st_->factory = std::move(factory);
             st_->max_agents = opts.max_agents;
-            st_->max_idle = opts.max_idle == 0 ? 1 : opts.max_idle;
+            st_->max_idle = opts.max_idle;
         }
 
         Pool(const Pool&) = delete;
         Pool& operator=(const Pool&) = delete;
         Pool(Pool&&) noexcept = default;
-        Pool& operator=(Pool&&) noexcept = default;
+        Pool& operator=(Pool&& other) noexcept {
+            if (this != &other) {
+                close();
+                st_ = std::move(other.st_);
+            }
+            return *this;
+        }
 
         /// 析构: 标记关闭并丢弃空闲资源。借出中的 lease 仍安全 (状态是 shared_ptr)。
-        ~Pool() {
-            if (!st_)
-                return;
-            st_->closed = true;
-            st_->idle.clear();
-            while (!st_->waiters.empty())
-                st_->wake_one(); // 让等待者自己看到"已关闭"并拿到无效句柄
-        }
+        ~Pool() { close(); }
 
         /// 借一个资源: 优先复用空闲, 其次在额度内新建, 否则排队等待。
         Task<PoolLease<T>> acquire() { return acquire_impl(st_); }
 
-        std::size_t idle_count() const noexcept { return st_->idle.size(); }
-        std::size_t in_use_count() const noexcept { return st_->in_use; }
-        std::size_t waiting_count() const noexcept { return st_->waiters.size(); }
-        bool closed() const noexcept { return st_->closed; }
+        std::size_t idle_count() const noexcept { return st_ ? st_->idle.size() : 0; }
+        std::size_t in_use_count() const noexcept { return st_ ? st_->in_use : 0; }
+        std::size_t waiting_count() const noexcept { return st_ ? st_->waiters.size() : 0; }
+        bool closed() const noexcept { return !st_ || st_->closed; }
 
         /// 主动关闭: 拒绝新的 acquire, 丢弃空闲资源, 唤醒等待者
         void close() {
+            if (!st_ || st_->closed)
+                return;
             st_->closed = true;
             st_->idle.clear();
             while (!st_->waiters.empty())
@@ -291,11 +301,16 @@ namespace coro {
         /// 自由协程 (不是成员协程): 帧只捕获 shared_ptr, 不捕获 Pool 的 this
         static Task<PoolLease<T>> acquire_impl(std::shared_ptr<detail::pool_state<T>> st) {
             for (;;) {
+                if (!st || st->closed)
+                    co_return PoolLease<T>{};
                 if (!st->idle.empty()) {
                     T resource = std::move(st->idle.front());
                     st->idle.pop_front();
                     ++st->in_use; // 复用不增加总数: 它本来就在池里
-                    co_return PoolLease<T>{std::move(resource), st};
+                    detail::pool_reservation<T> reservation{st};
+                    PoolLease<T> lease{std::move(resource), st};
+                    reservation.active = false;
+                    co_return lease;
                 }
                 if (st->closed)
                     co_return PoolLease<T>{}; // 池已关: 无效句柄, 由调用方判 valid()
@@ -306,14 +321,13 @@ namespace coro {
                     continue;
                 }
                 ++st->in_use; // 先占名额: 否则并发 acquire 会同时建出超额资源
-                try {
-                    T created = co_await st->factory();
-                    co_return PoolLease<T>{std::move(created), st};
-                } catch (...) {
-                    --st->in_use; // 建连失败必须归还名额
-                    st->wake_one();
-                    throw; // 原样上抛: 是工厂的错, 不该被池改写成语义不明
-                }
+                detail::pool_reservation<T> reservation{st};
+                T created = co_await st->factory();
+                if (st->closed)
+                    co_return PoolLease<T>{}; // 建连期间池已关闭, 销毁新资源并归还名额。
+                PoolLease<T> lease{std::move(created), st};
+                reservation.active = false;
+                co_return lease;
             }
         }
 

@@ -14,13 +14,17 @@
 
 cmake_minimum_required(VERSION 3.20)
 project(router LANGUAGES CXX)
+include(GNUInstallDirs)
 
 # ---- 主 target: header-only INTERFACE 库 ----
 add_library(router INTERFACE)
 add_library(router::router ALIAS router)
+add_library(coro::router ALIAS router)
 
 # 头文件直接位于本目录 (radix_router.h), include 本目录即可 #include <radix_router.h>
-target_include_directories(router INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(router INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/coro/router>)
 target_compile_features(router INTERFACE cxx_std_20)
 
 # ---- 编译器适配 ----

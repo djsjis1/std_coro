@@ -1,8 +1,11 @@
 #pragma once
 
 #include <functional>
+#include <exception>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "llhttp.h"
 
@@ -26,6 +29,19 @@ public:
     // 解析一条完整消息:先重置解析器,再 feed(一次性传入整条消息)
     bool feed_all(const char *data, size_t len);
 
+    // Signal transport EOF. Required for responses whose body is delimited by EOF.
+    bool finish();
+    bool completed() const noexcept { return completed_; }
+
+    // Stop exactly at a message boundary. consumed_bytes() identifies the unread
+    // suffix of the last feed; pass that suffix again after resume(). Default OFF.
+    void pause_after_message(bool enabled) noexcept { pause_after_message_ = enabled; }
+    size_t consumed_bytes() const noexcept { return consumed_bytes_; }
+    void resume();
+
+    // Configure before feeding an HTTP_RESPONSE parser for a HEAD request.
+    void response_to_head(bool enabled) noexcept { response_to_head_ = enabled; }
+
     // 重置解析器状态(不清空已累积的结果)
     void reset();
 
@@ -45,6 +61,9 @@ public:
     int status_code = 0;                              // 状态码,仅解析响应时有效
     std::string http_body;                            // 消息体
     std::map<std::string, std::string> http_headers;  // 头部,字段名按接收原样保存
+    // Preserve repeated fields (notably Set-Cookie); trailers are kept separately.
+    std::vector<std::pair<std::string, std::string>> header_fields;
+    std::vector<std::pair<std::string, std::string>> trailer_fields;
 
     // 消息体上限(字节),超出则中止解析;0 表示不限制(参考 cpp-httplib 的做法)
     size_t body_limit = 8 * 1024 * 1024;
@@ -66,6 +85,16 @@ public:
 private:
     void setup_callbacks();
     void clear_result();
+    bool accept_result(llhttp_errno_t error);
+    template <typename F> int callback(F&& fn) noexcept {
+        try {
+            return fn();
+        } catch (...) {
+            callback_error_ = std::current_exception();
+            llhttp_set_error_reason(&parser_, "C++ HTTP callback failed");
+            return -1; // Never unwind through llhttp's C frames.
+        }
+    }
 
     llhttp_t parser_;
     llhttp_settings_t settings_;
@@ -76,4 +105,10 @@ private:
     std::string error_;
     static const std::string empty_string_;
     size_t header_count_ = 0; // 当前消息已完成的头部字段数 (包含重复字段)
+    size_t consumed_bytes_ = 0;
+    bool completed_ = false;
+    bool paused_ = false;
+    bool pause_after_message_ = false;
+    bool response_to_head_ = false;
+    std::exception_ptr callback_error_;
 };

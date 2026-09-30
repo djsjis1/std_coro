@@ -7,7 +7,10 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // 系统头按平台分流: coro_header_check 会把每个公共头单独编成一个 TU,
@@ -49,7 +52,7 @@
 // ============================================================================
 
 namespace coro {
-    namespace detail {
+    namespace net {
         /// DNS 解析失败: 携带 getaddrinfo 的返回码, 调用方要能区分"查不到"与"网络故障"。
         class DnsResolutionError : public std::runtime_error {
           public:
@@ -57,7 +60,11 @@ namespace coro {
                 : std::runtime_error("resolve \"" + host + "\" failed: " + detail), code(code) {}
             int code; ///< getaddrinfo 返回码 (EAI_NONAME/EAI_AGAIN/...)
         };
-    } // namespace detail
+    } // namespace net
+
+    namespace detail {
+        using DnsResolutionError = net::DnsResolutionError; // compatibility alias
+    }
 
     namespace net {
 #if CORO_HAS_DNS
@@ -69,9 +76,14 @@ namespace coro {
         };
 
         /// 解析主机名/服务名为可连接的 IPv4 端点列表。不阻塞事件循环。
-        /// 失败抛 detail::DnsResolutionError; 查不到地址返回空 vector (不算错误)。
+        /// 系统解析失败抛 DnsResolutionError; 成功但没有兼容地址时返回空 vector。
         inline Task<std::vector<resolved_endpoint>> resolve(std::string host, std::string service = "") {
+            if (host.find('\0') != std::string::npos || service.find('\0') != std::string::npos)
+                throw std::invalid_argument("DNS host/service must not contain embedded NUL");
             co_return co_await to_thread([host, service]() {
+#ifdef _WIN32
+                ensure_winsock(); // resolve() can be the first network operation in the process.
+#endif
                 // 结果按值带回循环线程: sockaddr 是 POD, 但 vector 跨线程搬运才安全
                 std::vector<resolved_endpoint> out;
                 addrinfo hints{};
@@ -87,30 +99,37 @@ namespace coro {
                 if (rc != 0) {
                     // 在 worker 线程里构造异常对象没问题: to_thread 会把它作为结果传回并
                     // 由 await_resume 在循环线程重新抛出。
-                    throw detail::DnsResolutionError(host, rc, gai_strerror(rc));
+#ifdef _WIN32
+                    throw DnsResolutionError(host, rc, gai_strerrorA(rc));
+#else
+                    throw DnsResolutionError(host, rc, gai_strerror(rc));
+#endif
                 }
+                // 容器分配或字符串构造抛异常时也要释放解析结果。
+                const auto free_results = [](addrinfo* addresses) { ::freeaddrinfo(addresses); };
+                std::unique_ptr<addrinfo, decltype(free_results)> results(raw, free_results);
                 char peer[INET_ADDRSTRLEN] = {0};
                 for (addrinfo* it = raw; it != nullptr; it = it->ai_next) {
-                    if (it->ai_family != AF_INET || it->ai_addrlen < sizeof(sockaddr_in))
+                    if (it->ai_family != AF_INET || !it->ai_addr || it->ai_addrlen < sizeof(sockaddr_in))
                         continue;
                     sockaddr_in sa{};
                     std::memcpy(&sa, it->ai_addr, sizeof(sa));
                     resolved_endpoint ep;
-                    if (::inet_ntop(AF_INET, &sa.sin_addr, peer, sizeof(peer)) != nullptr)
-                        ep.address = peer;
+                    if (::inet_ntop(AF_INET, &sa.sin_addr, peer, sizeof(peer)) == nullptr)
+                        continue;
+                    ep.address = peer;
                     ep.port = static_cast<uint16_t>(ntohs(sa.sin_port));
                     if (it->ai_canonname != nullptr)
                         ep.canonical_name = it->ai_canonname;
                     out.push_back(std::move(ep));
                 }
-                ::freeaddrinfo(raw); // 必须在同一线程释放, 且不能漏
                 return out;
             });
         }
 
         /// 按解析结果建立连接: 把 endpoint 适配回 net.hpp 的 (ip, port) 接口, 调用方不必
         /// 自己拆字段。ip 为空视为无效结果。
-        inline Task<TcpStream> connect(const resolved_endpoint& ep) {
+        inline Task<TcpStream> connect(resolved_endpoint ep) {
             co_return co_await TcpStream::connect(ep.address.c_str(), ep.port);
         }
 #endif // CORO_HAS_DNS

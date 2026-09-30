@@ -39,13 +39,23 @@ if(MSVC)
 endif()
 
 # ---- 目标三元组: 与 Configure 的 target 名对齐 ----
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "vendored OpenSSL currently supports native Linux builds only")
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(_ossl_conf_target "linux-aarch64")
-else()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set(_ossl_conf_target "linux-x86_64")
+else()
+    message(FATAL_ERROR "Unsupported OpenSSL architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
 find_program(MAKE_EXE make REQUIRED)
+
+# The installed library must never look for trust anchors in this checkout's
+# build directory. Override for distributions using a different OpenSSL layout;
+# SSL_CERT_FILE / SSL_CERT_DIR remain runtime overrides.
+set(CORO_TLS_OPENSSLDIR "/etc/ssl" CACHE PATH "Runtime OpenSSL configuration and trust directory")
 
 # ---- 产物路径 (构建目录内, 不污染源码树) ----
 set(_ossl_libssl "${_ossl_out}/libssl.a")
@@ -65,13 +75,14 @@ file(COPY "${_ossl_src}/" DESTINATION "${_ossl_out}"
 # Configure 在副本根目录运行 (OpenSSL 的约定: 生成 configdata.pm 与 include/openssl/*.h)
 add_custom_command(
     OUTPUT "${_ossl_out}/configdata.pm.done"
-    COMMAND ${PERL_EXECUTABLE} ./Configure "${_ossl_conf_target}"
-            no-shared no-asm no-tests no-docs
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${CMAKE_C_COMPILER}"
+            ${PERL_EXECUTABLE} ./Configure "${_ossl_conf_target}"
+            no-shared no-asm no-tests no-docs -fPIC
             "--prefix=${_ossl_out}/install"
-            "--openssldir=${_ossl_out}/install/ssl"
+            "--openssldir=${CORO_TLS_OPENSSLDIR}"
     COMMAND ${CMAKE_COMMAND} -E touch "${_ossl_out}/configdata.pm.done"
     WORKING_DIRECTORY "${_ossl_out}"
-    DEPENDS "${_ossl_src}/Configure" "${_ossl_src}/VERSION.dat"
+    DEPENDS "${_ossl_src}/Configure" "${_ossl_src}/VERSION.dat" "${CMAKE_CURRENT_LIST_FILE}"
     COMMENT "OpenSSL 3.5.8: perl Configure ${_ossl_conf_target} no-shared no-asm no-tests no-docs"
     VERBATIM)
 
@@ -84,7 +95,7 @@ add_custom_command(
     COMMENT "OpenSSL 3.5.8: make build_libs (-j1, 低内存机器的安全档位)"
     VERBATIM)
 
-add_custom_target(openssl_vendored_build
+add_custom_target(openssl_vendored_build ALL
     DEPENDS "${_ossl_libssl}" "${_ossl_libcrypto}")
 
 # ---- 暴露成根 CMake 约定的两个目标名 ----
@@ -105,5 +116,13 @@ if(UNIX)
 endif()
 add_dependencies(openssl_ssl openssl_vendored_build)
 add_dependencies(openssl_crypto openssl_vendored_build)
+
+# 安装产物供 coroConfig.cmake 在消费端重建 imported 目标。
+# 注意: 不能用 install(TARGETS <IMPORTED 目标> EXPORT ...) —— CMake 明确拒绝
+# ("install TARGETS given target \"openssl_ssl\" which does not exist"), 所以这里走
+# install(FILES) + 由包配置自己 add_library(IMPORTED) 的标准路子。
+include(GNUInstallDirs)
+install(FILES "${_ossl_libssl}" "${_ossl_libcrypto}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY "${_ossl_out}/include/openssl" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 message(STATUS "vendored OpenSSL: ${_ossl_src} (3.5.8, ${_ossl_conf_target}, no-asm/no-tests/no-docs)")

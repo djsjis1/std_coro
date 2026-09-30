@@ -107,7 +107,7 @@ namespace coro {
         // ---- 核心 API ----
 
         /// 驱动事件循环, 直到没有就绪协程或定时器
-        /// 禁止嵌套调用（如果已经在运行中则直接返回）
+        /// 禁止嵌套调用（已经在运行中时抛出 std::runtime_error）。
         void run();
 
         /// 常驻模式: 驱动事件循环直到 stop() 被调用 (无工作时也保持等待)。
@@ -369,6 +369,8 @@ namespace coro {
 
         // 跨线程投递的普通函数队列 (dispatch 用), queue_mutex_ 保护
         std::queue<std::function<void()>> fn_queue_;
+        // 批次存于 loop, 回调抛异常后未执行项留给下一次 run, 不随局部 vector 丢失。
+        std::queue<std::function<void()>> fn_batch_;
 
         std::priority_queue<TimerEntry> timer_heap_; // 定时器最小堆 (仅事件循环线程)
 
@@ -517,8 +519,8 @@ namespace coro {
         // 挂起的 I/O 操作也是"工作": 有它们事件循环就不能退出
         // 活跃协程 > 0 也是"工作": 它们可能挂起在等待跨线程唤醒 (Future 等)
         std::lock_guard lock(queue_mutex_);
-        return !ready_queue_.empty() || !fn_queue_.empty() || !timer_heap_.empty() || event_source_->has_pending() ||
-               active_coroutines_ > 0;
+        return !ready_queue_.empty() || !batch_.empty() || !fn_queue_.empty() || !fn_batch_.empty() ||
+               !timer_heap_.empty() || event_source_->has_pending() || active_coroutines_ > 0;
     }
 
     inline void EventLoop::run() {
@@ -531,133 +533,150 @@ namespace coro {
 
     inline void EventLoop::run_impl(bool stay) {
         if (running_)
-            return; // 禁止嵌套 run()
+            throw std::runtime_error("coro::EventLoop::run() called while already running on this thread; "
+                                     "nested run() is not supported");
+        auto* previous_loop = detail::t_current_loop;
+        const auto previous_task = detail::t_current_task;
         running_ = true;
         awake_.store(true, std::memory_order_seq_cst);
-        bind(this);                                   // 当前线程绑定本 loop:
+        bind(this);                                // 当前线程绑定本 loop:
+        detail::t_current_task = nullptr;
         loop_thread_id_ = std::this_thread::get_id(); // 事件源回调等内部路径路由正确
 
-        while (running_) {
-            // 非驻留模式: 无任何工作时退出 (驻留模式忽略此条件, 等 stop())
-            if (!stay && !has_work())
-                break;
-
-            // 第 0 步: 执行跨线程投递的普通函数 (dispatch)
-            // 它们可能创建新协程 → 之后再处理定时器/就绪队列。
-            // 原子标志空判跳锁: 空队列时零加锁。
-            if (has_pending_fn_.load(std::memory_order_acquire)) {
-                // 先复位再排空: 复位之后的新 dispatch 会重新置位 → 下轮处理,
-                // 不会漏 (反之「排空后复位」会覆盖并发置位 → 漏任务)
-                has_pending_fn_.store(false, std::memory_order_release);
-                std::vector<std::function<void()>> fns;
-                {
-                    std::lock_guard lock(queue_mutex_);
-                    while (!fn_queue_.empty()) {
-                        fns.push_back(std::move(fn_queue_.front()));
-                        fn_queue_.pop();
-                    }
-                }
-                for (auto& f : fns)
-                    f();
-            }
-
-            // 第一步: 惰性清理僵尸定时器 + 将到期定时器移入就绪队列
-            auto now = process_timers();
-
-            // 第二步: 如果就绪队列 (和 fn 队列) 为空, 通过 EventSource 等待
-            // 等价于 Python 的 selector.select(timeout):
-            //   - 定时器到点 → 超时返回, 处理定时器
-            //   - 其他线程 wake() → 立即返回 (不再睡死!)
-            //   - I/O 完成 → 立即返回, 恢复对应协程
-            //
-            // 入睡协议 (防丢失唤醒, seq_cst 全序保证正确):
-            //   1. 先声明入睡 (awake_ = false)
-            //   2. 锁内复查队列 —— 覆盖「声明之后、复查之前」到达的入队:
-            //      若生产者在它自己的 exchange 里读到 true (跳过唤醒),
-            //      则其入队在 SC 全序上先于本 store, 复查必然看到;
-            //      若读到 false, 它会投递唤醒包, wait_for 必然被打断
-            //   3. 都空了才真正 wait_for
-            {
-                awake_.store(false, std::memory_order_seq_cst);
-                bool empty;
-                {
-                    std::lock_guard lock(queue_mutex_);
-                    empty = ready_queue_.empty() && fn_queue_.empty();
-                }
-                if (!empty) {
-                    awake_.store(true, std::memory_order_seq_cst);
-                } else if (!timer_heap_.empty()) {
-                    auto next = timer_heap_.top().deadline;
-                    if (next > now) {
-                        // 向上取整: 剩余 <1ms 时等待 1ms 而非 0ms。
-                        // IOCP/io_uring 的超时都是毫秒粒度, 截断为 0 会让
-                        // wait_for 立即返回 → 循环忙转烧满一个核。
-                        auto ms = std::chrono::ceil<std::chrono::milliseconds>(next - now);
-                        event_source_->wait_for(ms);
-                    }
-                    // next <= now: 定时器已到期, 不等待直接进入下一轮
-                    awake_.store(true, std::memory_order_seq_cst);
-                } else if (stay || event_source_->has_pending() || has_active_coroutines()) {
-                    // 有挂起的 I/O 操作 (如 IOCP accept/read) 或活跃协程
-                    // (可能挂起在等待跨线程唤醒, 如 Future 的 set_value):
-                    // 无限等待, I/O 完成/跨线程唤醒时事件源会唤醒我们
-                    // (milliseconds::max() 在事件源内部会被 clamp 为最长等待)
-                    // 驻留模式 (stay) 下即使无事也无限等待, 直到 stop()
-                    event_source_->wait_for(std::chrono::milliseconds::max());
-                    awake_.store(true, std::memory_order_seq_cst);
-                } else {
-                    // 队列、堆、I/O 都无事可做, 退出
-                    awake_.store(true, std::memory_order_seq_cst);
+        // try-catch 保证: 即使 dispatch 回调或协程 resume 抛出异常,
+        // running_ 被复位、线程上下文恢复到调用前, 允许后续再次 run()。
+        // 异常在 cleanup 后重新抛出, 不静默吞掉。
+        try {
+            while (running_) {
+                // 非驻留模式: 无任何工作时退出 (驻留模式忽略此条件, 等 stop())
+                if (!stay && !has_work())
                     break;
-                }
-            }
 
-            // 第三步: 恢复就绪协程。
-            // 优化: 把整个就绪队列一次性 swap 出来 (一次加锁), 再逐个 resume;
-            //   否则每个句柄都要 pop_ready 加锁一次。
-            //   batch_ 是成员: swap 后容量在 batch_/ready_queue_ 间往复保留,
-            //   稳态运行零堆分配。
-            //   行为说明: resume 期间新 schedule 的协程留在新队列里,
-            //   由下一轮迭代处理 (等价 Python call_soon 的"下轮执行"语义,
-            //   且不会引入延迟: 队列非空时下一轮不会进入等待)。
-            {
-                std::lock_guard lock(queue_mutex_);
-                batch_.swap(ready_queue_);
-                // 注意: 不在此处从 scheduled_set_ 移除!
-                // batch 消费期间 (resume 之前) 句柄仍算"已调度",
-                // 防止 batch 内前面的协程 cancel 后面的协程时重复入队。
-            }
-            while (!batch_.empty()) {
-                auto entry = batch_.front();
-                auto h = entry.handle;
-                batch_.pop();
-                {
-                    // resume 前移除: 协程 resume 后若再次挂起, 允许重新入队。
-                    // 必须逐个进行而非整批提前擦除 —— 这是防 double-schedule
-                    // 的正确性机制 (见上方注释), 不能作为纯优化合并。
-                    std::lock_guard lock(queue_mutex_);
-                    auto live = live_frames_.find(h.address());
-                    if (live == live_frames_.end() || live->second != entry.generation)
-                        continue;
-                    scheduled_set_.erase(h.address());
-                }
-                if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)
-                    if (is_abandoned(h)) {
-                        // Task 已析构但帧仍存活 (在就绪队列中未被销毁):
-                        // 安全销毁帧, 补记活跃计数递减 (对应 Task 析构时跳过的 on_coroutine_finished)
-                        on_coroutine_finished(h);
-                        cleanup_abandoned(h);
-                        continue;
+                // 第 0 步: 执行跨线程投递的普通函数 (dispatch)
+                // 它们可能创建新协程 → 之后再处理定时器/就绪队列。
+                // 原子标志空判跳锁: 空队列时零加锁。
+                if (fn_batch_.empty() && has_pending_fn_.load(std::memory_order_acquire)) {
+                    // 先复位再排空: 复位之后的新 dispatch 会重新置位 → 下轮处理,
+                    // 不会漏 (反之「排空后复位」会覆盖并发置位 → 漏任务)
+                    has_pending_fn_.store(false, std::memory_order_release);
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        fn_batch_.swap(fn_queue_);
                     }
-                    detail::t_current_task = h; // 设置当前任务 (对标 current_task)
-                    h.resume();
-                    detail::t_current_task = nullptr;
+                }
+                while (!fn_batch_.empty()) {
+                    auto callback = std::move(fn_batch_.front());
+                    fn_batch_.pop(); // 抛异常的回调不重放, 仅保留尚未执行项。
+                    callback();
+                }
+
+                // 第一步: 惰性清理僵尸定时器 + 将到期定时器移入就绪队列
+                auto now = process_timers();
+
+                // 第二步: 如果就绪队列 (和 fn 队列) 为空, 通过 EventSource 等待
+                // 等价于 Python 的 selector.select(timeout):
+                //   - 定时器到点 → 超时返回, 处理定时器
+                //   - 其他线程 wake() → 立即返回 (不再睡死!)
+                //   - I/O 完成 → 立即返回, 恢复对应协程
+                //
+                // 入睡协议 (防丢失唤醒, seq_cst 全序保证正确):
+                //   1. 先声明入睡 (awake_ = false)
+                //   2. 锁内复查队列 —— 覆盖「声明之后、复查之前」到达的入队:
+                //      若生产者在它自己的 exchange 里读到 true (跳过唤醒),
+                //      则其入队在 SC 全序上先于本 store, 复查必然看到;
+                //      若读到 false, 它会投递唤醒包, wait_for 必然被打断
+                //   3. 都空了才真正 wait_for
+                {
+                    awake_.store(false, std::memory_order_seq_cst);
+                    bool empty;
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        empty = ready_queue_.empty() && batch_.empty() && fn_queue_.empty();
+                    }
+                    if (!empty) {
+                        awake_.store(true, std::memory_order_seq_cst);
+                    } else if (!timer_heap_.empty()) {
+                        auto next = timer_heap_.top().deadline;
+                        if (next > now) {
+                            // 向上取整: 剩余 <1ms 时等待 1ms 而非 0ms。
+                            // IOCP/io_uring 的超时都是毫秒粒度, 截断为 0 会让
+                            // wait_for 立即返回 → 循环忙转烧满一个核。
+                            auto ms = std::chrono::ceil<std::chrono::milliseconds>(next - now);
+                            event_source_->wait_for(ms);
+                        }
+                        // next <= now: 定时器已到期, 不等待直接进入下一轮
+                        awake_.store(true, std::memory_order_seq_cst);
+                    } else if (stay || event_source_->has_pending() || has_active_coroutines()) {
+                        // 有挂起的 I/O 操作 (如 IOCP accept/read) 或活跃协程
+                        // (可能挂起在等待跨线程唤醒, 如 Future 的 set_value):
+                        // 无限等待, I/O 完成/跨线程唤醒时事件源会唤醒我们
+                        // (milliseconds::max() 在事件源内部会被 clamp 为最长等待)
+                        // 驻留模式 (stay) 下即使无事也无限等待, 直到 stop()
+                        event_source_->wait_for(std::chrono::milliseconds::max());
+                        awake_.store(true, std::memory_order_seq_cst);
+                    } else {
+                        // 队列、堆、I/O 都无事可做, 退出
+                        awake_.store(true, std::memory_order_seq_cst);
+                        break;
+                    }
+                }
+
+                // 第三步: 恢复就绪协程。
+                // 优化: 把整个就绪队列一次性 swap 出来 (一次加锁), 再逐个 resume;
+                //   否则每个句柄都要 pop_ready 加锁一次。
+                //   batch_ 是成员: swap 后容量在 batch_/ready_queue_ 间往复保留,
+                //   稳态运行零堆分配。
+                //   行为说明: resume 期间新 schedule 的协程留在新队列里,
+                //   由下一轮迭代处理 (等价 Python call_soon 的"下轮执行"语义,
+                //   且不会引入延迟: 队列非空时下一轮不会进入等待)。
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    if (batch_.empty())
+                        batch_.swap(ready_queue_);
+                    // 注意: 不在此处从 scheduled_set_ 移除!
+                    // batch 消费期间 (resume 之前) 句柄仍算"已调度",
+                    // 防止 batch 内前面的协程 cancel 后面的协程时重复入队。
+                }
+                while (!batch_.empty()) {
+                    auto entry = batch_.front();
+                    auto h = entry.handle;
+                    batch_.pop();
+                    {
+                        // resume 前移除: 协程 resume 后若再次挂起, 允许重新入队。
+                        // 必须逐个进行而非整批提前擦除 —— 这是防 double-schedule
+                        // 的正确性机制 (见上方注释), 不能作为纯优化合并。
+                        std::lock_guard lock(queue_mutex_);
+                        auto live = live_frames_.find(h.address());
+                        if (live == live_frames_.end() || live->second != entry.generation)
+                            continue;
+                        scheduled_set_.erase(h.address());
+                    }
+                    if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)
+                        if (is_abandoned(h)) {
+                            // Task 已析构但帧仍存活 (在就绪队列中未被销毁):
+                            // 安全销毁帧, 补记活跃计数递减 (对应 Task 析构时跳过的 on_coroutine_finished)
+                            on_coroutine_finished(h);
+                            cleanup_abandoned(h);
+                            continue;
+                        }
+                        detail::t_current_task = h; // 设置当前任务 (对标 current_task)
+                        h.resume();
+                        detail::t_current_task = nullptr;
+                    }
                 }
             }
+        } catch (...) {
+            // 异常路径: 复位状态后重新抛出, 确保 loop 可再次 run()
+            running_ = false;
+            awake_.store(true, std::memory_order_seq_cst);
+            detail::t_current_task = previous_task;
+            bind(previous_loop);
+            throw;
         }
-
         running_ = false;
         awake_.store(true, std::memory_order_seq_cst); // 退出后: 不再有人需要唤醒我们
+        detail::t_current_task = previous_task;
+        bind(previous_loop);
     }
 
 } // namespace coro

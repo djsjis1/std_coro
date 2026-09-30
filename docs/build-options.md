@@ -9,22 +9,30 @@
 
 | 选项                              | 默认                              | 影响                                                                                 |
 | --------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
-| `CORO_ENABLE_NATIVE_IO`           | Windows/Linux`ON`，其他平台 `OFF` | 原生 I/O 总开关；关闭时核心走`CVEventSource`，网络/文件/管道/监视/进程模块全部不构建 |
+| `CORO_ENABLE_NATIVE_IO`           | Windows/Linux`ON`，其他平台 `OFF` | 原生 I/O 组件构建开关；关闭后不构建网络服务与相关示例，Linux 使用 CVEventSource；Windows 核心等待仍使用 IOCP |
 | `CORO_ENABLE_URING`               | `ON`                              | Linux 的 io_uring 后端（依赖`NATIVE_IO`）。关闭即纯协程核心                          |
 | `CORO_REQUIRE_URING`              | `OFF`                             | `ON` 时 io_uring 后端不可用直接配置失败，禁止静默降级；`OFF` 时只警告                |
-| `CORO_REQUIRE_TLS` | `OFF` | 要求 `thirdparty/openssl` 源码存在，缺失时配置期 `FATAL_ERROR`；`OFF` 时降级为警告并置 `CORO_HAS_TLS=0` |
-
-启用 TLS 的前置与仓库形态：`thirdparty/openssl/` 是 OpenSSL 3.5.8 LTS 源码树（上游 `openssl-3.5.8.tar.gz`），构建期由 `perl Configure` + `make build_libs -j1` 产出 `libcrypto.a`/`libssl.a`。入库树有两处必要删减：其一，GitHub Push Protection (GH013) 会把上游测试夹具里的**示例私钥**判成密钥泄漏而拒绝 push（实测 241 个文件含 `BEGIN ... PRIVATE KEY`，如 `apps/rsa8192.pem`、`demos/smime/cakey.pem`），这些夹具在 `no-tests` 构建下不参与编译，故一并移除；其二，为控制体积删去了 `doc/` 正文与 `test` 的大体积语料（`test/recipes/30-test_evp_data/*.txt`），**但保留了各目录的 `build.info`** —— 上游 `Configure` 会校验被删目录的清单是否存在，只删清单会直接失败；而它不会校验 `doc` 清单里列的 `.pod` 文件，所以这条裁剪线是实测出来的（140MB → 61MB → 移除私钥夹具后 4375 文件，最大单文件 2.3MB）。另外已知缺陷：`coro::coro` 的导出 INTERFACE 引用了未随包定义的 `openssl_ssl`/`openssl_crypto`，因此 `find_package(coro)` 目前对消费者不可用（`install(TARGETS)` 不接受 IMPORTED 目标，需改为安装 `.a` 并在 `coroConfig.cmake` 内自建 imported 目标，或把 TLS 拆成独立组件）；CI 的 package smoke 会暴露它。
+| `CORO_REQUIRE_TLS` | `OFF` | 要求 TLS 实际启用；开关、网络后端或源码不满足时配置失败 |
 | `CORO_ENABLE_WEB`                 | `OFF`                             | `coro::web` 静态库、`web_server` 示例与 Web 层测试的唯一开关                         |
+| `CORO_ENABLE_HTTP` | `OFF` | 独立 HTTP 协议库；Web 开启时自动引入，不依赖协程或原生 I/O |
 | `CORO_ENABLE_TLS` | `OFF` | 构建 `coro::tls`；只用仓库内 `thirdparty/openssl` 源码，配置期不联网、不查系统 OpenSSL |
 | `CORO_ENABLE_CONCURRENCY_EXT`     | `OFF`                             | 并发工具扩展（`timer.hpp`/`context.hpp`/后续的 Channel、select 等）与其测试；只依赖纯核心，零第三方 |
 | `CORO_BUILD_TESTS`                | `OFF`                             | googletest 与`coro_tests`                                                            |
 | `CORO_BUILD_EXAMPLES`             | `OFF`                             | `examples/`、`tcp_udp` 示例、根 `main.cpp` 练习场                                    |
-| `CORO_BUILD_BENCHMARKS`           | `OFF`                             | `coro_stress` 压测程序（`EXAMPLES=ON` 时也会带上）                                   |
+| `CORO_BUILD_BENCHMARKS`           | `OFF`                             | 可单独构建 `coro_stress`；`EXAMPLES=ON` 仍兼容原有压测构建行为 |
 | `CORO_GCC13_COROUTINE_WORKAROUND` | `ON`                              | GCC 13 上对协程翻译单元加`-fno-tree-slp-vectorize`                                   |
 
 **开发验证目标默认全 OFF 是刻意的**：本库以 `add_subdirectory` 或 `find_package`
 被消费时，不应该附带把测试框架、示例和 Web 服务一起配置进来。
+
+TLS 当前支持原生 Linux x86_64/aarch64。包装层使用仓库内 OpenSSL 3.5.8 源码、Perl
+和 make，Windows 与交叉编译仍在配置期拒绝。`coro::tls` 隔离 OpenSSL 实现；
+安装包通过 `set_and_check()` 重建可重定位的静态库路径，不借用导出文件的
+`_IMPORT_PREFIX`。源码改动尚待维护者执行安装迁移验证。
+
+OpenSSL 运行时默认信任目录由 `CORO_TLS_OPENSSLDIR` 指定（默认 `/etc/ssl`），
+不会指向构建目录；不同发行版可以覆盖，运行时也可用 `SSL_CERT_FILE` /
+`SSL_CERT_DIR` 或 `TlsContext::load_verify_file()` 指定信任来源。
 
 ## 2. 能力宏：每项能力一个，单点派生
 
@@ -76,12 +84,12 @@ Web    → 需要 NET && FS, 由 target 属性 CORO_WEB_IO_AVAILABLE 表达
 ## 3. 模块依赖方向
 
 ```
-core (task/scheduler/sync/gather/...)        ← 零第三方依赖, 任何平台可构建
-  └── IO 模块 (net/fs/pipe/fs_watch/process) ← 仅依赖 IOCP 或 io_uring
-        └── tcp_udp, router                   ← router 实际是独立 header 库, 不依赖 IO
-              └── coro::web (Web/src)          ← 显式 CORO_ENABLE_WEB
-                    └── thirdparty/http        ← HTTP 协议解析 (llhttp)
-                          └── Web (web_server 示例)
+core ← io ← tls
+         ← tcp_udp
+web → io + router + http_protocol
+http_protocol → llhttp
+router → 标准库
+coro::coro → io + 已启用的 tls（兼容入口）
 ```
 
 规则：
@@ -93,18 +101,22 @@ core (task/scheduler/sync/gather/...)        ← 零第三方依赖, 任何平�
 - `Web` 支持 `cmake -S Web` 独立构建（`CORO_WEB_BOOTSTRAP` 路径自动引入根工程），
   改动根 CMake 时必须保持这条路径可用。
 
-### 3.1 消费者目标：`coro::core` 与 `coro::coro`
+### 3.1 消费者目标
 
 | 目标 | 携带内容 | 适用消费者 |
 |---|---|---|
-| `coro::core` | include 路径、`cxx_std_20`、MSVC/GCC 协程方言、GCC13 规避、`pthread` | 只用 Task/调度/同步/定时器；**不**继承 `liburing`、`ws2_32` |
-| `coro::coro` | `coro::core` + 原生 I/O 后端（Linux `coro::uring`、Windows `ws2_32`）与 `CORO_HAS_URING` | 使用 net/fs/pipe/process，或沿用旧代码 |
+| `coro::core` | include 路径、`cxx_std_20`、MSVC/GCC 协程方言、GCC13 规避、`Threads::Threads` | 只用 Task/调度/同步/定时器；**不**继承 `liburing`、`ws2_32` |
+| `coro::io` | core + 原生 I/O 后端与 `CORO_HAS_URING` | 使用 net/fs/pipe/process，不引入 OpenSSL |
+| `coro::tls` | io + 编译后的 TLS 实现，OpenSSL 为私有依赖 | 显式使用 TLS |
+| `coro::http_protocol` | llhttp + 解析/报文构建 | 不需要 Web 或协程的 HTTP 消费者 |
+| `coro::router` | 纯标准库路由器 | 路由匹配；兼容 router::router |
+| `coro::coro` | io + 已启用的 tls | 沿用旧聚合入口 |
 
-- 依赖方向单向 `coro::coro → coro::core`，禁止反向；核心头不得 include 后端头
+- 组件依赖只指向更低层，禁止反向依赖 `coro::coro` 聚合入口；核心头不得 include 后端头
   （`coro.hpp` 不含 IO 头，后端由 `event_loop.hpp` 按宏条件引入）。
 - 安装导出名由 `EXPORT_NAME` 显式指定：`add_library(ns::name ALIAS)` 不参与
   `install(EXPORT)` 命名，不设则消费者拿到的是 `coro::coro_core`。
-- `find_package(coro COMPONENTS ...)` 的组件名即导出目标名（`core`/`coro`/`web`…）；
+- `find_package(coro COMPONENTS ...)` 的组件名即导出目标名（`core`/`io`/`tls`/`http_protocol`/`router`/`tcp_udp`/`coro`）；
   请求安装包中不存在的组件在配置期直接失败并给出可操作原因，未请求的组件不会给消费者
   带来任何链接依赖。
 - 回归门禁：`tests/core_smoke` 在**带 io_uring 的安装包**上配置 `coro::core` 消费者，
@@ -120,7 +132,7 @@ core (task/scheduler/sync/gather/...)        ← 零第三方依赖, 任何平�
 | 目录                                    | 上游         | 用在哪                       | 引入方式                                                          |
 | --------------------------------------- | ------------ | ---------------------------- | ----------------------------------------------------------------- |
 | `thirdparty/googletest-main`            | GoogleTest   | `coro_tests`                 | `CORO_BUILD_TESTS=ON` 时 `add_subdirectory(... EXCLUDE_FROM_ALL)` |
-| `thirdparty/http/llhttp-release-v9.3.0` | llhttp 9.3.0 | `thirdparty/http` 的解析后端 | `add_subdirectory(llhttp-release-v9.3.0)`                         |
+| `thirdparty/http/llhttp-release-v9.3.0` | llhttp 9.3.0 | `thirdparty/http` 的解析后端 | 包装层直接编译 llhttp 的三个 C 文件                         |
 | `thirdparty/liburing`                   | liburing 2.9 | Linux io_uring 事件源        | `add_subdirectory(thirdparty/liburing)`，构建静态库 `uring`       |
 
 `thirdparty/liburing/CMakeLists.txt` 是**包装层**（不改上游源码）：上游的
@@ -151,12 +163,13 @@ CI、文档与所有引用点。
 | `core`   | `NATIVE_IO=OFF`，纯协程核心         | `build/core`   |
 | `native` | 核心 + io_uring/IOCP 模块（无测试） | `build/native` |
 | `web`    | `native` + `CORO_ENABLE_WEB=ON`     | `build/web`    |
+| `tls` | Linux 原生 I/O + TLS，测试与示例仍关闭 | `build/tls` |
 | `dev`    | 全特性 + 测试 + 示例 + 压测         | `build/dev`    |
 
 前三个 configure preset 仍继承“测试/示例/压测全关”，只用于验证模块开关本身；
 要跑单测就用 `dev`，或临时叠加 `-DCORO_BUILD_TESTS=ON`。
 
-配套还有 `buildPresets`（core/native/web/dev，均 `jobs: 2`，低内存机器友好）
+配套还有 `buildPresets`（core/native/web/tls/dev，均 `jobs: 2`，低内存机器友好）
 与 `testPresets`（仅 dev）：
 
 ```bash

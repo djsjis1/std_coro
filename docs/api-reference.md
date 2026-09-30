@@ -22,6 +22,7 @@
 - [Unix 域套接字 unix.hpp](#unix-域套接字-unixhpp)
 - [资源池 pool.hpp](#资源池-poolhpp)
 - [TLS tls.hpp](#tls-tlshpp)
+- [TCP/UDP 服务与关闭结果](#tcpudp-服务与关闭结果)
 - [并发组合 gather.hpp / wait.hpp](#并发组合)
 - [TaskGroup task_group.hpp](#taskgroup-task_grouphpp)
 - [同步原语 sync.hpp](#同步原语-synchpp)
@@ -373,7 +374,7 @@ auto ms = rl.retry_after<std::chrono::milliseconds>(1); // 给上层回 429 Retr
 
 ## 字节流 stream.hpp
 
-> 只依赖核心与 `io.hpp`；`#include <coro/stream.hpp>`。作用：把 `TcpStream`/`PipeEnd`/未来的
+> 只依赖协程核心；`#include <coro/stream.hpp>`。作用：把 `TcpStream`/`PipeEnd`/
 > TLS 流上“一次 N 字节”的裸读裸写，包成协议层常用的“读一行 / 读满定长 / 全量写出”。
 
 ```cpp
@@ -394,6 +395,11 @@ co_await writer.write_all("PING\r\n");
 | `write_all(data, n)` | `true` = 全写完；`false` = 对端不可写（**已写出的部分不回退**，调用方需知道协议已不一致） |
 | `write_line(s)` | `write_all(s)` + 一个 LF |
 | `buffered()` | 已缓冲未消费字节数（跨次调用不丢数据） |
+
+`max_capacity` 是硬上限：初始容量超过它时会缩小，值为 0 抛 `invalid_argument`。
+`read_until()` 的分隔符不能为空；EOF 处单独的 CR 会保留为数据并消费。
+字符串写入重载和分隔符会复制到任务里，允许传入临时字符串；指针重载仍要求调用者
+保持缓冲有效到操作结束。同一 reader 的读取必须串行。
 
 四种结局严格可区分（本层的核心合同，测试逐条锁定）：
 
@@ -440,6 +446,8 @@ auto sock = co_await coro::net::connect(eps[0]);               // 端点直接�
 - **v1 只返回 IPv4**：`net.hpp` 目前只构造 `sockaddr_in`，返回 v6 地址等于交给调用方一个
   连不上的东西；等 `net.hpp` 支持 `sockaddr_in6` 再放开。
 - 不做结果缓存与 happy-eyeballs 排序（属连接池 / HTTP Client 层策略），不做反向解析。
+- 系统解析失败抛 `coro::net::DnsResolutionError`，保留旧 detail 名字的兼容别名；
+  Windows 上解析会先初始化 Winsock，不要求调用者先创建 socket。
 - 测试刻意用**非法服务名**触发失败而非"未知主机"：本机存在把任意域名（含 RFC 6761 保留的
   `.invalid`）解析到 198.18.0.8 的拦截器，用主机名断言会变成分环境偶发。
 
@@ -502,7 +510,7 @@ coro::Pool<coro::net::TcpStream> pool(
 
 auto lease = co_await pool.acquire();   // 复用空闲 → 额度内新建 → 否则排队
 if (!lease.valid()) throw std::runtime_error("pool closed");
-use(**lease);                            // 或 lease->write(...)
+use(*lease);                            // 或 lease->write(...)
 // 离开作用域自动归还; 连接已坏时 lease.discard() 让池少一个成员
 ```
 
@@ -527,22 +535,25 @@ use(**lease);                            // 或 lease->write(...)
 范围：不做空闲 TTL 淘汰与健康探测——那需要资源侧"还能用吗"的回调，由使用者拿到 lease
 后自行校验并 `discard()` 更诚实；也不做每键多池（按 endpoint 分池由调用方组合）。
 
+`max_idle=0` 表示不保留空闲资源。工厂挂起期间池被关闭，`acquire()` 返回无效 lease；
+工厂失败、取消或 acquire 帧直接销毁都会归还预留名额。移动后的 Pool 视为关闭。
+
 ## TLS tls.hpp
 
 > **需要 `CORO_ENABLE_TLS=ON` 且仓库内存在 `thirdparty/openssl` 源码**（OpenSSL 3.5.8 LTS）。
 > 关闭时 `tls.hpp` 整体编译为空：消费者既不需要 OpenSSL 头文件，也不会被链接 `libssl`。
-> 实现体在 `include/coro/detail/tls.ipp`（唯一 `#include <openssl/*.h>` 的位置）。
+> 链接 `coro::tls`；实现体在 `src/tls.cpp`，OpenSSL 头文件只在实现中出现。
 
 ```cpp
 coro::tls::TlsContext ctx(coro::tls::TlsContext::role::client);
-if (!ctx.load_system_trust()) throw std::runtime_error("无信任锚: 必须失败, 不得跳过校验");
+if (!ctx.load_system_trust()) throw std::runtime_error("无法配置默认信任路径");
 
 auto sock = co_await coro::net::TcpStream::connect(ip, 443);
 coro::tls::TlsStream tls(std::move(sock), ctx, "example.com");
 if (!co_await tls.handshake()) throw coro::tls::TlsError(tls.last_error(), 0);
 
 coro::stream_writer w(tls);            // TlsStream 满足 AsyncWritable
-co_await w.write_line("GET / HTTP/1.0\r\n");
+co_await w.write_all("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
 coro::stream_reader r(tls);            // 也满足 AsyncReadable
 auto line = co_await r.read_line();
 const bool clean = co_await tls.shutdown();   // 双向 close_notify
@@ -556,8 +567,19 @@ const bool clean = co_await tls.shutdown();   // 双向 close_notify
 | `set_min_version` / `set_alpn` / `set_hostname_verification` | 版本下限、ALPN（wire format 由实现拼装）、主机名校验开关 |
 | `TlsStream::handshake()` | 协程；返回 `bool`，失败原因见 `last_error()`；可被取消 |
 | `read` / `write` | 协程成员，返回 `Task<int>`，约定与 `TcpStream` 一致（`0` = 干净 EOF，`-1` = 错误） |
-| `shutdown()` | 必须完成**双向** `close_notify` 才返回 true；未完成/协议错误即会话作废 |
+| `shutdown()` | 完成双向 `close_notify` 才返回 true；开始关闭后，无论结果如何都不可复用 |
 | `peer_verified` / `negotiated_version` / `negotiated_alpn` | 握手结果观测 |
+
+Context 配置在 Stream 构造时快照；Context 随后移动或析构不影响该会话。
+同一 Stream 的异步操作必须串行，重叠操作抛 `logic_error`；操作期间不得移动或析构 Stream。
+`set_verify_depth()` 会立即更新 Context；`set_alpn()` 校验协议长度，服务端按配置顺序选择共同协议。
+客户端自动发送 DNS 主机名的 SNI，默认校验证书身份；空主机名不会隐式跳过验证。
+`load_system_trust()` 返回 true 仅表示 OpenSSL 默认路径配置成功，验证链是否可信仍由握手判定。
+
+`last_error_code()` 保存会话错误，流适配器优先读取它，避免其他协程覆盖线程 errno。
+`reusable()` 仅说明 TLS 状态仍可传输；上层还必须确认完整消费响应、连接健康。
+主动关闭、对端 close_notify、协议错误和操作取消后都不能复用。
+超时由调用方用 `wait_for` 控制，本层没有隐藏 deadline。
 
 三条设计要点（都在头注释里）：
 
@@ -566,13 +588,40 @@ const bool clean = co_await tls.shutdown();   // 双向 close_notify
    （直接 `SSL_connect` 或用阻塞 BIO 会把整个 loop 卡住。）
 2. **`read`/`write` 是协程成员而非手写 awaiter**：这样自动继承框架的取消注入与异常传播，
    不必重造挂起/摘链/取消兜底 —— 那是本项目反复出过错的地方。
-3. **未完成 `close_notify` 交换的连接不得回连接池**：`shutdown()` 返回 false 即应 `discard()`；
+3. **关闭后的 TLS 连接不得回连接池**：调用 `shutdown()` 后，无论返回 true/false 都应 `discard()`；
    实测踩过的坑是 `SSL_get_shutdown()` 的 `SSL_RECEIVED_SHUTDOWN` 位**只在库处理该记录后**才更新，
    刚 `BIO_write` 进去就查标志必然为空，会把已成功的交换误判为失败。
 
 前置工具：OpenSSL 的构建脚本需要 **Perl**（CI 与本人都按外部前置处理）；NASM 缺失时统一
 `no-asm`，保证不同机器编出同一套 C 实现。Windows 的 nmake/JOM 编排尚未实现，配置期显式
 `FATAL_ERROR` 而不是静默产出坏库。
+
+## TCP/UDP 服务与关闭结果
+
+链接 `coro::tcp_udp`，包含 `<tcp_udp/tcp_server.hpp>` 或 `<tcp_udp/udp_server.hpp>`。
+关闭结果是 `<coro/shutdown.hpp>` 中的 `coro::ShutdownReport`：
+
+```cpp
+struct ShutdownReport {
+    bool drained;
+    std::size_t unfinished;
+};
+
+auto result = co_await server.shutdown();       // 使用 Config 中的宽限期
+auto result2 = co_await server.shutdown(1s);    // 覆盖排空时间
+auto result3 = co_await server.shutdown(1s, 500ms);
+```
+
+未启动的服务关闭时直接返回 `{true, 0}`。`stop_request()` 使用已配置的宽限期；
+`stop()` 跳过排空并请求取消。入口 I/O 的取消完成后 `shutdown()` 才返回，
+`unfinished` 表示仍未结束的 handler；还有任务时 `start()` 返回 false，也不能销毁它们借用的资源。
+`last_shutdown_report()` 保留最近一次关闭时的快照。
+
+服务的配置、启动、停止在所属事件循环线程执行；跨线程使用 `loop.dispatch()`。
+`set_handler()` 的处理器在 `start()` 时复制，之后修改只影响下一次启动。
+Server 必须存活到 `shutdown()` 返回；UDP handler 若借用 `socket()`，还须等待全部
+handler 完成。负的关闭宽限期与不在 1–65535 范围内的 UDP 接收缓冲大小会被拒绝。
+`UdpServer::pending_bytes()` 在无限额模式下也统计真实的在途数据量。
 
 ## 并发组合 gather.hpp / wait.hpp
 
@@ -804,11 +853,12 @@ public:
 ```cpp
 namespace coro {
     template <typename F>
-    Task<std::invoke_result_t<F>> to_thread(F func);
+    Task<std::invoke_result_t<F&>> to_thread(F func);
 }
 ```
 
 - `func` 在进程级线程池（默认 `hardware_concurrency` 线程）执行；
+- 支持仅可移动的闭包，例如捕获 `unique_ptr`；函数按左值调用；
 - 返回值/异常跨线程传回 `co_await` 处；
 - 纪律：`func` 内**不得**触碰事件循环与协程对象；
   与协程世界通信请用 `Promise::set_value`。

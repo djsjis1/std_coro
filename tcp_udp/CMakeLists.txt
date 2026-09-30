@@ -19,11 +19,12 @@ endif()
 
 add_library(coro_tcp_udp INTERFACE)
 add_library(coro::tcp_udp ALIAS coro_tcp_udp)
+set_target_properties(coro_tcp_udp PROPERTIES EXPORT_NAME tcp_udp)
 
 target_include_directories(coro_tcp_udp INTERFACE
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
-target_link_libraries(coro_tcp_udp INTERFACE coro::coro)
+target_link_libraries(coro_tcp_udp INTERFACE coro::io)
 
 # TCP/UDP echo 示例 (服务端 + 内置测试客户端) —— 组件本身始终定义, 示例才受开关控制
 if(CORO_BUILD_EXAMPLES)

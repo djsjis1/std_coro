@@ -2,10 +2,12 @@
 
 #include "task.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -23,7 +25,7 @@
 // 用法:
 //   coro::Scheduler sched;                    // 默认 = CPU 核数个 worker
 //   for (auto& req : requests)
-//       sched.spawn_any(handle(req));         // 自动分发到最闲的 worker
+//       sched.spawn_any([req] { return handle(req); }); // 在 worker 创建任务
 //   sched.wait_all();                         // 阻塞直到全部完成
 //   // sched 析构时自动停止并 join 所有 worker
 //
@@ -47,18 +49,44 @@ namespace coro {
             workers_.resize(workers);
             // atomic 数组: make_unique 值初始化 (全部为 0)
             assigned_ = std::make_unique<std::atomic<size_t>[]>(workers);
-            for (auto& w : workers_) {
-                w.thread = std::thread([&w] {
-                    // 本线程的 EventLoop (惰性创建)
-                    EventLoop& loop = EventLoop::get();
-                    w.loop.store(&loop, std::memory_order_release); // 公布给主线程 (atomic store 消除数据竞争)
-                    loop.run_until_stopped();
-                });
-            }
-            // 等所有 worker 的 loop 就绪 (避免 spawn_any 时 loop 为空)
-            for (auto& w : workers_) {
-                while (!w.loop.load(std::memory_order_acquire))
-                    std::this_thread::yield();
+            try {
+                for (auto& w : workers_) {
+                    w.thread = std::thread([&w] {
+                        EventLoop* loop = nullptr;
+                        try {
+                            loop = &EventLoop::get();
+                            // 由 run 内的第一条回调发布就绪, 保证立即 stop 不会被
+                            // 尚未开始的 run_until_stopped 覆盖。
+                            loop->dispatch([&w, loop] {
+                                w.loop.store(loop, std::memory_order_release);
+                                w.started.store(true, std::memory_order_release);
+                            });
+                        } catch (...) {
+                            w.startup_error = std::current_exception();
+                            w.started.store(true, std::memory_order_release);
+                            return;
+                        }
+                        loop->run_until_stopped();
+                    });
+                }
+                for (auto& w : workers_) {
+                    while (!w.started.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    if (w.startup_error)
+                        std::rethrow_exception(w.startup_error);
+                }
+            } catch (...) {
+                // 部分线程创建失败时构造函数不会进入 ~Scheduler, 必须在这里 join。
+                for (auto& w : workers_) {
+                    if (!w.thread.joinable())
+                        continue;
+                    while (!w.started.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    if (auto* loop = w.loop.load(std::memory_order_acquire))
+                        loop->stop();
+                    w.thread.join();
+                }
+                throw;
             }
         }
 
@@ -84,38 +112,53 @@ namespace coro {
         /// factory 在 worker 线程被调用 (协程帧在 worker 线程创建/销毁,
         /// 避免跨线程堆操作), 返回的 Task 立即启动并自持有运行到完成。
         ///
-        /// 工厂是普通函数/lambda (非协程): 返回 Task<T>。
+        /// 工厂返回 Task<T>; 闭包由包装协程持有到任务结束, 也支持带捕获的协程 lambda。
         ///   sched.spawn_any([] { return handle_request(req); });   // 推荐
-        ///   sched.spawn_any(make_task, arg1, arg2);                // 函数 + 参数
+        ///   sched.spawn_any([arg1, arg2] { return make_task(arg1, arg2); });
         ///
         /// 注意: 不返回任务句柄 (结果通过参数/共享状态传递)。
         template <typename F> void spawn_any(F factory) {
+            // dispatch 的 std::function 需要可复制包装; 工厂本身允许仅可移动。
+            auto holder = std::make_shared<F>(std::move(factory));
             ++pending_dispatches_;
             // 单次扫描直接拿索引 (旧实现 pick_least_loaded 返回指针后
             // 还要 index_of 再扫一遍, O(2N) → O(N))
             size_t best = pick_least_loaded_index();
             ++assigned_[best];
-            workers_[best]
-                .loop.load(std::memory_order_acquire)
-                ->dispatch([this, factory = std::move(factory)]() mutable {
+            try {
+                workers_[best].loop.load(std::memory_order_acquire)->dispatch([this, holder]() mutable {
                     try {
-                        // 在 worker 线程: 创建帧 → 启动 → 自持有
-                        auto t = factory();
-                        t.start();
-                        t.detach(); // 协程自持有到完成 (帧在 worker 线程销毁)
+                        auto task = run_factory(std::move(*holder));
+                        task.start();
+                        task.detach();
                     } catch (...) {
-                        // factory 抛异常: 记录但不传播 (防止 std::terminate)
+                        // 包装任务创建失败也要可观测; 工厂运行时异常走 Task 的默认报告。
+                        try {
+                            detail::detached_exception_handler()(std::current_exception());
+                        } catch (...) {
+                            std::fprintf(stderr, "[coro] scheduler error handler threw\n");
+                        }
                     }
-                    --pending_dispatches_; // 放行 wait_all
+                    --pending_dispatches_;
                 });
+            } catch (...) {
+                --assigned_[best];
+                --pending_dispatches_;
+                throw;
+            }
         }
 
-        /// 阻塞等待所有已分发任务完成。
+        /// 阻塞等待所有已分发任务完成。不能从本 Scheduler 的 worker 调用。
+        /// Scheduler 的析构也必须由 worker 之外的所有者执行。
         /// 注: 协程在 worker 线程完成时没有跨线程通知机制 (active_coroutines_
         /// 是 atomic 可安全读, 但每次完成都 notify 会给热路径加系统调用),
         /// 因此仍是轮询 —— 但用自适应退避: 首次 50µs, 每轮翻倍, 上限 1ms。
         /// 对快任务场景比固定 1ms 轮询快约一个数量级, 慢任务不增加开销。
         void wait_all() {
+            for (const auto& worker : workers_) {
+                if (worker.thread.get_id() == std::this_thread::get_id())
+                    throw std::logic_error("Scheduler::wait_all cannot block a worker of the same scheduler");
+            }
             using namespace std::chrono_literals;
             auto interval = 50us;
             while (true) {
@@ -147,6 +190,10 @@ namespace coro {
         }
 
       private:
+        template <typename F> static Task<> run_factory(F factory) {
+            co_await factory();
+        }
+
         /// 选择「活跃协程最少」的 worker, 返回其索引。
         /// 两级选择:
         ///   主: 活跃协程数 (当前真实负载)
@@ -173,13 +220,18 @@ namespace coro {
         struct Worker {
             std::thread thread;
             std::atomic<EventLoop*> loop{nullptr}; // atomic: worker 线程写, 主线程读 (消除数据竞争)
+            std::atomic<bool> started{false};
+            std::exception_ptr startup_error;
 
             Worker() = default;
             Worker(Worker&& other) noexcept
-                : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)) {}
+                : thread(std::move(other.thread)), loop(other.loop.load(std::memory_order_relaxed)),
+                  started(other.started.load(std::memory_order_relaxed)), startup_error(std::move(other.startup_error)) {}
             Worker& operator=(Worker&& other) noexcept {
                 thread = std::move(other.thread);
                 loop.store(other.loop.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                started.store(other.started.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                startup_error = std::move(other.startup_error);
                 return *this;
             }
             Worker(const Worker&) = delete;

@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/httpTargets.cmake")
+if(NOT TARGET http::http)
+    add_library(http::http ALIAS http::http_protocol)
+endif()
+if(NOT TARGET llhttp::llhttp)
+    add_library(llhttp::llhttp ALIAS http::llhttp)
+endif()
+check_required_components(http)

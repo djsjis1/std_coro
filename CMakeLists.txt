@@ -1,5 +1,5 @@
 # ============================================================================
-# coro — C++20 协程事件循环框架 (header-only)
+# coro — C++20 协程核心与可选 I/O、TLS、HTTP 组件
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 project(coro VERSION 0.1.0 LANGUAGES CXX)
@@ -22,24 +22,29 @@ option(CORO_ENABLE_NATIVE_IO "启用 Windows/Linux 原生 I/O 后端与基础 I/
 option(CORO_ENABLE_URING "Linux 上启用 io_uring I/O 后端" ON)
 option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止静默回退" OFF)
 option(CORO_ENABLE_WEB "构建 Web 服务框架 (coro::web 与 web_server)" OFF)
-option(CORO_ENABLE_TLS "构建 coro::tls (依赖仓库内 OpenSSL 源码)" OFF)
+option(CORO_ENABLE_HTTP "构建独立 HTTP 解析与报文组件 (coro::http_protocol)" OFF)
+option(CORO_ENABLE_HTTP_CLIENT "构建协程 HTTP/HTTPS 客户端 (coro::http_client)" OFF)
+option(CORO_ENABLE_HTTP_SERVER "构建独立 HTTP/HTTPS 服务器 (coro::http_server)" OFF)
+option(CORO_ENABLE_TLS "启用 TLS API (依赖仓库内 OpenSSL 源码)" OFF)
 option(CORO_REQUIRE_TLS "配置时要求 thirdparty/openssl 源码可用, 禁止静默降级" OFF)
 # 并发工具扩展 (Timer/Context/Channel/select/...): 只依赖纯核心, 零第三方
 option(CORO_ENABLE_CONCURRENCY_EXT "启用新增并发工具头与对应测试" OFF)
-if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING))
-    message(FATAL_ERROR "CORO_REQUIRE_URING requires Linux and CORO_ENABLE_URING=ON")
+if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING OR NOT CORO_ENABLE_NATIVE_IO))
+    message(FATAL_ERROR "CORO_REQUIRE_URING requires Linux, CORO_ENABLE_NATIVE_IO=ON and CORO_ENABLE_URING=ON")
 endif()
 
 # 单配置生成器 (Ninja/Makefile) 默认 Release; 多配置 (VS) 由 --config 决定
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
 # ============================================================================
-# 库 target 分层 (header-only INTERFACE):
+# 库 target 分层:
 #   coro::core — 纯协程核心, 不携带任何第三方头与 I/O 链接依赖
-#   coro::coro — 兼容入口, 在 core 之上追加原生 I/O 后端依赖
-# 依赖方向单向 (coro -> coro_core), 核心不得反向感知 net/fs/tls/http。
+#   coro::io   — core + 原生 I/O 后端
+#   coro::tls  — io + 私有 OpenSSL 实现 (可选静态库)
+#   coro::coro — 兼容入口, 聚合 io 与已启用的 tls
+# 核心不得反向感知 net/fs/tls/http。HTTP 协议与 router 独立于协程核心。
 # ============================================================================
 add_library(coro_core INTERFACE)
 add_library(coro::core ALIAS coro_core)
@@ -52,21 +57,26 @@ target_include_directories(coro_core INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(coro_core INTERFACE cxx_std_20)
 
-# Scheduler 线程设施属于核心, 与是否启用原生 I/O 无关
-if(UNIX)
-    target_link_libraries(coro_core INTERFACE pthread)
-endif()
+# 让 CMake 按工具链选择线程编译/链接选项, 避免硬编码 pthread。
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+target_link_libraries(coro_core INTERFACE Threads::Threads)
 
+add_library(coro_io INTERFACE)
+add_library(coro::io ALIAS coro_io)
+set_target_properties(coro_io PROPERTIES EXPORT_NAME io)
+target_link_libraries(coro_io INTERFACE coro_core)
+
+# 兼容入口聚合已启用组件; 组件自身只能依赖更低层, 不能反向依赖此入口。
 add_library(coro INTERFACE)
 add_library(coro::coro ALIAS coro)
-target_link_libraries(coro INTERFACE coro_core)
+target_link_libraries(coro INTERFACE coro_io)
 
 if(MSVC)
     target_compile_options(coro_core INTERFACE /utf-8 /EHsc)
 endif()
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
-    target_compile_options(coro_core INTERFACE -fcoroutines)
-endif()
+target_compile_options(coro_core INTERFACE
+    "$<$<AND:$<COMPILE_LANG_AND_ID:CXX,GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,14>>:-fcoroutines>")
 
 # GCC 13 的 SLP 优化可能让协程帧函数指针引用已被丢弃的 COMDAT section。
 # 保留其余优化；通过生成器表达式让安装包按消费者的编译器版本应用规避。
@@ -76,10 +86,10 @@ if(CORO_GCC13_COROUTINE_WORKAROUND)
         "$<$<AND:$<COMPILE_LANG_AND_ID:CXX,GNU>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,13>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,14>>:-fno-tree-slp-vectorize>")
 endif()
 
-# 平台链接库: ws2_32 仅网络模块需要, 挂在兼容入口 coro 上
+# 平台链接库: ws2_32 仅网络模块需要, 挂在 io 组件上
 set(CORO_HAS_URING OFF)
 if(WIN32)
-    target_link_libraries(coro INTERFACE ws2_32)
+    target_link_libraries(coro_io INTERFACE ws2_32)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_URING)
     # io_uring 后端统一使用仓库内源码 (thirdparty/liburing), 不查找系统预装库:
@@ -89,7 +99,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_
         # 导致安装导出引用到未安装的 liburing.a。
         add_subdirectory(thirdparty/liburing)
         set(CORO_HAS_URING ON)
-        target_link_libraries(coro INTERFACE uring)
+        target_link_libraries(coro_io INTERFACE uring)
         message(STATUS "io_uring backend: in-tree liburing 2.9 source (thirdparty/liburing)")
     else()
         set(CORO_HAS_URING OFF)
@@ -108,22 +118,32 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 # io_uring 能力单一事实源: 仅 Linux + 仓库内源码可用时为真, 由头文件据此派生
 # CORO_HAS_{NET,FS,PIPE,FSWATCH,PROCESS} 等模块宏。
-target_compile_definitions(coro INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
+target_compile_definitions(coro_io INTERFACE CORO_HAS_URING=$<BOOL:${CORO_HAS_URING}>)
 # 并发扩展能力同样单点派生: 关闭时相关实现与测试整体不参与编译 (不是只屏蔽几个调用点)
-target_compile_definitions(coro INTERFACE CORO_HAS_CONCURRENCY_EXT=$<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}>)
+target_compile_definitions(coro_core INTERFACE CORO_HAS_CONCURRENCY_EXT=$<BOOL:${CORO_ENABLE_CONCURRENCY_EXT}>)
 
 # TLS: 与 io_uring 同一套语义 —— 只用仓库内 OpenSSL 源码, 配置期绝不联网、不查系统
 # 预装开发库; 缺源码时 REQUIRE_TLS=ON 直接失败, 否则警告并降级 (CORO_HAS_TLS=0)。
 # 关闭开关时下面整段不参与: 不 add_subdirectory、不探测 Perl/NASM、不注册测试与示例。
 set(CORO_HAS_TLS OFF)
+if(CORO_REQUIRE_TLS AND NOT CORO_ENABLE_TLS)
+    message(FATAL_ERROR "CORO_REQUIRE_TLS requires CORO_ENABLE_TLS=ON")
+endif()
 if(CORO_ENABLE_TLS)
-    if(NOT CORO_HAS_URING AND NOT WIN32)
+    if(NOT CORO_ENABLE_NATIVE_IO OR (NOT CORO_HAS_URING AND NOT WIN32))
         # TLS 需要真正的 socket 后端 (Linux 走 io_uring, Windows 走 IOCP)。
         message(WARNING "CORO_ENABLE_TLS=ON 但原生网络不可用 (需要 Linux+io_uring 或 Windows); TLS 已禁用。")
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/openssl/CMakeLists.txt")
         add_subdirectory(thirdparty/openssl)
         set(CORO_HAS_TLS ON)
-        target_link_libraries(coro INTERFACE openssl_ssl openssl_crypto)
+        add_library(coro_tls STATIC src/tls.cpp)
+        add_library(coro::tls ALIAS coro_tls)
+        set_target_properties(coro_tls PROPERTIES EXPORT_NAME tls POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(coro_tls PUBLIC coro_io PRIVATE
+            $<BUILD_INTERFACE:openssl_ssl>
+            $<INSTALL_INTERFACE:coro::openssl_ssl>)
+        target_compile_definitions(coro_tls PUBLIC CORO_HAS_TLS=1)
+        target_link_libraries(coro INTERFACE coro_tls)
         message(STATUS "TLS backend: in-tree OpenSSL source (thirdparty/openssl)")
     else()
         if(CORO_REQUIRE_TLS)
@@ -133,11 +153,23 @@ if(CORO_ENABLE_TLS)
         message(WARNING "thirdparty/openssl source not found: coro::tls 已禁用 (CORO_HAS_TLS=0)。")
     endif()
 endif()
+if(CORO_REQUIRE_TLS AND NOT CORO_HAS_TLS)
+    message(FATAL_ERROR "CORO_REQUIRE_TLS requires a native socket backend and vendored OpenSSL")
+endif()
 # TLS 能力单点派生: 头文件与测试只用 defined(CORO_HAS_TLS) && CORO_HAS_TLS 判定。
-target_compile_definitions(coro INTERFACE CORO_HAS_TLS=$<BOOL:${CORO_HAS_TLS}>)
+if(NOT CORO_HAS_TLS)
+    target_compile_definitions(coro INTERFACE CORO_HAS_TLS=0)
+endif()
 
 # 路由库: header-only 基数树动态路由, 目标名 router::router
 add_subdirectory(router)
+
+# HTTP 只依赖 llhttp, 可在 NATIVE_IO=OFF 的构建中独立消费。
+if(CORO_ENABLE_HTTP OR CORO_ENABLE_HTTP_CLIENT OR CORO_ENABLE_HTTP_SERVER OR CORO_ENABLE_WEB OR CORO_WEB_BOOTSTRAP)
+    set(CORO_HTTP_EXPORT_WITH_CORO ON)
+    set(STD_HTTP_BUILD_EXAMPLES OFF)
+    add_subdirectory(thirdparty/http)
+endif()
 
 # MSVC: 限制单个项目内的编译并行度，避免与 MSBuild 并行叠加耗尽内存。
 if(MSVC)
@@ -172,6 +204,27 @@ if(CORO_ENABLE_NATIVE_IO)
     endif()
 endif()
 
+# Transport consumers are optional and share protocol code without depending on Web.
+if(CORO_ENABLE_HTTP_CLIENT OR CORO_ENABLE_HTTP_SERVER)
+    if(NOT CORO_HAS_NET)
+        message(FATAL_ERROR "HTTP client/server require native network I/O")
+    endif()
+    foreach(_http_component IN ITEMS CLIENT SERVER)
+        if(CORO_ENABLE_HTTP_${_http_component})
+            string(TOLOWER "${_http_component}" _http_name)
+            add_library(coro_http_${_http_name} STATIC src/http_${_http_name}.cpp)
+            add_library(coro::http_${_http_name} ALIAS coro_http_${_http_name})
+            set_target_properties(coro_http_${_http_name} PROPERTIES
+                EXPORT_NAME http_${_http_name} POSITION_INDEPENDENT_CODE ON)
+            target_link_libraries(coro_http_${_http_name} PUBLIC coro::io PRIVATE coro::http_protocol)
+            target_compile_definitions(coro_http_${_http_name} PUBLIC CORO_HAS_HTTP_${_http_component}=1)
+            if(CORO_HAS_TLS)
+                target_link_libraries(coro_http_${_http_name} PRIVATE coro::tls)
+            endif()
+        endif()
+    endforeach()
+endif()
+
 # Web 按 CORO_ENABLE_WEB 显式启用 (不再由示例/测试隐式拉起); 依赖原生网络与文件 IO。
 # 属性跨独立入口的目录作用域可读 (Web 独立构建时经 CORO_WEB_BOOTSTRAP 引入)。
 set_property(TARGET coro PROPERTY CORO_WEB_IO_AVAILABLE FALSE)
@@ -190,6 +243,11 @@ endif()
 # 示例
 # ============================================================================
 if(CORO_BUILD_EXAMPLES)
+if(CORO_HAS_TLS)
+    add_executable(example_tls examples/tls_demo.cpp)
+    target_link_libraries(example_tls PRIVATE coro::tls)
+endif()
+
 add_executable(example_basic examples/basic.cpp)
 target_link_libraries(example_basic PRIVATE coro::coro)
 
@@ -265,11 +323,12 @@ if(CORO_HAS_NET)
     target_link_libraries(coro_practice PRIVATE coro::coro coro::tcp_udp)
 endif()
 
-# 高并发压力测试 (独立程序, 不计入常规 ctest)
+endif() # CORO_BUILD_EXAMPLES
+
+# 高并发压力测试可独立开启, 不依赖 CORO_BUILD_EXAMPLES。
 if(CORO_BUILD_BENCHMARKS OR CORO_BUILD_EXAMPLES)
     add_executable(coro_stress tests/stress.cpp)
     target_link_libraries(coro_stress PRIVATE coro::coro)
-endif()
 endif()
 
 # ============================================================================
@@ -284,6 +343,9 @@ if(CORO_ENABLE_WEB AND NOT CORO_WEB_BOOTSTRAP)
 endif()
 if(CORO_HAS_NET)
     add_subdirectory(tcp_udp)
+endif()
+if(TARGET coro_http_server)
+    target_link_libraries(coro_http_server PRIVATE coro::tcp_udp)
 endif()
 
 # ============================================================================
@@ -368,7 +430,16 @@ endif()
 # ============================================================================
 # 安装与 find_package(coro CONFIG REQUIRED)
 # ============================================================================
-install(TARGETS coro coro_core EXPORT coroTargets)
+install(TARGETS coro coro_core coro_io router EXPORT coroTargets)
+install(FILES router/radix_router.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/coro/router)
+if(TARGET coro_tls)
+    install(TARGETS coro_tls EXPORT coroTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+foreach(_http_name IN ITEMS client server)
+    if(TARGET coro_http_${_http_name})
+        install(TARGETS coro_http_${_http_name} EXPORT coroTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
+endforeach()
 install(DIRECTORY include/coro DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # tcp_udp 是正式组件: 导出 target 并安装头文件, 保持与源码树相同的 <tcp_udp/...> 写法
 if(TARGET coro_tcp_udp)
@@ -385,7 +456,8 @@ install(EXPORT coroTargets
 configure_package_config_file(
     cmake/coroConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/coroConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/coro)
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/coro
+    PATH_VARS CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR)
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/coroConfigVersion.cmake
     VERSION ${PROJECT_VERSION}

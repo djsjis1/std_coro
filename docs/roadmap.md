@@ -7,7 +7,7 @@
 >
 > 每完成一项把 `- [ ]` 勾成 `- [x]`；实施中发现锚点漂移（行号变化等）随手修正本文档。
 >
-> 制定日期：2026-09-18 ｜ 最近核对：2026-09-21 ｜ 状态：**阶段 0 部分完成，需重新核对**
+> 制定日期：2026-09-18 ｜ 最近源码核对：2026-09-30 ｜ 状态：**TLS 收口代码已调整，验证待维护者执行**
 >
 > 说明：本手册是演进计划，不是自动生成的能力清单。当前代码已经包含 UDP、
 > Linux process 条件编译和多项 Web/生命周期修复；因此下面的历史复选框和行号
@@ -17,6 +17,30 @@
 ---
 
 ## 0. 如何使用本手册（贡献者工作流）
+
+### 当前实施顺序（2026-09-30）
+
+此处 M4/M5 沿用新增模块的编号，不等同于下文历史路线图的「阶段 4」。
+历史方案、复选框与行号留作设计背景，以本节和 quality-status 的当前状态为准。
+
+| 阶段 | 当前代码 | 下一步 |
+|---|---|---|
+| M4 | stream、dns、unix、pool 已实现 | 更新这四组模块的 lint/覆盖率基线 |
+| M5 TLS | 内置 OpenSSL；TlsContext/TlsStream；安装路径与严格开关修复；tls_demo 已写 | 按验证计划跑迁移安装包消费，然后增加 Linux TLS CI |
+| Windows | 非 TLS CI 失败原因待取 annotation；OpenSSL 包装层仍 FATAL | 先修 CI 实际失败，再独立实现 nmake/JOM 和多配置/CRT 编排 |
+| HTTP 协议层 | 已独立为 coro::http_protocol，支持构建/安装；仅依赖 llhttp | 纯协议配置与安装包消费待验证；Web 数据类型仍在 Web/ |
+| HttpClient | 尚未实现 | 协议层独立后先支持 http://，TLS 通过验证后再加 https:// |
+| servers | HTTPS 与按连接属性分池尚未完成 | 按 scheme/host/port/TLS 配置隔离；开始 shutdown 后无论结果都必须 discard |
+| AsyncGenerator | 暂缓 | 先补 await_ready 方向和“终态且有值不 resume 已结束帧”两条回归 |
+| macOS/kqueue | 尚不支持原生 I/O | 独立后端与目标平台 CI 之后再宣称支持 |
+
+TLS 关闭仍为默认。现已提供独立 `coro::io`、`coro::tls` 目标，`coro::coro` 保留兼容聚合接口；OpenSSL 实现编译在 `src/tls.cpp`，不进入公共头。
+HTTP/2、QUIC、c-ares 继续在本轮范围外，重新决策前不启动。
+
+本轮未执行测试；详见 [维护者验证计划](tls-validation-plan.md)。性能优化仍需前后
+基准支撑，本轮改动属于构建可用性与生命周期正确性修复，不宣称吞吐提升。
+
+### 贡献流程
 
 ```
 ① 读 §1 总原则 + §3 通用方法论（改库前必须理解的部分）
@@ -863,7 +887,7 @@ process 用例通过，Windows 侧无任何行为变化。
 
 | 项 | 前置决策 | 工作量 | 依赖 |
 |---|---|---|---|
-| TLS（TlsStream 装饰 TcpStream） | 依赖选型：OpenSSL vs mbedTLS vs 编译开关 `CORO_WITH_TLS`（OFF 时零依赖不变，倾向后者） | 大 | TCP 稳定即可，无硬依赖 |
+| TLS（TlsStream 装饰 TcpStream） | 已选仓库内 OpenSSL，`CORO_ENABLE_TLS` 默认 OFF；API 与示例已有，安装修复待验证 | 收口中 | Linux TLS CI 与安装迁移验证，Windows 编排另行实现 |
 | IPv6（`sockaddr_storage` + `getaddrinfo` 遍历） | API 兼容策略（默认 `AF_UNSPEC`，现有 IPv4 行为不变）；触碰 net.hpp 全部地址代码与两类接口 | 大 | 建议在 1.2 DNS（已引入 getaddrinfo）之后 |
 | kqueue 事件源（macOS） | macOS CI runner（`ci.yml:141` 预留位）；模仿 CVEventSource + kevent | 中 | 无 |
 | HTTP/2 | 生态收益/工作量比低，暂缓 | 极大 | 阶段 2.2 流式完成后再议 |

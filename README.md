@@ -11,6 +11,12 @@
 >   ⚡ 性能: [docs/performance.md](docs/performance.md) ·
 >   🛠 FAQ: [docs/faq.md](docs/faq.md)
 
+TLS 收口代码与生命周期修复的验证步骤见 [维护者验证计划](docs/tls-validation-plan.md)。
+Linux 开启 `CORO_ENABLE_TLS=ON` 后可单独链接 `coro::tls` 使用 TLS API；
+开启 `CORO_BUILD_EXAMPLES` 可构建 [本地 TLS 示例](examples/tls_demo.cpp)。
+TLS 实现编译为独立静态库，OpenSSL 头文件不进入公共头；Windows TLS 构建尚未支持。
+本轮改动未运行构建或测试，待维护者验证。
+
 类似 Python **asyncio** 的 C++20 协程库，核心部分 header-only；平台 IO 使用系统库，
 Linux 的 io_uring 为可选依赖。核心能力：
 
@@ -73,6 +79,26 @@ target_link_libraries(my_app PRIVATE coro::coro)
 
 安装与平台验证边界见 [质量基线与发布说明](docs/quality-status.md)。
 
+需要控制依赖时，按组件选择目标；`coro::coro` 保留为兼容聚合入口：
+
+| 目标 | 用途与依赖 |
+|---|---|
+| `coro::core` | Task、调度、同步与定时器，标准线程设施 |
+| `coro::io` | 原生网络与文件 I/O，依赖 core，不链接 OpenSSL |
+| `coro::tls` | TLS 会话，依赖 io 与私有 OpenSSL 实现；只在 TLS 开启时提供 |
+| `coro::http_protocol` | HTTP 解析和报文构建，只依赖 llhttp；开启 `CORO_ENABLE_HTTP` 或 Web 后提供 |
+| `coro::tcp_udp` | TCP/UDP 服务封装，依赖 io |
+| `coro::router` | 独立路由算法，无协程或网络依赖 |
+
+例如 `find_package(coro CONFIG REQUIRED COMPONENTS io)` 后链接 `coro::io`。
+只使用 TLS 的应用链接 `coro::tls`，不需要手动配置 OpenSSL 头路径。
+
+只需要 HTTP 协议时可设置 `CORO_ENABLE_HTTP=ON`、`CORO_ENABLE_NATIVE_IO=OFF`，
+安装后使用 `find_package(coro CONFIG REQUIRED COMPONENTS http_protocol)` 并链接
+`coro::http_protocol`。公共头为 `<http_parse.h>`、`<http_protocol.h>`；该组件不依赖
+协程调度器、socket、TLS 或 Web 服务。`thirdparty/http` 也保留独立构建与
+`find_package(http CONFIG REQUIRED)` / `http::http` 用法。
+
 ## 头文件与模块边界
 
 `coro.hpp` **只聚合核心层**（Task/EventLoop/gather/Future/sync/Queue/wait/TaskGroup/to_thread/Scheduler 等，零平台依赖），**不含** IO 层与并发扩展——按需单独 include：
@@ -86,7 +112,8 @@ target_link_libraries(my_app PRIVATE coro::coro)
 | DNS / 子进程 / 信号 / 目录监视 | `<coro/dns.hpp>` / `<coro/process.hpp>` / `<coro/signal.hpp>` / `<coro/fs_watch.hpp>` |
 | 流式读写适配（read_line/write_all…） | `<coro/stream.hpp>` |
 | channel / select / Timer / Context(取消) / rate_limiter / Pool | `<coro/channel.hpp>` / `<coro/select.hpp>` / `<coro/timer.hpp>` / `<coro/context.hpp>` / `<coro/rate_limit.hpp>` / `<coro/pool.hpp>` |
-| 高级服务框架 | `<coro/tcp_udp/tcp_server.hpp>`、`<coro/tcp_udp/udp_server.hpp>` |
+| 高级服务框架 | `<tcp_udp/tcp_server.hpp>`、`<tcp_udp/udp_server.hpp>` |
+| TLS 会话 | `<coro/tls.hpp>`（链接 `coro::tls`） |
 
 能力宏（由 CMake 目标定义注入，header-only 消费者无需关心）：
 
@@ -200,12 +227,14 @@ auto [name, count] = co_await coro::gather(
 ```cpp
 // 场景：包装一个老式的回调 API
 coro::Task<std::string> download_async(const std::string& url) {
-    coro::Promise<std::string> promise;
-    auto future = promise.get_future();
+    // 必须用 shared_ptr: 回调可能在协程帧销毁后才触发,
+    // 捕获局部引用 (&promise) 会导致 use-after-free。
+    auto promise = std::make_shared<coro::Promise<std::string>>();
+    auto future = promise->get_future();
 
-    // 在回调中完成 Promise
-    legacy_api.download(url, [&promise](const std::string& data) {
-        promise.set_value(data);
+    // 回调按值捕获 shared_ptr, 保证 Promise 活到回调执行
+    legacy_api.download(url, [promise](const std::string& data) {
+        promise->set_value(data);
     });
 
     co_return co_await future;  // 挂起直到回调触发
@@ -215,7 +244,7 @@ coro::Task<std::string> download_async(const std::string& url) {
 如果值已经提前设置好，`await_ready()` 返回 `true`，不会挂起：
 
 ```cpp
-promise.set_value("立即就绪!");
+promise->set_value("立即就绪!");
 auto result = co_await future;  // 不会挂起，立即返回
 ```
 
@@ -401,7 +430,8 @@ while (有就绪协程 或 定时器 或 活跃协程 或 挂起 I/O) {
 
 ```
 coro/
-├── include/coro/          # ★ 核心头文件（header-only，24 个）
+├── include/coro/          # 核心、I/O 与可选组件公共头
+├── src/tls.cpp           # TLS 实现，隔离 OpenSSL 头文件
 ├── CMakeLists.txt         # 库目标 coro::coro + 安装导出
 ├── examples/              # 示例
 ├── tests/                 # 单元测试（googletest，当前 24 个测试源）+ 压测

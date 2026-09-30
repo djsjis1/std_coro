@@ -85,12 +85,14 @@
       "jobs": 2
     },
     {
+      "name": "tls",
+      "configurePreset": "tls",
+      "jobs": 2
+    },
+    {
       "name": "dev",
       "configurePreset": "dev",
-      "jobs": 2,
-      "targets": [
-        "all"
-      ]
+      "jobs": 2
     }
   ],
   "testPresets": [
