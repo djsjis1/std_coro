@@ -128,8 +128,11 @@ namespace coro {
         }
 
         /// 按解析结果建立连接: 把 endpoint 适配回 net.hpp 的 (ip, port) 接口, 调用方不必
-        /// 自己拆字段。ip 为空视为无效结果。
-        inline Task<TcpStream> connect(const resolved_endpoint& ep) {
+        /// 自己拆字段。ip 为空视为无效结果。按值持有: 调用方常以临时 endpoint
+        /// (如 resolve 结果下标) 转发, 惰性 Task 在首次 co_await 前不会运行,
+        /// const& 形参可能在恢复时悬空 —— 与 unix.hpp connect 同一契约。
+        // cppcheck-suppress passedByValue
+        inline Task<TcpStream> connect(resolved_endpoint ep) {
             co_return co_await TcpStream::connect(ep.address.c_str(), ep.port);
         }
 #endif // CORO_HAS_DNS

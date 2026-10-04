@@ -154,7 +154,12 @@ namespace coro {
             return requested < maximum ? requested : maximum;
         }
 
-        Task<std::optional<std::string>> read_until_owned(const std::string& delim) {
+        /// 按值持有: read_until 以临时 std::string(delim) 转发进来, 惰性 Task 在
+        /// 首次 co_await 前不会运行, 临时那时早已析构 —— const& 形参会读到悬空
+        /// 内存 (实测分隔符扫描命中脏数据)。cppcheck 的 passedByValue 建议对
+        /// 普通函数成立, 对惰性协程入口不成立。
+        // cppcheck-suppress passedByValue
+        Task<std::optional<std::string>> read_until_owned(std::string delim) {
             for (;;) {
                 if (auto hit = scan(delim)) {
                     std::string out = take_bytes(*hit);
@@ -307,7 +312,11 @@ namespace coro {
         }
 
       private:
-        Task<bool> write_owned(const std::string& data) { co_return co_await write_all(data.data(), data.size()); }
+        /// 按值持有: write_all(string_view)/write_line 以临时字符串转发进来,
+        /// 惰性 Task 在首次 co_await 前不会运行, const& 形参会读到已析构的
+        /// 临时 (实测短写路径返回 false)。契约见上方 write_all 注释。
+        // cppcheck-suppress passedByValue
+        Task<bool> write_owned(std::string data) { co_return co_await write_all(data.data(), data.size()); }
 
         Source* src_;
     };
