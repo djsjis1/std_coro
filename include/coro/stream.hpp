@@ -60,8 +60,8 @@ namespace coro {
         /// 把底层"返回字节数 / 0 / -1"的约定翻译成异常或直接判定, 集中一处免得每个
         /// 调用点各写一遍。取消在上层由 await_transform 注入, 不会走到这里。
         [[noreturn]] inline void throw_io_error(const char* what) {
-            const auto error = errno ? std::error_code(errno, std::generic_category())
-                                     : std::make_error_code(std::errc::io_error);
+            const auto error =
+                errno ? std::error_code(errno, std::generic_category()) : std::make_error_code(std::errc::io_error);
             throw std::system_error(error, what);
         }
 
@@ -307,9 +307,7 @@ namespace coro {
         }
 
       private:
-        Task<bool> write_owned(const std::string& data) {
-            co_return co_await write_all(data.data(), data.size());
-        }
+        Task<bool> write_owned(const std::string& data) { co_return co_await write_all(data.data(), data.size()); }
 
         Source* src_;
     };

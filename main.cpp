@@ -43,7 +43,8 @@ static coro::Task<int> read_exact(coro::net::TcpStream& conn, char* buf, int n) 
     int total = 0;
     while (total < n) {
         int r = co_await conn.read(buf + total, n - total);
-        if (r <= 0) co_return total;
+        if (r <= 0)
+            co_return total;
         total += r;
     }
     co_return total;
@@ -74,27 +75,33 @@ static WorkerStats worker_func(int id, unsigned short port) {
         while (true) {
             // 1. 读 4 字节长度头
             int r = co_await read_exact(conn, len_buf, 4);
-            if (r < 4) break;
+            if (r < 4)
+                break;
 
             uint32_t msg_len = ntohl(*(uint32_t*)len_buf);
-            if (msg_len == 0 || msg_len > sizeof(data_buf)) break;
+            if (msg_len == 0 || msg_len > sizeof(data_buf))
+                break;
 
             // 2. 读完整消息体
             r = co_await read_exact(conn, data_buf, msg_len);
-            if (r < (int)msg_len) break;
+            if (r < (int)msg_len)
+                break;
 
             // 3. 回显: 先发长度头, 再发数据体
             uint32_t net_len = htonl(msg_len);
             int w1 = co_await conn.write((const char*)&net_len, 4);
-            if (w1 <= 0) break;
+            if (w1 <= 0)
+                break;
 
             int written = 0;
             while (written < (int)msg_len) {
                 int nw = co_await conn.write(data_buf + written, msg_len - written);
-                if (nw <= 0) break;
+                if (nw <= 0)
+                    break;
                 written += nw;
             }
-            if (written < (int)msg_len) break;
+            if (written < (int)msg_len)
+                break;
         }
         co_return;
     });
@@ -108,7 +115,7 @@ static WorkerStats worker_func(int id, unsigned short port) {
         std::fprintf(stderr, "[worker-%d] start() failed on port %u\n", id, port);
         return {};
     }
- 
+
     std::printf("[worker-%d] ready on 0.0.0.0:%u\n", id, srv->port());
 
     auto watchdog = [id, &loop, srv]() -> coro::Task<> {
@@ -140,10 +147,13 @@ int main(int argc, char* argv[]) {
 
     unsigned short port = 9000;
     size_t num_workers = std::thread::hardware_concurrency();
-    if (num_workers == 0) num_workers = 4;
+    if (num_workers == 0)
+        num_workers = 4;
 
-    if (argc > 1) port = static_cast<unsigned short>(std::atoi(argv[1]));
-    if (argc > 2) num_workers = static_cast<size_t>(std::atoi(argv[2]));
+    if (argc > 1)
+        port = static_cast<unsigned short>(std::atoi(argv[1]));
+    if (argc > 2)
+        num_workers = static_cast<size_t>(std::atoi(argv[2]));
 
     std::printf("==========================================================\n");
     std::printf("  高并发多线程 TCP 回显服务器 (长度前缀协议)\n");

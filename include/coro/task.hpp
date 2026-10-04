@@ -360,7 +360,8 @@ namespace coro {
     // ============================================================================
     // Task<T> — 主模板（T 非 void）
     // ============================================================================
-    template <typename T> class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task {
+    template <typename T>
+    class [[nodiscard("Task is lazy: await it, run it, or explicitly start and detach it")]] Task {
       public:
         // ==================================================================
         // promise_type — 编译器要求的嵌套类型

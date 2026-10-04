@@ -37,8 +37,7 @@ namespace {
     coro::Task<> exchange(std::string certificate, std::string private_key) {
         // Context 先于 stream 构造并活到会话结束; 私钥只交给服务端。
         coro::tls::TlsContext server_context(coro::tls::TlsContext::role::server);
-        if (!server_context.use_certificate_file(certificate) ||
-            !server_context.use_private_key_file(private_key))
+        if (!server_context.use_certificate_file(certificate) || !server_context.use_private_key_file(private_key))
             throw std::runtime_error("cannot load server certificate/private key");
         coro::tls::TlsContext client_context(coro::tls::TlsContext::role::client);
         if (!client_context.load_verify_file(certificate))
