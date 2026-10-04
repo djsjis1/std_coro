@@ -266,7 +266,7 @@ namespace {
     coro::Task<> lock_holder(coro::Lock* lk, std::atomic<bool>* held, std::atomic<bool>* released) {
         auto guard = co_await lk->guard();
         held->store(true);
-        co_await coro::sleep(30ms); // 持锁期间让别人排队
+        co_await coro::sleep(300ms); // 持锁期间让别人排队 (长持: 见下方取消测试的时序说明)
         released->store(true);
         co_return; // guard 在此析构 -> release()
     }
@@ -282,17 +282,19 @@ namespace {
         coro::Lock lk;
         std::atomic<bool> held{false}, released{false}, b_got{false}, c_got{false};
 
+        // 与信号量版同一理由: Windows 计时器精度 ~15.6ms, 间隔必须留足刻度余量,
+        // 保证 cancel 落在持有者释放之前 (否则 B 已真实取得锁, 测的不是本合同)。
         auto holder = coro::spawn(lock_holder(&lk, &held, &released));
-        co_await coro::sleep(10ms); // 确保持有者已持锁
+        co_await coro::sleep(30ms); // 确保持有者已持锁
 
         auto b = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &b_got)));
-        co_await coro::sleep(5ms); // B 已挂进等待队列
+        co_await coro::sleep(30ms); // B 已挂进等待队列
         auto c = std::make_shared<coro::Task<>>(coro::spawn(lock_taker(&lk, &c_got)));
-        co_await coro::sleep(5ms); // C 也挂进队列 (排在 B 之后)
+        co_await coro::sleep(30ms); // C 也挂进队列 (排在 B 之后)
 
         auto* loop = &coro::EventLoop::get();
         loop->dispatch([b] { b->cancel(); });
-        co_await coro::sleep(60ms); // 等持有者释放并把锁交给 C
+        co_await coro::sleep(400ms); // 等持有者释放并把锁交给 C
 
         co_await std::move(holder);
         *holder_done = released.load();
