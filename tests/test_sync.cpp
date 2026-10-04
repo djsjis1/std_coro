@@ -314,17 +314,20 @@ namespace {
         coro::Semaphore sm(1);
         std::atomic<bool> a{false}, b{false}, c{false};
 
-        auto holder = coro::spawn(sem_holder(&sm, &a, 30));
-        co_await coro::sleep(10ms); // A 已占住唯一许可
+        // Windows 默认计时器精度 ~15.6ms: 所有间隔必须留出 ≥10 个刻度的余量,
+        // 否则 cancel 可能落在 A 释放之后 —— B 已真实取得许可, 测的就不是
+        // "排队中被取消" 的合同了 (曾在 Windows CI 稳定失败)。
+        auto holder = coro::spawn(sem_holder(&sm, &a, 300)); // A 长持许可
+        co_await coro::sleep(30ms);                          // A 已占住唯一许可
 
         auto vb = std::make_shared<coro::Task<>>(coro::spawn(sem_holder(&sm, &b, 1)));
-        co_await coro::sleep(5ms);
+        co_await coro::sleep(30ms); // B 已挂进等待队列
         auto vc = std::make_shared<coro::Task<>>(coro::spawn(sem_holder(&sm, &c, 1)));
-        co_await coro::sleep(5ms);
+        co_await coro::sleep(30ms); // C 也挂进队列 (排在 B 之后)
 
         auto* loop = &coro::EventLoop::get();
         loop->dispatch([vb] { vb->cancel(); });
-        co_await coro::sleep(60ms); // A 释放后许可应落到 C
+        co_await coro::sleep(400ms); // A 释放后许可应落到 C
 
         co_await std::move(holder);
         *third_got = c.load();

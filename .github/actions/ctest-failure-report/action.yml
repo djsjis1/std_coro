@@ -78,13 +78,21 @@ runs:
         # 只回传首行等于没有回传: 定位需要的是"哪次访问、哪个线程、栈顶在哪一行"。
         # 因此把 WRITE/READ of size ... by thread 与栈帧行 (#N 0x... in func file:line)
         # 一起报出, 栈帧只保留函数与源码位置、丢掉地址与偏移避免噪声。
+        # ASan 报 READ/WRITE (全大写), TSan 报 Read/Write (首字母大写) —— 两种都认,
+        # 只认全大写会让 TSan 的竞争栈帧永远提取不到 (只剩 warning 首行)。
         san_err=$(grep -oE '(ERROR: AddressSanitizer|ERROR: LeakSanitizer|WARNING: ThreadSanitizer|runtime error): [^[:cntrl:]]{0,120}' "$log" | sort -u | head -n 8)
-        san_frames=$(grep -oE '(READ|WRITE) of size [0-9]+ at 0x[0-9a-f]+ by thread T[0-9]+' "$log" | sort -u | head -n 4)
+        san_frames=$(grep -oE '(READ|WRITE|Read|Write) of size [0-9]+ at 0x[0-9a-f]+( by thread T[0-9]+|:)?' "$log" | sort -u | head -n 4)
+        san_prev=$(grep -oE 'Previous (READ|WRITE|Read|Write) of size [0-9]+ at 0x[0-9a-f]+( by (main thread|thread T[0-9]+))?' "$log" | sort -u | head -n 2)
         san_where=$(grep -oE '^ *#[0-9]+ 0x[0-9a-f]+ in [^(]{1,90}' "$log" | sed 's/^ *//' | head -n 12)
         if [ -n "$san_frames" ]; then
           while IFS= read -r f; do
             echo "::error::$LABEL sanitizer access: $f"
           done <<< "$san_frames"
+        fi
+        if [ -n "$san_prev" ]; then
+          while IFS= read -r p; do
+            echo "::error::$LABEL sanitizer previous: $p"
+          done <<< "$san_prev"
         fi
         if [ -n "$san_where" ]; then
           while IFS= read -r w; do
