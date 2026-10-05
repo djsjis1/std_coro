@@ -138,8 +138,9 @@ namespace coro {
                     return m;
                 }
 
-                /// 注册等待者 (allow() 已保证处理器安装)
+                /// 注册等待者 (同时确保 CRT 处理器已安装)
                 void add(int sig, void* awaiter, std::coroutine_handle<> h, EventLoop* loop) {
+                    install(sig); // 幂等: 确保 CRT handler + console handler 已安装
                     std::lock_guard lock(mtx_);
                     waiters_[sig].push_back({awaiter, h, loop});
                 }
