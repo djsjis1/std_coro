@@ -13,120 +13,120 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// ── 共享协程辅助 ──
+    // ── 共享协程辅助 ──
 
-// 单次等待: 挂起 → 信号到达 → 返回信号编号
-coro::Task<int> wait_one(int sig) {
-    co_return co_await coro::signal::wait(sig);
-}
-
-// ── 核心等待: 一次 raise → 等待者收到正确信号号 ──
-
-coro::Task<> wait_basic_task(int sig, int* received) {
-    auto t = coro::spawn(wait_one(sig));
-    co_await coro::sleep(30ms); // 确保等待者已注册
-    std::raise(sig);
-    *received = co_await std::move(t);
-}
-
-// ── 多等待者: 一次投递唤醒全部 ──
-
-coro::Task<int> waiter(int sig, int id, std::vector<int>* order) {
-    int s = co_await coro::signal::wait(sig);
-    order->push_back(id);
-    co_return s;
-}
-
-coro::Task<> wait_multi_task(int sig, int* woken, std::vector<int>* order) {
-    // 同 loop 单线程, 无需 mutex
-    auto a = coro::spawn(waiter(sig, 1, order));
-    auto b = coro::spawn(waiter(sig, 2, order));
-    auto c = coro::spawn(waiter(sig, 3, order));
-    co_await coro::sleep(30ms);
-    std::raise(sig);
-    co_await std::move(a);
-    co_await std::move(b);
-    co_await std::move(c);
-    *woken = (int)order->size();
-}
-
-// ── handle: 两次信号 → factory 执行两次 ──
-
-coro::Task<> handle_tick(int* counter) {
-    ++(*counter);
-    co_return;
-}
-
-coro::Task<> handle_task(int sig, int* fires) {
-    int counter = 0;
-    auto h = coro::signal::handle(sig, [&counter] { return handle_tick(&counter); });
-    co_await coro::sleep(30ms); // 确保 handle 循环协程已挂起在 wait 上
-    std::raise(sig);
-    // 轮询等待, 避免固定 sleep 在慢 CI 上 flaky
-    auto deadline = std::chrono::steady_clock::now() + 200ms;
-    while (counter < 1 && std::chrono::steady_clock::now() < deadline)
-        co_await coro::sleep(5ms);
-    std::raise(sig);
-    while (counter < 2 && std::chrono::steady_clock::now() < deadline)
-        co_await coro::sleep(5ms);
-    *fires = counter;
-    (void)h; // RAII: 协程退出时析构注销
-}
-
-// ── 超时取消: wait_for 超时后等待者应被干净摘除 ──
-
-coro::Task<> wait_cancel_timeout_task(int sig, bool* timed_out) {
-    auto t = coro::spawn(wait_one(sig));
-    co_await coro::sleep(30ms);
-    try {
-        co_await coro::wait_for(std::move(t), 50ms);
-        *timed_out = false;
-    } catch (const coro::TimeoutError&) {
-        *timed_out = true;
+    // 单次等待: 挂起 → 信号到达 → 返回信号编号
+    coro::Task<int> wait_one(int sig) {
+        co_return co_await coro::signal::wait(sig);
     }
-}
 
-// ── 自定义信号: allow → wait → notify ──
+    // ── 核心等待: 一次 raise → 等待者收到正确信号号 ──
 
-coro::Task<> custom_notify_task(int sig, int* received) {
-    auto t = coro::spawn(wait_one(sig));
-    co_await coro::sleep(30ms);
-    coro::signal::notify(sig);
-    *received = co_await std::move(t);
-}
+    coro::Task<> wait_basic_task(int sig, int* received) {
+        auto t = coro::spawn(wait_one(sig));
+        co_await coro::sleep(30ms); // 确保等待者已注册
+        std::raise(sig);
+        *received = co_await std::move(t);
+    }
+
+    // ── 多等待者: 一次投递唤醒全部 ──
+
+    coro::Task<int> waiter(int sig, int id, std::vector<int>* order) {
+        int s = co_await coro::signal::wait(sig);
+        order->push_back(id);
+        co_return s;
+    }
+
+    coro::Task<> wait_multi_task(int sig, int* woken, std::vector<int>* order) {
+        // 同 loop 单线程, 无需 mutex
+        auto a = coro::spawn(waiter(sig, 1, order));
+        auto b = coro::spawn(waiter(sig, 2, order));
+        auto c = coro::spawn(waiter(sig, 3, order));
+        co_await coro::sleep(30ms);
+        std::raise(sig);
+        co_await std::move(a);
+        co_await std::move(b);
+        co_await std::move(c);
+        *woken = (int)order->size();
+    }
+
+    // ── handle: 两次信号 → factory 执行两次 ──
+
+    coro::Task<> handle_tick(int* counter) {
+        ++(*counter);
+        co_return;
+    }
+
+    coro::Task<> handle_task(int sig, int* fires) {
+        int counter = 0;
+        auto h = coro::signal::handle(sig, [&counter] { return handle_tick(&counter); });
+        co_await coro::sleep(30ms); // 确保 handle 循环协程已挂起在 wait 上
+        std::raise(sig);
+        // 轮询等待, 避免固定 sleep 在慢 CI 上 flaky
+        auto deadline = std::chrono::steady_clock::now() + 200ms;
+        while (counter < 1 && std::chrono::steady_clock::now() < deadline)
+            co_await coro::sleep(5ms);
+        std::raise(sig);
+        while (counter < 2 && std::chrono::steady_clock::now() < deadline)
+            co_await coro::sleep(5ms);
+        *fires = counter;
+        (void)h; // RAII: 协程退出时析构注销
+    }
+
+    // ── 超时取消: wait_for 超时后等待者应被干净摘除 ──
+
+    coro::Task<> wait_cancel_timeout_task(int sig, bool* timed_out) {
+        auto t = coro::spawn(wait_one(sig));
+        co_await coro::sleep(30ms);
+        try {
+            co_await coro::wait_for(std::move(t), 50ms);
+            *timed_out = false;
+        } catch (const coro::TimeoutError&) {
+            *timed_out = true;
+        }
+    }
+
+    // ── 自定义信号: allow → wait → notify ──
+
+    coro::Task<> custom_notify_task(int sig, int* received) {
+        auto t = coro::spawn(wait_one(sig));
+        co_await coro::sleep(30ms);
+        coro::signal::notify(sig);
+        *received = co_await std::move(t);
+    }
 
 #ifndef _WIN32
-// Linux: 自定义实时信号经 raise() 真实信号路径到达
-coro::Task<> custom_raise_task(int sig, int* received) {
-    auto t = coro::spawn(wait_one(sig));
-    co_await coro::sleep(30ms);
-    std::raise(sig);
-    *received = co_await std::move(t);
-}
+    // Linux: 自定义实时信号经 raise() 真实信号路径到达
+    coro::Task<> custom_raise_task(int sig, int* received) {
+        auto t = coro::spawn(wait_one(sig));
+        co_await coro::sleep(30ms);
+        std::raise(sig);
+        *received = co_await std::move(t);
+    }
 #endif
 
-// ── 有活跃等待者时 disallow 拒绝, 等待者仍能正常唤醒 ──
+    // ── 有活跃等待者时 disallow 拒绝, 等待者仍能正常唤醒 ──
 
-coro::Task<> disallow_with_waiter_task(int sig, bool* blocked, int* received) {
-    auto t = coro::spawn(wait_one(sig));
-    co_await coro::sleep(30ms);
-    *blocked = !coro::signal::disallow(sig); // 有等待者 → false
-    coro::signal::notify(sig);               // 信号仍有效: 等待者正常唤醒
-    *received = co_await std::move(t);
-    coro::signal::disallow(sig);             // 等待者退场后干净注销
-}
-
-// ── 未注册信号 wait 抛 invalid_argument ──
-
-coro::Task<> unallowed_wait_throws(int sig, bool* threw) {
-    try {
-        int s = co_await coro::signal::wait(sig);
-        (void)s;
-        *threw = false;
-    } catch (const std::invalid_argument&) {
-        *threw = true;
+    coro::Task<> disallow_with_waiter_task(int sig, bool* blocked, int* received) {
+        auto t = coro::spawn(wait_one(sig));
+        co_await coro::sleep(30ms);
+        *blocked = !coro::signal::disallow(sig); // 有等待者 → false
+        coro::signal::notify(sig);               // 信号仍有效: 等待者正常唤醒
+        *received = co_await std::move(t);
+        coro::signal::disallow(sig); // 等待者退场后干净注销
     }
-}
+
+    // ── 未注册信号 wait 抛 invalid_argument ──
+
+    coro::Task<> unallowed_wait_throws(int sig, bool* threw) {
+        try {
+            int s = co_await coro::signal::wait(sig);
+            (void)s;
+            *threw = false;
+        } catch (const std::invalid_argument&) {
+            *threw = true;
+        }
+    }
 
 } // namespace
 
@@ -237,8 +237,8 @@ TEST(SignalTest, DisallowWithActiveWaiterFails) {
     bool blocked = false;
     int received = 0;
     test_util::run_task([&] { return disallow_with_waiter_task(41, &blocked, &received); });
-    EXPECT_TRUE(blocked);         // disallow 被拒绝
-    EXPECT_EQ(received, 41);      // 等待者正常唤醒, 未被注销打断
+    EXPECT_TRUE(blocked);    // disallow 被拒绝
+    EXPECT_EQ(received, 41); // 等待者正常唤醒, 未被注销打断
 }
 
 #endif // _WIN32 || __linux__
