@@ -1160,7 +1160,12 @@ namespace coro::io {                        // [仅 Linux]
 
 ```cpp
 namespace coro::signal {
-    /*awaiter*/ wait(int sig);              // → int 信号编号; 不支持 → std::invalid_argument
+    bool allow(int sig);                   // 注册自定义信号 (进程级, 幂等);
+                                           // 不可注册编号 → false
+    bool disallow(int sig);                // 注销并恢复 SIG_DFL; 有等待者 → false
+    void notify(int sig);                  // 库内投递, 效果等同信号到达 (跨平台)
+
+    /*awaiter*/ wait(int sig);              // → int 信号编号; 未注册 → std::invalid_argument
                                             // 多协程可同时等同一信号
 
     class handler {                         // RAII 注册对象; 可移动不可拷贝
@@ -1174,11 +1179,18 @@ namespace coro::signal {
 }
 ```
 
-- 支持集合：`SIGINT` / `SIGTERM` / `SIGBREAK` / `SIGHUP`（Windows 自定义
-  SIGHUP=3 映射"关窗"事件）；其余信号抛 `std::invalid_argument`；
+- 默认白名单（无需 allow）：Linux `{SIGINT, SIGTERM, SIGHUP}`，
+  Windows `{SIGINT, SIGTERM, SIGBREAK, SIGHUP}`（自定义 SIGHUP=3 映射
+  "关窗"事件）；
+- 自定义信号先 `allow(sig)` 再 `wait`/`handle`：
+  - Linux 接受 1..31（SIGKILL/SIGSTOP 除外）与 `SIGRTMIN..SIGRTMAX`，
+    注册后 `raise()`/`kill()` 均可到达；32/33 是 glibc 线程库保留号被拒绝；
+  - Windows 接受任意 1..63 编号；CRT 不认识的编号（如 42）只能经
+    `notify()` 投递（`raise()` 不可达）；
+- `disallow` 存在等待者时拒绝；注销后 Linux 恢复 `SIG_DFL`；
 - Windows 无真信号：控制台事件（Ctrl+C / Ctrl+Break / 关窗）与 CRT
   `raise()` 双路桥接；SIGHUP 无法经 `raise()` 触发；
-- Linux 用 `sigaction + self-pipe + reader 线程`；信号处理器只做
+- Linux 用 `sigaction + eventfd + reader 线程`；信号处理器只做
   async-signal-safe 的 `write`，再由 reader 把通知路由到各等待者的 loop；
 - `handle` 的 factory 在**注册时的 loop** 上执行，串行不重入
   （上一个协程完成前新信号排队）。
