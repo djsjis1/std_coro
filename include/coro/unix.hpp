@@ -143,12 +143,8 @@ namespace coro {
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<read_awaiter*>(ptr);
-                    if (auto* u = detail::current_uring()) {
-                        if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {

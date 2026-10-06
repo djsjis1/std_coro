@@ -10,7 +10,9 @@
 #include <cerrno>
 #endif
 
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <utility>
 
 // ============================================================================
@@ -26,6 +28,9 @@
 //                          精确区分 WSAECONNRESET(10054) 与 ECONNRESET(105) 等
 //   - last_error 是 thread_local: 与 errno 同样的每线程语义, 在 co_await
 //     返回后立即读取有效 (不要跨 await 点保存)
+//   - io_uring 的取消为尽力而为: SQ 满时无法立即提交 ASYNC_CANCEL，会以
+//     EAGAIN 记录最近错误并仅输出一次诊断；原操作仍保持有效，最终完成时
+//     正常恢复协程，绝不因丢弃取消请求而提前释放协程帧。
 //
 // 历史问题: 旧版 net.hpp 直接 `errno = op.error` 赋 WSA 错误码, 而 WSA 码
 // (10035/10054...) 与 CRT errno 值是完全不同的两套编码, strerror 得到乱码,
@@ -204,4 +209,31 @@ namespace coro {
         }
 
     } // namespace io
+
+#ifdef CORO_URING_ENABLED
+    namespace detail {
+        /// 提交 io_uring ASYNC_CANCEL。取消路径必须立即 submit：与普通 I/O
+        /// 的批量提交不同，Task 析构正在等待原操作的完成包/CQE，延迟取消会
+        /// 无谓地拉长协程帧与用户缓冲的保活时间。
+        ///
+        /// SQ 满时不能伪造“已取消”：原操作仍在内核中，必须等它自然完成。
+        /// 这里记录 EAGAIN 并进程级只诊断一次，既让调用者可观测也避免满载
+        /// 时每个取消请求刷屏。
+        inline void submit_uring_cancel(net::UringEventSource* u, uring_op* op) noexcept {
+            io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
+            if (!sqe) {
+                io::set_error(EAGAIN);
+                static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+                if (!reported.test_and_set(std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[coro] io_uring cancellation queue is full; waiting for original operation\n");
+                return;
+            }
+            io_uring_prep_cancel(sqe, op, 0);
+            const int ret = io_uring_submit(u->handle());
+            if (ret < 0)
+                io::set_error(-ret);
+        }
+    } // namespace detail
+#endif
 } // namespace coro

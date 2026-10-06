@@ -193,7 +193,7 @@ namespace coro {
         // 操作, 默认编译关闭; 需要调试/监控时定义 CORO_TASK_REGISTRY。
         void on_coroutine_started(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            live_frames_.emplace(h.address(), ++next_generation_);
+            live_frames_.try_emplace(h.address(), ++next_generation_);
             ++active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             all_tasks_.insert(h.address());
@@ -202,7 +202,11 @@ namespace coro {
         void on_coroutine_finished(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
             live_frames_.erase(h.address());
-            scheduled_set_.erase(h.address());
+            // local_live_frames_ 仅 owner loop 线程访问。Task 的析构/完成
+            // 合同本就要求在 owner loop 上发生，跨线程析构仍走原有延迟销毁
+            // 协议，不能在这里触碰 owner 的无锁缓存。
+            if (detail::t_current_loop == this)
+                local_live_frames_.erase(h.address());
             --active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             all_tasks_.erase(h.address());
@@ -214,8 +218,8 @@ namespace coro {
         /// 返回 true 表示已注册废弃 (帧保持存活), false 表示不在队列中 (调用方可安全销毁)。
         bool mark_abandoned(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            auto it = scheduled_set_.find(h.address());
-            if (it == scheduled_set_.end())
+            auto it = live_frames_.find(h.address());
+            if (it == live_frames_.end() || !it->second.scheduled.load(std::memory_order_acquire))
                 return false; // 不在就绪队列: 调用方可安全销毁帧
             abandoned_handles_.insert(h.address());
             return true; // 已注册废弃: 调用方不要销毁帧
@@ -304,6 +308,17 @@ namespace coro {
         struct ReadyEntry {
             std::coroutine_handle<> handle;
             uint64_t generation;
+            bool local = false; // owner loop fast path: 可免锁消费 FrameState
+        };
+
+        /// 已启动协程的共享存活元数据。generation 防止句柄地址复用；scheduled
+        /// 是跨线程与 owner fast path 共享的原子去重位，取代全局 scheduled_set_。
+        /// unordered_map 的 node 地址在 rehash 时稳定，owner loop 可安全缓存
+        /// FrameState*；删除只在 owner loop 的完成路径发生。
+        struct FrameState {
+            explicit FrameState(uint64_t gen) : generation(gen) {}
+            uint64_t generation;
+            std::atomic<bool> scheduled{false};
         };
 
         struct TimerEntry {
@@ -345,22 +360,18 @@ namespace coro {
 
         // ---- 成员变量 ----
 
-        HandleQueue ready_queue_;                   // 就绪协程 FIFO
+        HandleQueue ready_queue_;                   // 跨线程入站协程 FIFO (queue_mutex_ 保护)
+        HandleQueue ready_local_;                   // owner loop 同线程 fast path (无锁)
         HandleQueue batch_;                         // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<ReadyEntry> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_;            // 保护 ready_queue_/scheduled_set_/all_tasks_ (跨线程)
+        mutable std::mutex queue_mutex_;            // 保护 ready_queue_/live_frames_/all_tasks_ (跨线程)
 
-        // 已在就绪队列中的句柄集合 (schedule 幂等去重)。
-        // 为什么需要: 同一句柄可能被多个来源同时调度, 例如
-        //   1) 任务完成 → final_suspend 调度等待它的协程 W
-        //   2) 同一时刻 W 被 cancel → suspended_ 仍为 true → cancel 也调度 W
-        // 若双入队, W 第一次 resume 后帧销毁, 第二次 pop 到它时 done() 是 UB。
-        // schedule 时查重, 出队 (批量 swap) 时移除。
-        std::unordered_set<const void*> scheduled_set_;
-
-        // 始终启用的帧存活表，与可选调试注册表分离。出队前检查代次，
-        // 不对已释放帧调用 done()；地址复用也不能让旧条目恢复新帧。
-        std::unordered_map<const void*, uint64_t> live_frames_;
+        // 始终启用的帧存活表，与可选调试注册表分离。FrameState::scheduled
+        // 同时承担幂等入队，消除 scheduled_set_ 的一次额外哈希查找。
+        std::unordered_map<const void*, FrameState> live_frames_;
+        // owner loop 的 FrameState* 缓存：首次同线程调度时从 live_frames_
+        // 获取，后续 schedule/resume 无锁；仅 owner thread 可访问。
+        std::unordered_map<const void*, FrameState*> local_live_frames_;
         uint64_t next_generation_ = 0;
 
         // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
@@ -448,9 +459,9 @@ namespace coro {
                 // 调度入口只接受已启动的存活帧；自定义协程也须配对调用
                 // on_coroutine_started/on_coroutine_finished，且在 owner loop 销毁。
                 auto live = live_frames_.find(h.address());
-                if (live == live_frames_.end() || !scheduled_set_.insert(h.address()).second)
+                if (live == live_frames_.end() || live->second.scheduled.exchange(true, std::memory_order_acq_rel))
                     return;
-                ready_queue_.push({h, live->second});
+                ready_queue_.push({h, live->second.generation});
             }
             // 同线程调度 (run() 内部) 不唤醒: 循环会自然处理就绪队列。
             // 等价 Python: loop.call_soon() 不唤醒, call_soon_threadsafe() 才写 self-pipe
@@ -465,7 +476,7 @@ namespace coro {
             std::lock_guard lock(queue_mutex_);
             auto live = live_frames_.find(h.address());
             if (live != live_frames_.end())
-                timer_heap_.push({deadline, {h, live->second}, std::move(token)});
+                timer_heap_.push({deadline, {h, live->second.generation, false}, std::move(token)});
         }
     }
 
@@ -503,8 +514,8 @@ namespace coro {
                 std::lock_guard lock(queue_mutex_);
                 for (auto entry : timer_expired_buf_) {
                     auto live = live_frames_.find(entry.handle.address());
-                    if (live != live_frames_.end() && live->second == entry.generation &&
-                        scheduled_set_.insert(entry.handle.address()).second)
+                    if (live != live_frames_.end() && live->second.generation == entry.generation &&
+                        !live->second.scheduled.exchange(true, std::memory_order_acq_rel))
                         ready_queue_.push(entry);
                 }
             }
@@ -647,9 +658,9 @@ namespace coro {
                         // 的正确性机制 (见上方注释), 不能作为纯优化合并。
                         std::lock_guard lock(queue_mutex_);
                         auto live = live_frames_.find(h.address());
-                        if (live == live_frames_.end() || live->second != entry.generation)
+                        if (live == live_frames_.end() || live->second.generation != entry.generation)
                             continue;
-                        scheduled_set_.erase(h.address());
+                        live->second.scheduled.store(false, std::memory_order_release);
                     }
                     if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)
                         if (is_abandoned(h)) {

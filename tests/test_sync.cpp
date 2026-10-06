@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <thread>
 
 #include <vector>
 
@@ -351,4 +352,136 @@ TEST(SyncTest, CancelledQueuedSemaphoreWaiterDoesNotLeakPermits) {
     bool third_got = false;
     test_util::run_task([&] { return cancelled_queued_semaphore_waiter(&third_got); });
     EXPECT_TRUE(third_got) << "取消的等待者吞掉了许可, 信号量漏干";
+}
+
+// ============================================================================
+// Condition 取消窗口的互斥保持
+//
+// 回归 (旧实现的两个叠加缺陷):
+//   1. wait() 是子协程, 取消展开直接销毁子协程帧 (帧内析构不运行),
+//      "重新拿锁"的代码永不执行, 等待队列残留僵尸句柄;
+//   2. 调用方 Guard 析构的二次 release 会把通知方持有的锁转移给队首
+//      等待者 —— 通知方与新持有者并发进入临界区, 互斥失效。
+// 修复后 (wait 改为直接 awaiter + Guard 持有者校验): 取消窗口内锁被
+// 通知方持有时, 取消路径不碰锁, 探针必须等通知方正常释放后才进入。
+// ============================================================================
+
+namespace {
+
+    coro::Task<> cond_cancel_target(coro::Condition* cond, bool* caught) {
+        try {
+            auto g = co_await cond->lock()->guard();
+            while (true)
+                co_await cond->wait(); // 挂起 (锁已交还), 将被取消
+        } catch (const coro::CancelledError&) {
+            *caught = true; // 取消应正常传播 (锁语义不损坏)
+        }
+    }
+
+    coro::Task<> cond_cancel_notifier(coro::Lock* lock, coro::Condition* cond, std::atomic<int>* in_critical,
+                                      int* violations) {
+        auto g = co_await lock->guard();
+        if (in_critical->fetch_add(1) != 0)
+            ++*violations;          // 临界区重叠 = 互斥失效
+        co_await coro::sleep(50ms); // 持锁窗口: 期间取消等待者
+        in_critical->fetch_sub(1);
+        cond->notify();
+    } // g 析构 → 正常释放
+
+    coro::Task<> cond_cancel_probe(coro::Lock* lock, std::atomic<int>* in_critical, int* violations) {
+        auto g = co_await lock->guard();
+        if (in_critical->fetch_add(1) != 0)
+            ++*violations;
+        co_await coro::yield();
+        in_critical->fetch_sub(1);
+    }
+
+    coro::Task<> cond_cancel_scenario(int* violations, bool* caught, bool* lock_intact) {
+        coro::Lock lock;
+        coro::Condition cond(&lock);
+        std::atomic<int> in_critical{0};
+
+        auto target = coro::spawn(cond_cancel_target(&cond, caught));
+        co_await coro::yield(); // target 拿锁并挂到 cond 上 (锁已交还)
+
+        auto notifier = coro::spawn(cond_cancel_notifier(&lock, &cond, &in_critical, violations));
+        auto probe = coro::spawn(cond_cancel_probe(&lock, &in_critical, violations));
+        co_await coro::sleep(10ms); // notifier 已持锁进入临界区, probe 已在锁队列排队
+
+        target.cancel(); // 取消窗口: 锁被通知方持有
+
+        co_await std::move(notifier);
+        co_await std::move(probe);
+        co_await std::move(target);
+
+        // 取消风暴过后锁语义完好
+        {
+            auto g = co_await lock.guard();
+            *lock_intact = true;
+        }
+    }
+
+} // namespace
+
+TEST(SyncTest, ConditionCancelDoesNotStealLockFromHolder) {
+    int violations = 0;
+    bool caught = false, lock_intact = false;
+    test_util::run_task([&] { return cond_cancel_scenario(&violations, &caught, &lock_intact); });
+    EXPECT_EQ(violations, 0) << "取消 cond.wait 的展开路径偷走了通知方持有的锁 (互斥失效)";
+    EXPECT_TRUE(caught) << "取消应正常传播为 CancelledError";
+    EXPECT_TRUE(lock_intact) << "取消后锁应能正常获取";
+}
+
+// ============================================================================
+// 跨线程唤醒路由 (回归: set/release 必须把等待者路由回其家 loop)
+//
+// 旧实现用 EventLoop::get().schedule(h) 唤醒 —— 解析到调用者线程的 loop:
+// 从无事件循环的工作线程 set() 会把句柄投到新建的 (未运行的) loop,
+// 等待者永久挂死。修复后等待者挂起时记录家 loop, 唤醒路由回去
+// (与 future.hpp 的 Waiter{handle, loop} 模式对齐)。
+// ============================================================================
+
+namespace {
+
+    coro::Task<> cross_thread_event_waiter(coro::Event* ev, std::atomic<bool>* woken) {
+        co_await ev->wait();
+        woken->store(true);
+    }
+
+    coro::Task<> cross_thread_sem_waiter(coro::Semaphore* sem, std::atomic<int>* acquired) {
+        co_await sem->acquire(); // 初始 0 许可 → 挂起
+        ++*acquired;
+        sem->release();
+    }
+
+    coro::Task<> cross_thread_scenario(bool* event_woken, bool* sem_passed) {
+        coro::Event ev;
+        coro::Semaphore sem(0);
+        std::atomic<bool> woken{false};
+        std::atomic<int> acquired{0};
+
+        auto w = coro::spawn(cross_thread_event_waiter(&ev, &woken));
+        auto s = coro::spawn(cross_thread_sem_waiter(&sem, &acquired));
+        co_await coro::yield(); // 两个等待者均已挂起
+
+        // 从无事件循环的裸线程唤醒: 必须路由回等待者的家 loop
+        std::thread t([&] {
+            ev.set();
+            sem.release();
+        });
+        t.join();
+
+        co_await std::move(w);
+        co_await std::move(s);
+        *event_woken = woken.load();
+        *sem_passed = acquired.load() == 1;
+    }
+
+} // namespace
+
+TEST(SyncTest, CrossThreadWakeRoutesToHomeLoop) {
+    bool event_woken = false, sem_passed = false;
+    test_util::run_task([&] { return cross_thread_scenario(&event_woken, &sem_passed); });
+    EXPECT_TRUE(event_woken) << "跨线程 Event::set 没有把等待者唤醒回它的家 loop";
+    EXPECT_TRUE(sem_passed) << "跨线程 Semaphore::release 没有把等待者唤醒回它的家 loop";
 }

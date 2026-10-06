@@ -16,8 +16,19 @@
 #include <vector>
 
 // ============================================================================
-// coro::wait — wait_for / wait_any / gather_all / gather_void
+// coro::wait — wait_for / wait_tasks（主入口）+ 兼容组合器
 // ============================================================================
+//
+// 组合原语选择:
+//   - 静态异构任务（编译期数量）           → gather（gather.hpp）
+//   - 动态同构任务 / First*/AllCompleted  → wait_tasks
+//   - 结构化并发、失败即取消同组任务      → TaskGroup（task_group.hpp）
+//   - channel 收发分支竞速                → select（select.hpp）
+//
+// wait_any / gather_all / gather_void 保留为源兼容入口，但已弃用：
+//   wait_any(...)       → wait_tasks(..., WaitMode::FirstCompleted)
+//   gather_all(tasks)   → wait_tasks(..., WaitMode::AllCompleted)
+//   gather_void(...)    → gather(...)（忽略返回 tuple）
 
 namespace coro {
 
@@ -188,7 +199,9 @@ namespace coro {
     // ============================================================================
     // wait_any — FIRST_COMPLETED (两路竞速)
     // ============================================================================
-    template <typename T> Task<T> wait_any(Task<T> t1, Task<T> t2) {
+    template <typename T>
+    [[deprecated("use wait_tasks(..., coro::WaitMode::FirstCompleted) for dynamic task sets")]] Task<T>
+    wait_any(Task<T> t1, Task<T> t2) {
         auto state = std::make_shared<detail::wait_any_state<T>>();
         // 取消守卫: 调用方帧被取消销毁时, 置 cont_dead 防止 monitor schedule 悬空句柄
         struct _cancel_guard {
@@ -240,7 +253,8 @@ namespace coro {
         }
     } // namespace detail
 
-    template <typename T> Task<T> wait_any(std::vector<Task<T>> tasks) {
+    template <typename T>
+    [[deprecated("use wait_tasks(..., coro::WaitMode::FirstCompleted)")]] Task<T> wait_any(std::vector<Task<T>> tasks) {
         if (tasks.empty())
             throw std::invalid_argument("wait_any: empty task list");
         if (tasks.size() == 1)
@@ -341,7 +355,9 @@ namespace coro {
     // ============================================================================
     // gather_all — 动态数量 gather
     // ============================================================================
-    template <typename T> Task<std::vector<T>> gather_all(std::vector<Task<T>> tasks) {
+    template <typename T>
+    [[deprecated("use wait_tasks(..., coro::WaitMode::AllCompleted)")]] Task<std::vector<T>>
+    gather_all(std::vector<Task<T>> tasks) {
         if (tasks.empty())
             co_return std::vector<T>{};
 
@@ -473,7 +489,8 @@ namespace coro {
         }
     } // namespace detail
 
-    template <typename... Ts> Task<void> gather_void(Task<Ts>... tasks) {
+    template <typename... Ts>
+    [[deprecated("use gather(...) and ignore its tuple result")]] Task<void> gather_void(Task<Ts>... tasks) {
         return detail::gather_void_impl(std::make_tuple(std::move(tasks)...));
     }
 

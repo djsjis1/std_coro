@@ -693,6 +693,19 @@ handler 完成。负的关闭宽限期与不在 1–65535 范围内的 UDP 接�
 
 ## 并发组合 gather.hpp / wait.hpp
 
+### 选择决策
+
+| 场景 | 首选 API | 关键合同 |
+|---|---|---|
+| 编译期固定、可混合结果类型 | `gather` | 全部完成；结果按参数顺序返回 tuple |
+| 运行期动态、同一结果类型 | `wait_tasks` | 通过 `WaitMode` 选择 FirstCompleted / FirstException / AllCompleted |
+| 失败即取消其余子任务 | `TaskGroup` | 结构化收尾；失败抛 `ExceptionGroup` |
+| 多个 channel 收发操作竞速 | `select` | channel 专用；落选分支不消费数据 |
+
+`wait_any`、`gather_all`、`gather_void` 是保留的源兼容入口，均标记为 deprecated；
+新代码应分别使用 `wait_tasks(..., FirstCompleted)`、`wait_tasks(..., AllCompleted)`、
+`gather(...)`（忽略 tuple）。
+
 ### gather — 静态 N 路（编译期数量）
 
 ```cpp
@@ -710,22 +723,23 @@ namespace coro {
 - 不支持 `Task<void>` 放 tuple 取值场景？——void 可以放进参数列表，
   只是该位置无返回值；需要"取值"就用非 void 任务。
 
-### gather_all / gather_void — 动态 N 路 / void 路
+### 兼容组合器：gather_all / gather_void（deprecated）
 
 ```cpp
 namespace coro {
     template <typename T>
-    Task<std::vector<T>> gather_all(std::vector<Task<T>> tasks);   // 接管所有权
+    [[deprecated]] Task<std::vector<T>> gather_all(std::vector<Task<T>> tasks);
 
     template <typename... Ts>
-    Task<void> gather_void(Task<Ts>... tasks);    // 混合 void 任务, 编译期数量
+    [[deprecated]] Task<void> gather_void(Task<Ts>... tasks);
 }
 ```
 
-- 语义同 gather：并发启动；结果按原顺序；异常 = 等全部完成后
-  重抛第一个。
-- 动态数量的 void 任务用
-  `wait_tasks(std::move(v), WaitMode::AllCompleted)`。
+- `gather_all` 迁移到
+  `wait_tasks(std::move(tasks), WaitMode::AllCompleted)`；两者都是动态同构任务、
+  全部完成后按原顺序返回结果，异常在全部结束后传播。
+- `gather_void` 迁移到 `gather(task1, task2, ...)` 并忽略它的 tuple；`gather`
+  已支持 `Task<void>`（对应位置不提供值）。
 
 ### wait_for — 超时
 
@@ -740,16 +754,18 @@ namespace coro {
 - 超时 → 任务被自动 `cancel()`，等待者收到 `TimeoutError`；
   提前完成 → 定时器撤销，零残留。
 
-### wait_any — 两路竞速
+### wait_any — 兼容两路竞速（deprecated）
 
 ```cpp
 namespace coro {
     template <typename T>
-    Task<T> wait_any(Task<T> a, Task<T> b);       // FIRST_COMPLETED
+    [[deprecated]] Task<T> wait_any(Task<T> a, Task<T> b);
 }
 ```
 
-先完成者（成败均可）胜出；落选者**继续后台运行**不被取消。
+迁移到 `wait_tasks(std::move(tasks), WaitMode::FirstCompleted)`。先完成者
+（成败均可）胜出；落选者**继续后台运行**不被取消——需要失败自动取消时改用
+`TaskGroup`。
 
 ### wait_tasks — N 路等待（对标 asyncio.wait）
 

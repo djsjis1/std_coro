@@ -155,6 +155,18 @@ target_link_libraries(my_app PRIVATE coro::coro)
 | `asyncio.create_subprocess_exec` | `co_await coro::process::spawn({...}, opts)` |
 | 每线程一个 loop | `EventLoop::get().run()`（每线程独立 loop,多核并行） |
 
+### 并发组合器选择
+
+| 需求 | 首选 API | 关键语义 |
+|---|---|---|
+| 编译期固定、可混合返回类型的任务 | `gather(a(), b(), ...)` | 全部完成；返回按参数顺序组成的 tuple；首个异常在全部结束后抛出 |
+| 运行期动态、同一返回类型的一组任务 | `wait_tasks(std::move(tasks), WaitMode::...)` | `FirstCompleted` / `FirstException` / `AllCompleted` 三种策略 |
+| 失败时自动取消同组任务的结构化并发 | `TaskGroup` + `co_await group.wait()` | 失败聚合为 `ExceptionGroup`，其余任务被取消 |
+| 多个 `channel` 收发分支竞速 | `select(...)` | 仅 channel 专用；落选分支不消费数据 |
+
+`wait_any`、`gather_all`、`gather_void` 是兼容入口，已标记为 deprecated；分别迁移到
+`wait_tasks(..., FirstCompleted)`、`wait_tasks(..., AllCompleted)`、`gather(...)`（忽略 tuple）。
+
 ---
 
 ## 功能详解
@@ -252,7 +264,7 @@ promise->set_value("立即就绪!");
 auto result = co_await future;  // 不会挂起，立即返回
 ```
 
-### 5. `wait_for` / `wait_tasks` — 超时与竞速
+### 5. `wait_for` / `wait_tasks` — 超时与动态任务集
 
 ```cpp
 // 超时: 超时后任务被自动取消, 抛 TimeoutError
@@ -497,7 +509,7 @@ cmake --build build --config Release --target coro_stress
 | **跨线程 set_value** | `Promise::set_value()` 可从任意线程调用 (自动路由唤醒到等待者所在的 loop) |
 | **Task 生命周期** | 析构未完成的 `Task` 会安全放弃/销毁该任务；若希望任务继续运行，必须保存 `spawn` 返回值，或明确调用 `detach()` |
 | **取消语义** | `Task::cancel()` 对标 Python：协程在下一个 await 点收到 `CancelledError`（可 catch 做清理），循环任务也能终止。请在事件循环线程调用；挂起在 I/O 上的任务会先取消底层 I/O（CancelIoEx / ASYNC_CANCEL），由完成包唤醒 |
-| **嵌套 run()** | 不支持（检测到嵌套调用会直接返回） |
+| **嵌套 run()** | 不支持（检测到嵌套调用会抛出 `std::runtime_error`，错误信息说明原因；异常后事件循环状态复位，可再次运行） |
 | **协作式调度** | 无栈协作式: 协程体内不要写不含 co_await 的死循环, 否则阻塞整个事件循环 (与 Python asyncio 相同, Go 无此限制) |
 | **lambda 协程** | 支持；捕获存放在闭包对象中，闭包必须活到协程结束，或改用无捕获 lambda + 参数 |
 

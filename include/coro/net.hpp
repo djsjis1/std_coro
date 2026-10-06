@@ -866,12 +866,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                        // sqe 获取失败 (ring 满): 原 op 最终仍会产生 CQE, 等它自然完成
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 
@@ -927,11 +922,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 
@@ -994,11 +985,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<connect_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 
@@ -1154,11 +1141,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<accept_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 
@@ -1287,11 +1270,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<recvfrom_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 
@@ -1360,11 +1339,7 @@ namespace coro {
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<sendto_awaiter*>(self);
                     if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
+                        detail::submit_uring_cancel(u, &aw->op);
                     }
                 }
 

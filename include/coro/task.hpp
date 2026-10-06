@@ -1,6 +1,7 @@
 #pragma once
 
 #include "event_loop.hpp"
+#include "exceptions.hpp" // CancelledError / TimeoutError (库异常唯一事实源)
 
 #include <cassert>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <exception>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -85,28 +87,8 @@
 
 namespace coro {
 
-    // ============================================================================
-    // CancelledError — 协程取消异常（类似 Python asyncio.CancelledError）
-    // ============================================================================
-    //
-    //   当 Task::cancel() 被调用后，被取消的协程会在下一个 await 点
-    //   收到此异常（注入协程体内，可 catch 做清理），任何 co_await 该
-    //   Task 的协程也会在 await_resume 时收到此异常。
-    //
-    //   用法:
-    //     try { co_await task; }
-    //     catch (const CancelledError&) { /* 清理工作 */ }
-    // ============================================================================
-    struct CancelledError : std::runtime_error {
-        CancelledError() : std::runtime_error("coroutine cancelled") {}
-    };
-
-    // ============================================================================
-    // TimeoutError — 超时异常（wait_for 超时时抛出）
-    // ============================================================================
-    struct TimeoutError : std::runtime_error {
-        TimeoutError() : std::runtime_error("operation timed out") {}
-    };
+    // CancelledError / TimeoutError 定义于 exceptions.hpp (库异常唯一事实源,
+    // 公共根 coro::Error) —— 本文件经 #include 引入, 此处不再重复定义。
 
     // 前向声明 (默认 T = void, 这样 Task<> 等价于 Task<void>)
     template <typename T = void> class Task;
@@ -550,7 +532,8 @@ namespace coro {
         /// handle_ 非空即帧存活 (见析构注释), 无需额外标志判断。
         Task(Task&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
             : handle_(std::exchange(other.handle_, nullptr)), result_(std::move(other.result_)),
-              exception_(std::move(other.exception_)), ready_(other.ready_), started_(other.started_) {
+              exception_(std::move(other.exception_)), ready_(other.ready_), started_(other.started_),
+              result_consumed_(other.result_consumed_) {
             if (handle_) {
                 handle_.promise().task_ = this; // 重定位指针
             }
@@ -584,6 +567,7 @@ namespace coro {
                 exception_ = std::move(other.exception_);
                 ready_ = other.ready_;
                 started_ = other.started_;
+                result_consumed_ = other.result_consumed_;
                 if (handle_)
                     handle_.promise().task_ = this;
             }
@@ -615,7 +599,15 @@ namespace coro {
         }
 
         void await_suspend(std::coroutine_handle<> continuation) {
-            assert(handle_ && "Task has no coroutine (already completed?)");
+            // 误用防护: moved-from / 已销毁的 Task 被再次 co_await 时,
+            // 旧实现在 NDEBUG 下会解引用空句柄 (UB), 这里显式报错。
+            if (!handle_)
+                throw std::runtime_error("coro::Task: co_await on moved-from or destroyed Task");
+            // 误用防护: 同一未完成的 Task 被第二个协程 co_await 会覆盖
+            // continuation_, 让第一个等待者永久挂起。等待者销毁时
+            // on_waiter_destroyed 会清空 continuation_, 之后允许新的等待者。
+            if (handle_.promise().continuation_)
+                throw std::logic_error("coro::Task: already being awaited by another coroutine");
             // 设置 continuation: 当前协程完成时恢复谁。
             // 同时捕获等待者的 loop: 此刻正运行在等待者线程上。
             handle_.promise().continuation_ = continuation;
@@ -642,8 +634,12 @@ namespace coro {
             if (exception_) {
                 std::rethrow_exception(exception_);
             }
-            // 返回结果 (result_ 在 final_suspend 时已被设置)
-            assert(result_.has_value());
+            // 结果只能消费一次: 二次 co_await 已完成的 Task 会拿到被移空的值
+            // (move-only 类型得到空指针等静默错误), 必须显式报错;
+            // moved-from Task 的 result_ 为空, 同样在这里拦截。
+            if (result_consumed_ || !result_.has_value())
+                throw std::logic_error("coro::Task: result not available (already consumed or moved-from Task)");
+            result_consumed_ = true;
             return std::move(*result_);
         }
 
@@ -728,7 +724,9 @@ namespace coro {
         T take_result() {
             if (exception_)
                 std::rethrow_exception(exception_);
-            assert(result_.has_value());
+            if (result_consumed_ || !result_.has_value())
+                throw std::logic_error("coro::Task: result not available (already consumed or moved-from Task)");
+            result_consumed_ = true;
             return std::move(*result_);
         }
 
@@ -749,6 +747,7 @@ namespace coro {
         std::exception_ptr exception_;               // 协程异常 (如果有)
         bool ready_ = false;                         // 是否已完成
         bool started_ = false;                       // 是否已启动
+        bool result_consumed_ = false;               // 结果已被 await_resume/take_result 移走
     };
 
     // ============================================================================
@@ -884,7 +883,11 @@ namespace coro {
         // ---- Awaitable ----
         bool await_ready() const noexcept { return ready_; }
         void await_suspend(std::coroutine_handle<> continuation) {
-            assert(handle_);
+            // 误用防护同 Task<T>: moved-from 空句柄 / 重复等待均显式报错
+            if (!handle_)
+                throw std::runtime_error("coro::Task: co_await on moved-from or destroyed Task");
+            if (handle_.promise().continuation_)
+                throw std::logic_error("coro::Task: already being awaited by another coroutine");
             handle_.promise().continuation_ = continuation;
             handle_.promise().continuation_loop_ = &EventLoop::get(); // 等待者的 loop
             if (!started_) {

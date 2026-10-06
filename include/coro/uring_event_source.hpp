@@ -63,7 +63,10 @@ namespace coro {
 
 // 环深度的单一可覆盖点: 消费者可用 -DCORO_URING_RING_DEPTH=n 或编译定义覆盖
 #ifndef CORO_URING_RING_DEPTH
-#define CORO_URING_RING_DEPTH 256
+// 默认 1024: 256 在几百个并发连接（读/写/accept/cancel 共用 SQ）时会
+// 以 ENOBUFS 形式直接失败；提升到 1024 仅增加数百 KB 共享环内存，换取
+// 零配置场景的高并发稳定性。消费者仍可用编译定义按需覆盖。
+#define CORO_URING_RING_DEPTH 1024
 #endif
 
     namespace net {
@@ -72,8 +75,8 @@ namespace coro {
 
         class UringEventSource : public EventSource {
           public:
-            /// 环深度: 同时挂起的异步操作上限。默认 256 够用且内存友好; 高并发场景
-            /// (上万连接) 可用编译定义 CORO_URING_RING_DEPTH 覆盖, 或构造时传参。
+            /// 环深度: 同时挂起的异步操作上限。默认 1024 兼顾常见服务器并发与内存占用; 超高并发场景
+            /// (上万连接) 仍可用编译定义 CORO_URING_RING_DEPTH 覆盖, 或构造时传参。
             /// 深度不足时 io_uring_get_sqe 拿不到槽位, 表现为提交失败而不是静默降速。
             explicit UringEventSource(unsigned entries = CORO_URING_RING_DEPTH) {
                 int ret = io_uring_queue_init(entries, &ring_, 0);

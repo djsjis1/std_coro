@@ -575,7 +575,7 @@ coro::call_at(deadline, callback);   // 指定时间点
 | **spawn 返回值要保存** | 丢弃返回值会终止任务，不会形成后台任务 |
 | **fire-and-forget** | `start()` 后 `detach()`，协程帧自持有运行到完成（见网络示例）；异常会打印警告。需后续 `cancel()` 则自己持有 Task（成员/`shared_ptr`），不要 detach |
 | **单线程模型** | 不要在多线程同时 resume 同一协程 |
-| **嵌套 run() 不支持** | 运行中再次 `run()` 直接返回 |
+| **嵌套 run() 不支持** | 运行中再次 `run()` 抛出 `std::runtime_error`（状态复位后可再次运行） |
 | **lambda 协程** | 支持；捕获属于闭包，闭包必须活到任务结束；逃逸任务优先用按值参数 |
 
 其余经典坑：

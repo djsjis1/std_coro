@@ -260,6 +260,19 @@ target_link_libraries(example_future PRIVATE coro::coro)
 add_executable(example_full_test examples/full_test.cpp)
 target_link_libraries(example_full_test PRIVATE coro::coro)
 
+# 核心并发示例: 只依赖 coro::core, core-only 构建同样可用
+add_executable(example_task_group examples/task_group.cpp)
+target_link_libraries(example_task_group PRIVATE coro::coro)
+
+add_executable(example_to_thread examples/to_thread.cpp)
+target_link_libraries(example_to_thread PRIVATE coro::coro)
+
+add_executable(example_wait_timeout examples/wait_timeout.cpp)
+target_link_libraries(example_wait_timeout PRIVATE coro::coro)
+
+add_executable(example_scheduler examples/scheduler.cpp)
+target_link_libraries(example_scheduler PRIVATE coro::coro)
+
 if(CORO_HAS_NET)
     add_executable(example_echo examples/echo_server.cpp)
     target_link_libraries(example_echo PRIVATE coro::coro)

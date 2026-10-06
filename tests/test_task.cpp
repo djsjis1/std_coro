@@ -171,3 +171,80 @@ TEST(TaskTest, RunPropagatesException) {
     }
     EXPECT_TRUE(caught);
 }
+
+// ============================================================================
+// Task 误用防护 (回归: 重复 co_await / move 后 co_await / 双等待者)
+//
+// 旧实现这些路径是静默 UB: 二次 co_await 已完成任务返回被移空的值
+// (move-only 类型得到空指针), move 后 co_await 在 NDEBUG 下解引用空句柄,
+// 第二个等待者覆盖 continuation 让第一个永久挂起。现在全部显式抛异常。
+// ============================================================================
+
+namespace {
+
+    coro::Task<> double_await_inner(bool* threw, int* first_value) {
+        auto make = []() -> coro::Task<int> { co_return 42; };
+        auto t = make();
+        *first_value = co_await t; // 第一次: 正常拿到 42
+        try {
+            int second = co_await t; // 二次 co_await 已完成的 Task
+            (void)second;
+        } catch (const std::logic_error&) {
+            *threw = true;
+        }
+    }
+
+    coro::Task<> moved_await_inner(bool* threw) {
+        auto make = []() -> coro::Task<int> { co_return 1; };
+        auto t = make();
+        auto t2 = std::move(t);
+        try {
+            int v = co_await t; // moved-from Task: 旧实现 NDEBUG 下解引用空句柄
+            (void)v;
+        } catch (const std::runtime_error&) {
+            *threw = true; // logic_error 与 runtime_error 互不继承, 不会误捕
+        }
+        co_await std::move(t2); // 正常消耗掉, 避免析构销毁未启动任务
+    }
+
+    coro::Task<int> await_by_ref(coro::Task<int>& t) {
+        co_return co_await t;
+    }
+
+    coro::Task<> second_waiter_inner(bool* threw) {
+        auto slow = []() -> coro::Task<int> {
+            co_await coro::sleep(50ms);
+            co_return 7;
+        };
+        auto t = coro::spawn(slow());          // 已启动
+        auto w = coro::spawn(await_by_ref(t)); // 第一个等待者 (持引用, 不 move)
+        co_await coro::yield();                // w 已设置 continuation 并挂起
+        try {
+            co_await t; // 第二个等待者: 不得覆盖 continuation
+        } catch (const std::logic_error&) {
+            *threw = true;
+        }
+        co_await std::move(w);
+    }
+
+} // namespace
+
+TEST(TaskTest, DoubleAwaitCompletedTaskThrows) {
+    bool threw = false;
+    int first_value = 0;
+    test_util::run_task([&] { return double_await_inner(&threw, &first_value); });
+    EXPECT_EQ(first_value, 42) << "第一次 co_await 应正常返回结果";
+    EXPECT_TRUE(threw) << "二次 co_await 已完成的 Task 必须报错, 不能返回被移空的值";
+}
+
+TEST(TaskTest, AwaitMovedFromTaskThrows) {
+    bool threw = false;
+    test_util::run_task([&] { return moved_await_inner(&threw); });
+    EXPECT_TRUE(threw) << "co_await moved-from Task 必须报错, 不能解引用空句柄";
+}
+
+TEST(TaskTest, SecondAwaiterOnRunningTaskThrows) {
+    bool threw = false;
+    test_util::run_task([&] { return second_waiter_inner(&threw); });
+    EXPECT_TRUE(threw) << "第二个等待者 co_await 未完成任务必须报错, 不能覆盖 continuation";
+}

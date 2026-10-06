@@ -38,11 +38,8 @@
 
 namespace coro {
 
-    /// 通道已被关闭 (发送侧或接收侧), 与"取消""超时"区分开
-    class ClosedChannelError : public std::runtime_error {
-      public:
-        explicit ClosedChannelError(const std::string& what) : std::runtime_error(what) {}
-    };
+    // ClosedChannelError 定义于 exceptions.hpp (库异常唯一事实源, 公共根
+    // coro::Error) —— 本文件经 #include 引入, 此处不再重复定义。
 
     namespace detail {
 
