@@ -202,11 +202,6 @@ namespace coro {
         void on_coroutine_finished(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
             live_frames_.erase(h.address());
-            // local_live_frames_ 仅 owner loop 线程访问。Task 的析构/完成
-            // 合同本就要求在 owner loop 上发生，跨线程析构仍走原有延迟销毁
-            // 协议，不能在这里触碰 owner 的无锁缓存。
-            if (detail::t_current_loop == this)
-                local_live_frames_.erase(h.address());
             --active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             all_tasks_.erase(h.address());
@@ -214,7 +209,7 @@ namespace coro {
         }
 
         /// Task 析构时调用: 尝试将句柄标记为「已废弃」。
-        /// 如果句柄在就绪队列中 (scheduled_set_ 有记录), 注册废弃, 延迟到事件循环安全销毁。
+        /// 如果句柄在就绪队列中 (FrameState::scheduled 为 true), 注册废弃, 延迟到事件循环安全销毁。
         /// 返回 true 表示已注册废弃 (帧保持存活), false 表示不在队列中 (调用方可安全销毁)。
         bool mark_abandoned(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
@@ -308,13 +303,11 @@ namespace coro {
         struct ReadyEntry {
             std::coroutine_handle<> handle;
             uint64_t generation;
-            bool local = false; // owner loop fast path: 可免锁消费 FrameState
         };
 
         /// 已启动协程的共享存活元数据。generation 防止句柄地址复用；scheduled
-        /// 是跨线程与 owner fast path 共享的原子去重位，取代全局 scheduled_set_。
-        /// unordered_map 的 node 地址在 rehash 时稳定，owner loop 可安全缓存
-        /// FrameState*；删除只在 owner loop 的完成路径发生。
+        /// 是跨线程入队去重的原子标志（同一句柄不会重复入队，防 double-resume）。
+        /// unordered_map 的 node 地址在 rehash 时稳定。
         struct FrameState {
             explicit FrameState(uint64_t gen) : generation(gen) {}
             uint64_t generation;
@@ -361,17 +354,13 @@ namespace coro {
         // ---- 成员变量 ----
 
         HandleQueue ready_queue_;                   // 跨线程入站协程 FIFO (queue_mutex_ 保护)
-        HandleQueue ready_local_;                   // owner loop 同线程 fast path (无锁)
         HandleQueue batch_;                         // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<ReadyEntry> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
         mutable std::mutex queue_mutex_;            // 保护 ready_queue_/live_frames_/all_tasks_ (跨线程)
 
         // 始终启用的帧存活表，与可选调试注册表分离。FrameState::scheduled
-        // 同时承担幂等入队，消除 scheduled_set_ 的一次额外哈希查找。
+        // 同时承担幂等入队，取代早前的全局去重 set（省一次额外哈希查找）。
         std::unordered_map<const void*, FrameState> live_frames_;
-        // owner loop 的 FrameState* 缓存：首次同线程调度时从 live_frames_
-        // 获取，后续 schedule/resume 无锁；仅 owner thread 可访问。
-        std::unordered_map<const void*, FrameState*> local_live_frames_;
         uint64_t next_generation_ = 0;
 
         // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
@@ -476,7 +465,7 @@ namespace coro {
             std::lock_guard lock(queue_mutex_);
             auto live = live_frames_.find(h.address());
             if (live != live_frames_.end())
-                timer_heap_.push({deadline, {h, live->second.generation, false}, std::move(token)});
+                timer_heap_.push({deadline, {h, live->second.generation}, std::move(token)});
         }
     }
 
@@ -499,7 +488,7 @@ namespace coro {
         // 第二步: 将到期的定时器移入就绪队列。
         // 先收集再「一次锁批量入队」—— 旧实现每个到期定时器一次锁,
         // 10 万个同时到期的场景就是 10 万次加锁。
-        // 注意: 仍经过 scheduled_set_ 去重 (与 schedule() 保持一致),
+        // 注意: 仍经过 FrameState::scheduled 去重 (与 schedule() 保持一致),
         // 否则跨线程 schedule(h) 和定时器到期可能将同一句柄双入队 → double-resume UB
         // 优化: 用成员 timer_expired_buf_ 代替局部 vector, 跨迭代复用容量 (同 batch_ 策略)
         timer_expired_buf_.clear();
@@ -644,7 +633,7 @@ namespace coro {
                     std::lock_guard lock(queue_mutex_);
                     if (batch_.empty())
                         batch_.swap(ready_queue_);
-                    // 注意: 不在此处从 scheduled_set_ 移除!
+                    // 注意: 不在此处清除 FrameState::scheduled!
                     // batch 消费期间 (resume 之前) 句柄仍算"已调度",
                     // 防止 batch 内前面的协程 cancel 后面的协程时重复入队。
                 }

@@ -54,7 +54,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          find include router examples tests Web/src Web/main.cpp main.cpp \
+          find include router examples tests Web/src Web/main.cpp playground/main.cpp \
             \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print0 | \
           xargs -0 -r clang-format-18 --dry-run --Werror
 

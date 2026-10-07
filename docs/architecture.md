@@ -189,7 +189,7 @@ mutex + condition_variable + bool 模拟 self-pipe；`has_pending` 恒 false
 | 成员 | 保护 | 用途 |
 |---|---|---|
 | `ready_queue_` | `queue_mutex_` | 就绪协程 FIFO（`HandleQueue`：vector + 头索引，见下） |
-| `scheduled_set_` | 同上 | `unordered_set<const void*>`：schedule **幂等去重**——同一句柄不会重复入队（防 double-resume UB） |
+| `live_frames_` | 同上 | `unordered_map<const void*, FrameState>`：帧存活表。`generation` 防句柄地址复用；`scheduled` 原子位承担 schedule **幂等去重**（同一句柄不会重复入队，防 double-resume UB） |
 | `timer_heap_` | 无锁（仅 loop 线程） | min-heap 定时器；每条带 `shared_ptr<atomic<bool>> token` 作"已消费/僵尸"标志 |
 | `fn_queue_` | 同 ready 锁 | `dispatch()` 投递的普通函数（跨线程） |
 | `awake_` | atomic seq_cst | 入睡协议标志（见下） |
@@ -217,7 +217,7 @@ void run_impl(bool stay)  // stay=true 即 run_until_stopped (Scheduler worker)
         // 第 1 步: 定时器
         now = process_timers();
         //   惰性清理: 堆顶 token 已置位(僵尸) → pop
-        //   到期条目跳过 handle.done(), 批量经 scheduled_set_ 去重后入就绪队列
+        //   到期条目跳过 handle.done(), 批量经 FrameState::scheduled 去重后入就绪队列
         //   (10 万定时器同到期只加一次锁)
 
         // 第 2 步: 入睡协议 (防丢唤醒)
@@ -234,10 +234,10 @@ void run_impl(bool stay)  // stay=true 即 run_until_stopped (Scheduler worker)
         // 往复保留, 稳态运行零堆分配 (MSVC deque 对 8 字节句柄每块只装
         // 2 个, vector 摊销后每几百次 push 才扩容一次)
         锁内 batch.swap(ready_queue_);            // 一次锁取出整批
-        // 刻意"不"在这一刻从 scheduled_set_ 移除!
+        // 刻意"不"在这一刻清除 FrameState::scheduled!
         // 防止 batch 内前一个协程 cancel 后一个协程时重复入队
         for h in batch:
-            锁内 scheduled_set_.erase(h);          // resume 前逐个移除
+            锁内 scheduled.store(false);             // resume 前逐个复位
             if (h && !h.done()) {
                 t_current_task = h;
                 h.resume();                        // resume 期间新 schedule 的

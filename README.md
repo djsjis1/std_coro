@@ -1,5 +1,8 @@
 # coro — C++20 协程事件循环框架
 
+[![CI](https://github.com/djsjis1/std_coro/actions/workflows/ci.yml/badge.svg)](https://github.com/djsjis1/std_coro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > 📚 **文档中心**: [docs/README.md](docs/README.md) — 全部文档的地图
 >
 > - 📖 完整指南: [docs/coro-guide.md](docs/coro-guide.md)（教程 + API 参考合并版）
@@ -11,11 +14,9 @@
 >   ⚡ 性能: [docs/performance.md](docs/performance.md) ·
 >   🛠 FAQ: [docs/faq.md](docs/faq.md)
 
-TLS 收口代码与生命周期修复的验证步骤见 [维护者验证计划](docs/tls-validation-plan.md)。
-Linux 开启 `CORO_ENABLE_TLS=ON` 后可单独链接 `coro::tls` 使用 TLS API；
+TLS 能力：Linux 开启 `CORO_ENABLE_TLS=ON` 后可单独链接 `coro::tls`；
 开启 `CORO_BUILD_EXAMPLES` 可构建 [本地 TLS 示例](examples/tls_demo.cpp)。
 TLS 实现编译为独立静态库，OpenSSL 头文件不进入公共头；Windows TLS 构建尚未支持。
-本轮改动未运行构建或测试，待维护者验证。
 
 类似 Python **asyncio** 的 C++20 协程库，核心部分 header-only；平台 IO 使用系统库，
 Linux 的 io_uring 为可选依赖。核心能力：
@@ -556,3 +557,4 @@ for (int i = 0; i < 3; ++i)
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
+

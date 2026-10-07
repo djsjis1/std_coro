@@ -243,98 +243,88 @@ endif()
 # 示例
 # ============================================================================
 if(CORO_BUILD_EXAMPLES)
-if(CORO_HAS_TLS)
-    add_executable(example_tls examples/tls_demo.cpp)
-    target_link_libraries(example_tls PRIVATE coro::tls)
-endif()
+    # 示例注册辅助: 默认链接 coro::coro, 特殊依赖用 LINK_LIBS 覆盖。
+    function(coro_add_example name source)
+        cmake_parse_arguments(ARG "" "" "LINK_LIBS" ${ARGN})
+        add_executable(${name} ${source})
+        if(ARG_LINK_LIBS)
+            target_link_libraries(${name} PRIVATE ${ARG_LINK_LIBS})
+        else()
+            target_link_libraries(${name} PRIVATE coro::coro)
+        endif()
+    endfunction()
 
-add_executable(example_basic examples/basic.cpp)
-target_link_libraries(example_basic PRIVATE coro::coro)
-
-add_executable(example_gather examples/gather.cpp)
-target_link_libraries(example_gather PRIVATE coro::coro)
-
-add_executable(example_future examples/future.cpp)
-target_link_libraries(example_future PRIVATE coro::coro)
-
-add_executable(example_full_test examples/full_test.cpp)
-target_link_libraries(example_full_test PRIVATE coro::coro)
-
-# 核心并发示例: 只依赖 coro::core, core-only 构建同样可用
-add_executable(example_task_group examples/task_group.cpp)
-target_link_libraries(example_task_group PRIVATE coro::coro)
-
-add_executable(example_to_thread examples/to_thread.cpp)
-target_link_libraries(example_to_thread PRIVATE coro::coro)
-
-add_executable(example_wait_timeout examples/wait_timeout.cpp)
-target_link_libraries(example_wait_timeout PRIVATE coro::coro)
-
-add_executable(example_scheduler examples/scheduler.cpp)
-target_link_libraries(example_scheduler PRIVATE coro::coro)
-
-if(CORO_HAS_NET)
-    add_executable(example_echo examples/echo_server.cpp)
-    target_link_libraries(example_echo PRIVATE coro::coro)
-endif()
-
-if(CORO_HAS_FS)
-    add_executable(example_file_io examples/file_io.cpp)
-    target_link_libraries(example_file_io PRIVATE coro::coro)
-endif()
-
-if(CORO_HAS_FSWATCH)
-    add_executable(example_dir_watch examples/dir_watch.cpp)
-    target_link_libraries(example_dir_watch PRIVATE coro::coro)
-endif()
-
-if(CORO_HAS_PROCESS)
-    add_executable(example_process examples/process_demo.cpp)
-    target_link_libraries(example_process PRIVATE coro::coro)
-endif()
-
-# 并发扩展示例: 受自己的开关门控, 不开关时既不编译也不拉进纯核心消费者的依赖面
-if(CORO_ENABLE_CONCURRENCY_EXT)
-    add_executable(example_timer_context examples/timer_context.cpp)
-    target_link_libraries(example_timer_context PRIVATE coro::coro)
-
-    add_executable(example_channel examples/channel_pipeline.cpp)
-    target_link_libraries(example_channel PRIVATE coro::coro)
-
-    add_executable(example_select examples/select_demo.cpp)
-    target_link_libraries(example_select PRIVATE coro::coro)
-
-    add_executable(example_rate_limit examples/rate_limit_demo.cpp)
-    target_link_libraries(example_rate_limit PRIVATE coro::coro)
-
-    add_executable(example_shield examples/shield_demo.cpp)
-    target_link_libraries(example_shield PRIVATE coro::coro)
-endif()
-
-# 流适配示例: 需要真实 socket 与 pipe, 因此与网络能力同进同出
-if(CORO_HAS_NET)
-    add_executable(example_stream examples/stream_demo.cpp)
-    target_link_libraries(example_stream PRIVATE coro::coro)
-
-    add_executable(example_dns examples/dns_demo.cpp)
-    target_link_libraries(example_dns PRIVATE coro::coro)
-endif()
-
-if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
-    add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
-    target_link_libraries(web_shutdown_check PRIVATE coro::web)
-    if(MSVC)
-        target_compile_options(web_shutdown_check PRIVATE /utf-8)
+    if(CORO_HAS_TLS)
+        coro_add_example(example_tls examples/tls_demo.cpp LINK_LIBS coro::tls)
     endif()
-endif()
 
-# 协程练习场 (main.cpp 用于练习写协程代码)
-# 练习场当前使用 tcp_udp 组件, 因此与网络能力一同注册: 否则 core-only + EXAMPLES=ON
-# 的配置会因缺少 <tcp_udp/...> 而构建失败 (该组合此前从未被验证)。
-if(CORO_HAS_NET)
-    add_executable(coro_practice main.cpp)
-    target_link_libraries(coro_practice PRIVATE coro::coro coro::tcp_udp)
-endif()
+    # 核心并发示例: 只依赖 coro::coro, core-only 构建同样可用
+    coro_add_example(example_basic examples/basic.cpp)
+
+    coro_add_example(example_gather examples/gather.cpp)
+
+    coro_add_example(example_future examples/future.cpp)
+
+    coro_add_example(example_full_test examples/full_test.cpp)
+
+    coro_add_example(example_task_group examples/task_group.cpp)
+
+    coro_add_example(example_to_thread examples/to_thread.cpp)
+
+    coro_add_example(example_wait_timeout examples/wait_timeout.cpp)
+
+    coro_add_example(example_scheduler examples/scheduler.cpp)
+
+    if(CORO_HAS_NET)
+        coro_add_example(example_echo examples/echo_server.cpp)
+    endif()
+
+    if(CORO_HAS_FS)
+        coro_add_example(example_file_io examples/file_io.cpp)
+    endif()
+
+    if(CORO_HAS_FSWATCH)
+        coro_add_example(example_dir_watch examples/dir_watch.cpp)
+    endif()
+
+    if(CORO_HAS_PROCESS)
+        coro_add_example(example_process examples/process_demo.cpp)
+    endif()
+
+    # 并发扩展示例: 受自己的开关门控, 不开关时既不编译也不拉进纯核心消费者的依赖面
+    if(CORO_ENABLE_CONCURRENCY_EXT)
+        coro_add_example(example_timer_context examples/timer_context.cpp)
+
+        coro_add_example(example_channel examples/channel_pipeline.cpp)
+
+        coro_add_example(example_select examples/select_demo.cpp)
+
+        coro_add_example(example_rate_limit examples/rate_limit_demo.cpp)
+
+        coro_add_example(example_shield examples/shield_demo.cpp)
+    endif()
+
+    # 流适配示例: 需要真实 socket 与 pipe, 因此与网络能力同进同出
+    if(CORO_HAS_NET)
+        coro_add_example(example_stream examples/stream_demo.cpp)
+
+        coro_add_example(example_dns examples/dns_demo.cpp)
+    endif()
+
+    if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
+        add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
+        target_link_libraries(web_shutdown_check PRIVATE coro::web)
+        if(MSVC)
+            target_compile_options(web_shutdown_check PRIVATE /utf-8)
+        endif()
+    endif()
+
+    # 协程练习场 (playground/ 用于练习写协程代码, 不参与安装)
+    # 练习场当前使用 tcp_udp 组件, 因此与网络能力一同注册: 否则 core-only + EXAMPLES=ON
+    # 的配置会因缺少 <tcp_udp/...> 而构建失败 (该组合此前从未被验证)。
+    if(CORO_HAS_NET)
+        coro_add_example(coro_practice playground/main.cpp LINK_LIBS coro::coro coro::tcp_udp)
+    endif()
 
 endif() # CORO_BUILD_EXAMPLES
 
