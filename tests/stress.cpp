@@ -17,7 +17,9 @@ namespace {
 
     int g_failures = 0;
 
-    std::chrono::steady_clock::time_point now() { return std::chrono::steady_clock::now(); }
+    std::chrono::steady_clock::time_point now() {
+        return std::chrono::steady_clock::now();
+    }
 
     // 场景计时 + 判定: 构造时打印 [RUN], finish() 只在无异常且计数等于期望时打印 [OK]。
     // 计时与判定分开, 避免"跑完就报成功"掩盖漏调度或未取出的异常。
@@ -95,7 +97,9 @@ namespace {
             *sum += co_await q->get();
     }
 
-    coro::Task<int> roundtrip_value(int value) { co_return value; }
+    coro::Task<int> roundtrip_value(int value) {
+        co_return value;
+    }
 
     coro::Task<> spawn_roundtrip(int n, int64_t* sum) {
         for (int i = 0; i < n; ++i) {

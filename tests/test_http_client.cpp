@@ -78,9 +78,7 @@ namespace {
             return port != 0;
         }
 
-        std::string url(std::string path = "/") const {
-            return "http://127.0.0.1:" + std::to_string(port) + path;
-        }
+        std::string url(std::string path = "/") const { return "http://127.0.0.1:" + std::to_string(port) + path; }
     };
 
     // 接受一次连接, 回一个固定响应, 然后关闭。
@@ -261,10 +259,10 @@ TEST(HttpClientTest, GetReturnsBodyAndDuplicateHeaders) {
 
     test_util::run_task([&]() -> coro::Task<> {
         auto server = coro::spawn(script_once(&p, "HTTP/1.1 200 OK\r\n"
-                                                    "Content-Type: text/plain\r\n"
-                                                    "Set-Cookie: a=1\r\n"
-                                                    "Set-Cookie: b=2\r\n"
-                                                    "Content-Length: 5\r\n\r\nhello"));
+                                                  "Content-Type: text/plain\r\n"
+                                                  "Set-Cookie: a=1\r\n"
+                                                  "Set-Cookie: b=2\r\n"
+                                                  "Content-Length: 5\r\n\r\nhello"));
         result = co_await fetch(client, p.url("/greet"));
         co_await join_peer(server);
     });
@@ -368,11 +366,11 @@ TEST(HttpClientTest, ChunkedResponseWithTrailer) {
 
     test_util::run_task([&]() -> coro::Task<> {
         auto server = coro::spawn(script_once(&p, "HTTP/1.1 200 OK\r\n"
-                                                    "Transfer-Encoding: chunked\r\n"
-                                                    "Trailer: X-Sum\r\n\r\n"
-                                                    "3\r\nabc\r\n"
-                                                    "2\r\nde\r\n"
-                                                    "0\r\nX-Sum: 7\r\n\r\n"));
+                                                  "Transfer-Encoding: chunked\r\n"
+                                                  "Trailer: X-Sum\r\n\r\n"
+                                                  "3\r\nabc\r\n"
+                                                  "2\r\nde\r\n"
+                                                  "0\r\nX-Sum: 7\r\n\r\n"));
         result = co_await fetch(client, p.url("/chunked"));
         co_await join_peer(server);
     });
@@ -393,7 +391,7 @@ TEST(HttpClientTest, InformationalResponseIsSkipped) {
 
     test_util::run_task([&]() -> coro::Task<> {
         auto server = coro::spawn(script_once(&p, "HTTP/1.1 100 Continue\r\n\r\n"
-                                                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+                                                  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
         result = co_await fetch(client, p.url("/continue"));
         co_await join_peer(server);
     });
@@ -498,7 +496,7 @@ TEST(HttpClientTest, HeaderLimitsRejectResponse) {
         co_await join_peer(server_bytes);
 
         auto server_count = coro::spawn(script_once(&crowded, "HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nC: 3\r\n"
-                                                                      "Content-Length: 2\r\n\r\nok"));
+                                                              "Content-Length: 2\r\n\r\nok"));
         count_result = co_await fetch(count_client, crowded.url("/header-count"));
         co_await join_peer(server_count);
     });

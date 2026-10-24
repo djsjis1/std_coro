@@ -237,6 +237,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCORO_REQUIRE_URING=ON \
+            -DCORO_ENABLE_TLS=ON \
             -DCORO_REQUIRE_TLS=ON \
             -DCORO_ENABLE_HTTP_CLIENT=ON \
             -DCORO_BUILD_TESTS=ON \
@@ -397,10 +398,15 @@ jobs:
           cmake -S tests/package_smoke -B build/package-smoke-missing `
             -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-moved" `
             -DCORO_SMOKE_COMPONENT=http_server
-          if ($LASTEXITCODE -eq 0) {
+          $missingCode = $LASTEXITCODE
+          if ($missingCode -eq 0) {
             "::error::find_package should have failed for an uninstalled component"
             exit 1
           }
+          Write-Output "expected configure failure for uninstalled component (exit $missingCode)"
+          # 本步骤最后一条原生命令是“预期失败”的 cmake, 而 pwsh 会拿它当步骤退出码,
+          # 必须显式以 0 结束, 否则整个步骤会被判失败。
+          exit 0
 
       - name: Verify standalone Web build
         timeout-minutes: 5
