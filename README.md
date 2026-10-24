@@ -451,14 +451,14 @@ coro/
 ├── src/tls.cpp           # TLS 实现，隔离 OpenSSL 头文件
 ├── CMakeLists.txt         # 库目标 coro::coro + 安装导出
 ├── examples/              # 示例
-├── tests/                 # 单元测试（googletest，当前 24 个测试源）+ 压测
+├── tests/                 # 单元测试 (googletest) 与压力测试源码
 ├── Web/                   # HTTP 服务器框架 (见 docs/web-framework.md)
 ├── router/                # 独立泛型基数树路由 radix_router<T>
 ├── docs/                  # 文档中心 (docs/README.md 为地图)
 │   ├── tutorial/          #   使用教程 (10 讲)
 │   └── cpp20-coroutines-course/  #   C++20 协程语言课程 (14 讲)
 ├── thirdparty/            # googletest / llhttp 等仓库内源码集成 (库本身零依赖; 仅启用对应模块时构建)
-└── main.cpp               # 协程练习场（改完直接编译运行）
+└── playground/main.cpp    # 协程练习场 (开启示例且网络可用时构建为 coro_practice)
 ```
 
 ## 作为依赖接入
@@ -481,25 +481,81 @@ target_link_libraries(your_app PRIVATE coro::coro)
 
 ## 构建
 
+需要: CMake 3.20+, 支持 C++20 的编译器 (MSVC 2022 / GCC 11+ / Clang 14+)。
+
+只把本库当依赖用时，按上面「安装为 CMake 包」或「作为依赖接入」即可：测试、示例与压测
+默认全关 (`CORO_BUILD_TESTS` / `CORO_BUILD_EXAMPLES` / `CORO_BUILD_BENCHMARKS` 均为
+`OFF`)，不会把 googletest 与示例一起配置进来。
+
+要跑示例、单元测试和压测，需要在配置时显式打开这些目标。
+
+单配置生成器 (Ninja / Makefile) 用 `CMAKE_BUILD_TYPE` 选择 Debug 或 Release：
+
 ```bash
-# 需要: CMake 3.20+, 支持 C++20 的编译器 (MSVC 2022 / GCC 11+ / Clang 14+)
-cmake -B build
-cmake --build build
+cmake -B build-dev -DCMAKE_BUILD_TYPE=Debug \
+  -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON -DCORO_BUILD_BENCHMARKS=ON
+cmake --build build-dev
+```
 
-# 运行示例
-./build/Debug/example_basic.exe
-./build/Debug/example_gather.exe
-./build/Debug/example_future.exe
-./build/Debug/example_file_io.exe    # 异步文件 IO
-./build/Debug/example_dir_watch.exe  # 目录监视
-./build/Debug/example_process.exe    # 子进程
+多配置生成器 (Visual Studio) 忽略 `CMAKE_BUILD_TYPE`，构建时用 `--config` 指定：
 
-# 单元测试
-ctest --test-dir build -C Debug --output-on-failure
+```powershell
+cmake -B build-dev -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON -DCORO_BUILD_BENCHMARKS=ON
+cmake --build build-dev --config Release
+```
 
-# 高并发压测 (10 万协程 / 400 万 yield / 100 万队列 / 多线程)
-cmake --build build --config Release --target coro_stress
-./build/Release/coro_stress.exe
+产物位置随生成器不同：多配置在 `build-dev/<Config>/`，单配置直接在 `build-dev/`。
+
+### 运行示例
+
+文件 / 目录监视 / 子进程示例按能力门控，需要原生 I/O 后端 (Windows IOCP 或 Linux io_uring)。
+
+Windows (多配置)：
+
+```powershell
+.\build-dev\Release\example_basic.exe
+.\build-dev\Release\example_gather.exe
+.\build-dev\Release\example_future.exe
+.\build-dev\Release\example_file_io.exe    # 异步文件 IO
+.\build-dev\Release\example_dir_watch.exe  # 目录监视
+.\build-dev\Release\example_process.exe    # 子进程
+```
+
+Linux (单配置)：
+
+```bash
+./build-dev/example_basic
+./build-dev/example_gather
+./build-dev/example_future
+./build-dev/example_file_io    # 异步文件 IO
+./build-dev/example_dir_watch  # 目录监视
+./build-dev/example_process    # 子进程
+```
+
+### 单元测试
+
+```bash
+# 多配置生成器 (Visual Studio) 必须带 -C
+ctest --test-dir build-dev -C Release --output-on-failure
+# 单配置生成器 (Ninja / Makefile)
+ctest --test-dir build-dev --output-on-failure
+```
+
+### 高并发压测
+
+八个场景: 10 万协程 sleep、10 万定时器、400 万 yield、100 万队列、spawn 往返、
+多线程、Scheduler 分发与均衡性。每个场景校验完成数量, 退出码 `0` = 全部通过, `1` = 有场景失败。
+
+```powershell
+# Windows (多配置)
+cmake --build build-dev --config Release --target coro_stress
+.\build-dev\Release\coro_stress.exe
+```
+
+```bash
+# Linux (单配置)
+cmake --build build-dev --target coro_stress
+./build-dev/coro_stress
 ```
 
 ## 限制 & 注意事项

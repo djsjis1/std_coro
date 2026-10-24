@@ -24,7 +24,15 @@ option(CORO_REQUIRE_URING "配置时要求 Linux io_uring 依赖可用，禁止�
 option(CORO_ENABLE_WEB "构建 Web 服务框架 (coro::web 与 web_server)" OFF)
 option(CORO_ENABLE_HTTP "构建独立 HTTP 解析与报文组件 (coro::http_protocol)" OFF)
 option(CORO_ENABLE_HTTP_CLIENT "构建协程 HTTP/HTTPS 客户端 (coro::http_client)" OFF)
-option(CORO_ENABLE_HTTP_SERVER "构建独立 HTTP/HTTPS 服务器 (coro::http_server)" OFF)
+# 预留开关: 保留名字是为了让旧的 -DCORO_ENABLE_HTTP_SERVER=ON 得到明确原因,
+# 而不是报缺源文件或静默忽略。打开时在配置期直接终止, 不引入任何第三方依赖。
+option(CORO_ENABLE_HTTP_SERVER "独立 HTTP/HTTPS 服务器 (预留, 尚未实现; HTTP/1.1 服务请改用 CORO_ENABLE_WEB)" OFF)
+if(CORO_ENABLE_HTTP_SERVER)
+    message(FATAL_ERROR
+        "CORO_ENABLE_HTTP_SERVER is reserved: coro::http_server is not implemented yet "
+        "(there is no src/http_server.cpp). Set it to OFF; for an existing HTTP/1.1 "
+        "server enable CORO_ENABLE_WEB=ON instead (the Web layer does not provide HTTPS).")
+endif()
 option(CORO_ENABLE_TLS "启用 TLS API (依赖仓库内 OpenSSL 源码)" OFF)
 option(CORO_REQUIRE_TLS "配置时要求 thirdparty/openssl 源码可用, 禁止静默降级" OFF)
 # 并发工具扩展 (Timer/Context/Channel/select/...): 只依赖纯核心, 零第三方
@@ -165,7 +173,7 @@ endif()
 add_subdirectory(router)
 
 # HTTP 只依赖 llhttp, 可在 NATIVE_IO=OFF 的构建中独立消费。
-if(CORO_ENABLE_HTTP OR CORO_ENABLE_HTTP_CLIENT OR CORO_ENABLE_HTTP_SERVER OR CORO_ENABLE_WEB OR CORO_WEB_BOOTSTRAP)
+if(CORO_ENABLE_HTTP OR CORO_ENABLE_HTTP_CLIENT OR CORO_ENABLE_WEB OR CORO_WEB_BOOTSTRAP)
     set(CORO_HTTP_EXPORT_WITH_CORO ON)
     set(STD_HTTP_BUILD_EXAMPLES OFF)
     add_subdirectory(thirdparty/http)
@@ -204,25 +212,20 @@ if(CORO_ENABLE_NATIVE_IO)
     endif()
 endif()
 
-# Transport consumers are optional and share protocol code without depending on Web.
-if(CORO_ENABLE_HTTP_CLIENT OR CORO_ENABLE_HTTP_SERVER)
+# HTTP 客户端是可选的传输消费者: 共享协议库, 但不依赖 Web。实现体在 src/http_client.cpp。
+if(CORO_ENABLE_HTTP_CLIENT)
     if(NOT CORO_HAS_NET)
-        message(FATAL_ERROR "HTTP client/server require native network I/O")
+        message(FATAL_ERROR "CORO_ENABLE_HTTP_CLIENT requires native network I/O")
     endif()
-    foreach(_http_component IN ITEMS CLIENT SERVER)
-        if(CORO_ENABLE_HTTP_${_http_component})
-            string(TOLOWER "${_http_component}" _http_name)
-            add_library(coro_http_${_http_name} STATIC src/http_${_http_name}.cpp)
-            add_library(coro::http_${_http_name} ALIAS coro_http_${_http_name})
-            set_target_properties(coro_http_${_http_name} PROPERTIES
-                EXPORT_NAME http_${_http_name} POSITION_INDEPENDENT_CODE ON)
-            target_link_libraries(coro_http_${_http_name} PUBLIC coro::io PRIVATE coro::http_protocol)
-            target_compile_definitions(coro_http_${_http_name} PUBLIC CORO_HAS_HTTP_${_http_component}=1)
-            if(CORO_HAS_TLS)
-                target_link_libraries(coro_http_${_http_name} PRIVATE coro::tls)
-            endif()
-        endif()
-    endforeach()
+    add_library(coro_http_client STATIC src/http_client.cpp)
+    add_library(coro::http_client ALIAS coro_http_client)
+    set_target_properties(coro_http_client PROPERTIES
+        EXPORT_NAME http_client POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(coro_http_client PUBLIC coro::io PRIVATE coro::http_protocol)
+    target_compile_definitions(coro_http_client PUBLIC CORO_HAS_HTTP_CLIENT=1)
+    if(CORO_HAS_TLS)
+        target_link_libraries(coro_http_client PRIVATE coro::tls)
+    endif()
 endif()
 
 # Web 按 CORO_ENABLE_WEB 显式启用 (不再由示例/测试隐式拉起); 依赖原生网络与文件 IO。
@@ -347,9 +350,6 @@ endif()
 if(CORO_HAS_NET)
     add_subdirectory(tcp_udp)
 endif()
-if(TARGET coro_http_server)
-    target_link_libraries(coro_http_server PRIVATE coro::tcp_udp)
-endif()
 
 # ============================================================================
 # 单元测试 (googletest, 集成于 thirdparty/googletest-main)
@@ -370,6 +370,10 @@ if(CORO_BUILD_TESTS)
     list(REMOVE_ITEM CORO_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_layer.cpp")
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
+    # HTTP 客户端是可选组件: 只有开启时才把实现链接进测试, 关闭时不引入任何依赖。
+    if(TARGET coro_http_client)
+        target_link_libraries(coro_tests PRIVATE coro::http_client)
+    endif()
     # 服务器生命周期测试需要 tcp_udp 组件 (无网络能力的构建里该测试文件自身会被门控)
     if(TARGET coro_tcp_udp)
         target_link_libraries(coro_tests PRIVATE coro::tcp_udp)
@@ -400,6 +404,10 @@ if(CORO_BUILD_TESTS)
     endforeach()
     add_library(coro_header_check OBJECT ${CORO_HEADER_CHECK_SOURCES})
     target_link_libraries(coro_header_check PRIVATE coro::coro)
+    # 同理: http_client.hpp 的内容由 CORO_HAS_HTTP_CLIENT 门控, 自检也要拿到同一能力宏。
+    if(TARGET coro_http_client)
+        target_link_libraries(coro_header_check PRIVATE coro::http_client)
+    endif()
     if(MSVC)
         target_compile_options(coro_header_check PRIVATE /utf-8)
     endif()
@@ -438,11 +446,9 @@ install(FILES router/radix_router.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/coro
 if(TARGET coro_tls)
     install(TARGETS coro_tls EXPORT coroTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
-foreach(_http_name IN ITEMS client server)
-    if(TARGET coro_http_${_http_name})
-        install(TARGETS coro_http_${_http_name} EXPORT coroTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    endif()
-endforeach()
+if(TARGET coro_http_client)
+    install(TARGETS coro_http_client EXPORT coroTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 install(DIRECTORY include/coro DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # tcp_udp 是正式组件: 导出 target 并安装头文件, 保持与源码树相同的 <tcp_udp/...> 写法
 if(TARGET coro_tcp_udp)

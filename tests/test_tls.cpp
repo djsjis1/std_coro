@@ -9,6 +9,7 @@
 
 #include <coro/coro.hpp>
 #include <coro/dns.hpp>
+#include <coro/http_client.hpp>
 #include <coro/net.hpp>
 #include <coro/stream.hpp>
 #include <coro/tls.hpp>
@@ -167,6 +168,69 @@ FnunJq/1n0ciUIJDSIuaerk=
 
 } // namespace
 
+#if defined(CORO_HAS_HTTP_CLIENT) && CORO_HAS_HTTP_CLIENT
+
+namespace {
+
+    // ── HTTP over TLS 的对端: 每条连接握手 → 读一个请求 → 回固定响应 ──
+    //
+    // 直接用 TlsStream 收发, 不依赖 stream_reader 的行语义: 只关心
+    // "请求头以 CRLFCRLF 结束"与"响应字节齐全"两件事。
+
+    coro::Task<bool> tls_write_all(coro::tls::TlsStream& tls, std::string data) {
+        std::size_t sent = 0;
+        while (sent < data.size()) {
+            const int n = co_await tls.write(data.data() + sent, data.size() - sent);
+            if (n <= 0)
+                co_return false;
+            sent += static_cast<std::size_t>(n);
+        }
+        co_return true;
+    }
+
+    coro::Task<std::string> tls_read_headers(coro::tls::TlsStream& tls) {
+        std::string request;
+        char buf[512];
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            const int n = co_await tls.read(buf, sizeof(buf));
+            if (n <= 0)
+                break;
+            request.append(buf, static_cast<std::size_t>(n));
+        }
+        co_return request;
+    }
+
+    // expected_accepts: 服务多少条连接。负例只服务一条 (客户端验证失败后握手不完成)。
+    coro::Task<> serve_http_over_tls(const pem_files* pem, int expected_accepts, int* accepts,
+                                     std::string* last_request) {
+        coro::net::TcpListener listener;
+        if (!listener.bind_listen("127.0.0.1", g_port))
+            co_return;
+        g_port = listener.local_port();
+        coro::tls::TlsContext ctx(coro::tls::TlsContext::role::server);
+        if (!ctx.use_certificate_file(pem->cert_path) || !ctx.use_private_key_file(pem->key_path))
+            co_return; // 证书加载失败: 由测试断言报红
+
+        for (int i = 0; i < expected_accepts; ++i) {
+            auto conn = co_await listener.accept();
+            if (!conn.valid())
+                co_return;
+            ++*accepts;
+            coro::tls::TlsStream tls(std::move(conn), ctx, "");
+            if (!co_await tls.handshake())
+                continue; // 负例: 客户端校验失败并断开
+            *last_request = co_await tls_read_headers(tls);
+            if (!co_await tls_write_all(tls, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntls-ok"))
+                continue;
+            (void)co_await tls.shutdown();
+        }
+        listener.close();
+    }
+
+} // namespace
+
+#endif // CORO_HAS_HTTP_CLIENT
+
 TEST(TlsTest, HandshakeVerifiesHostnameAndStreamsData) {
     pem_files pem;
     // clean 由服务端协程写、主线程读 -> 原子; hs_ok/pong 只在主协程链上顺序访问,
@@ -227,5 +291,89 @@ TEST(TlsTest, ReadWriteBeforeHandshakeFails) {
     EXPECT_EQ(read_rc, -1) << "未握手就 read 必须报错, 不能挂死";
     EXPECT_EQ(write_rc, -1) << "未握手就 write 必须报错, 不能挂死";
 }
+
+#if defined(CORO_HAS_HTTP_CLIENT) && CORO_HAS_HTTP_CLIENT
+
+// 真实的 HTTPS 往返: 客户端必须走 SNI + 证书主机名校验, 而不是把明文发出去。
+TEST(TlsTest, HttpClientCompletesHttpsRequestWithoutCachingConnections) {
+    pem_files pem;
+    int accepts = 0;
+    int requests_ok = 0;
+    int status = 0;
+    std::string body;
+    std::string last_request;
+    std::string error;
+
+    g_port = 0;
+    coro::run([&]() -> coro::Task<void> {
+        auto svc = coro::spawn(serve_http_over_tls(&pem, 2, &accepts, &last_request));
+        for (int i = 0; i < 50 && g_port == 0; ++i)
+            co_await coro::sleep(2ms);
+        if (g_port == 0) {
+            error = "服务端没起来";
+            co_return;
+        }
+
+        coro::HttpClient::Options options;
+        options.ca_bundle = pem.cert_path; // 自签名证书自己就是信任锚
+        options.max_idle_per_origin = 0;   // 不缓存连接: 每个请求都要重新握手
+        coro::HttpClient client(options);
+
+        const std::string url = "https://localhost:" + std::to_string(g_port) + "/tls";
+        for (int i = 0; i < 2; ++i) {
+            try {
+                auto response = co_await client.get(url);
+                status = response.status;
+                body = response.body;
+                if (response.status == 200 && response.body == "tls-ok")
+                    ++requests_ok;
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        }
+        co_await std::move(svc);
+    }());
+
+    EXPECT_EQ(error, "") << "HTTPS 请求失败: " << error;
+    EXPECT_EQ(requests_ok, 2) << "两次 HTTPS 请求都应成功";
+    EXPECT_EQ(accepts, 2) << "max_idle_per_origin=0 时每个请求都必须新建连接";
+    EXPECT_EQ(status, 200);
+    EXPECT_EQ(body, "tls-ok");
+    EXPECT_NE(last_request.find("GET /tls HTTP/1.1"), std::string::npos) << last_request;
+}
+
+// 负例: 测试证书不在系统信任链里, 客户端必须拒绝, 而不是"跳过校验"。
+TEST(TlsTest, HttpClientRejectsUntrustedCertificate) {
+    pem_files pem;
+    int accepts = 0;
+    std::string last_request;
+    std::string error;
+
+    g_port = 0;
+    coro::run([&]() -> coro::Task<void> {
+        auto svc = coro::spawn(serve_http_over_tls(&pem, 1, &accepts, &last_request));
+        for (int i = 0; i < 50 && g_port == 0; ++i)
+            co_await coro::sleep(2ms);
+        if (g_port == 0) {
+            error = "服务端没起来";
+            co_return;
+        }
+
+        coro::HttpClient client; // 默认信任系统锚: 自签名测试证书不在其中
+        try {
+            (void)co_await client.get("https://localhost:" + std::to_string(g_port) + "/tls");
+            error = "<no exception>";
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        co_await std::move(svc);
+    }());
+
+    EXPECT_NE(error, "");
+    EXPECT_NE(error, "<no exception>") << "未受信任的证书必须导致请求失败";
+    EXPECT_EQ(accepts, 1);
+}
+
+#endif // CORO_HAS_HTTP_CLIENT
 
 #endif // CORO_HAS_TLS

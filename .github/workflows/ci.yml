@@ -114,6 +114,7 @@ jobs:
             -DCORO_REQUIRE_URING=ON \
             -DCORO_ENABLE_WEB=ON \
             -DCORO_ENABLE_CONCURRENCY_EXT=ON \
+            -DCORO_ENABLE_HTTP_CLIENT=ON \
             -DCORO_BUILD_TESTS=ON \
             -DCORO_BUILD_EXAMPLES=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -150,6 +151,22 @@ jobs:
             -DCMAKE_PREFIX_PATH="$PWD/build/install-root"
           cmake --build build/core-smoke
           ./build/core-smoke/coro_core_smoke
+          # HTTP 客户端组件: 从复制后的前缀配置, 证明导入路径不依赖原构建目录
+          cp -r "$PWD/build/install-root" "$PWD/build/install-moved"
+          cmake -S tests/package_smoke -B build/package-smoke-client \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install-moved" \
+            -DCORO_SMOKE_COMPONENT=http_client \
+            -DCORO_SMOKE_EXPECT_TLS=0
+          cmake --build build/package-smoke-client
+          ./build/package-smoke-client/coro_package_smoke
+          # 未安装的组件必须在配置期失败, 而不是拖到链接才报错
+          if cmake -S tests/package_smoke -B build/package-smoke-missing \
+               -DCMAKE_PREFIX_PATH="$PWD/build/install-moved" \
+               -DCORO_SMOKE_COMPONENT=http_server; then
+            echo "::error::find_package should have failed for an uninstalled component"
+            exit 1
+          fi
 
       - name: Verify standalone Web build
         timeout-minutes: 5
@@ -186,6 +203,79 @@ jobs:
             build.log
             build/Testing/Temporary/
             build-core/Testing/Temporary/
+
+  # ============================================================
+  # Linux — TLS + HTTP 客户端 (真实 HTTPS 握手与安装消费)
+  # ============================================================
+  # Windows 的 OpenSSL 包装层尚未实现, 所以 TLS 只在 Linux 验证;
+  # 这个作业也只负责 TLS/客户端, 不重复跑 Web 与示例。
+  build-linux-tls-client:
+    name: Linux (GCC 13, TLS + HTTP client)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CXX: g++-13
+      CC: gcc-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # vendored OpenSSL 的包装层需要 perl + make
+          sudo apt-get install -y g++-13 perl make
+          "$CXX" --version
+          perl --version | head -2
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-tls-client
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCORO_REQUIRE_URING=ON \
+            -DCORO_REQUIRE_TLS=ON \
+            -DCORO_ENABLE_HTTP_CLIENT=ON \
+            -DCORO_BUILD_TESTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build tests
+        run: cmake --build build --target coro_tests
+
+      - name: Run TLS and HTTP client tests
+        timeout-minutes: 15
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Report ctest failures
+        if: failure()
+        uses: ./.github/actions/ctest-failure-report
+        with:
+          label: Linux GCC 13 TLS + HTTP client
+
+      - name: Verify installed package (TLS client)
+        run: |
+          cmake --install build --prefix "$PWD/build/install-root"
+          # 换一个前缀再消费: 静态库与头文件路径不能指回构建目录
+          cp -r "$PWD/build/install-root" "$PWD/build/install-moved"
+          cmake -S tests/package_smoke -B build/package-smoke-client \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install-moved" \
+            -DCORO_SMOKE_COMPONENT=http_client \
+            -DCORO_SMOKE_EXPECT_TLS=1
+          cmake --build build/package-smoke-client
+          ./build/package-smoke-client/coro_package_smoke
+
+      - name: Upload build and test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tls-client-logs
+          path: |
+            build/Testing/Temporary/
 
   # ============================================================
   # macOS — Apple Clang, Debug + Release
@@ -236,7 +326,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCORO_ENABLE_WEB=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON
+        # Windows 上 TLS 仍不支持, 所以客户端在这里只验证非 TLS 路径。
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_HTTP_CLIENT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON
 
       - name: Build all targets
         run: cmake --build build --config ${{ matrix.build_type }}
@@ -292,6 +383,24 @@ jobs:
           cmake -S tests/core_smoke -B build/core-smoke -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-root"
           cmake --build build/core-smoke --config ${{ matrix.build_type }}
           & "build\core-smoke\${{ matrix.build_type }}\coro_core_smoke.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # HTTP 客户端组件: 从复制后的前缀消费, 证明导入路径不依赖原构建目录
+          Copy-Item -Recurse "$env:GITHUB_WORKSPACE\build\install-root" "$env:GITHUB_WORKSPACE\build\install-moved"
+          cmake -S tests/package_smoke -B build/package-smoke-client `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-moved" `
+            -DCORO_SMOKE_COMPONENT=http_client `
+            -DCORO_SMOKE_EXPECT_TLS=0
+          cmake --build build/package-smoke-client --config ${{ matrix.build_type }}
+          & "build\package-smoke-client\${{ matrix.build_type }}\coro_package_smoke.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 未安装的组件必须在配置期失败, 而不是拖到链接才报错
+          cmake -S tests/package_smoke -B build/package-smoke-missing `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\build\install-moved" `
+            -DCORO_SMOKE_COMPONENT=http_server
+          if ($LASTEXITCODE -eq 0) {
+            "::error::find_package should have failed for an uninstalled component"
+            exit 1
+          }
 
       - name: Verify standalone Web build
         timeout-minutes: 5
@@ -347,7 +456,7 @@ jobs:
           uname -sr
 
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_ENABLE_HTTP_CLIENT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
 
       - name: Build (tests only)
         run: cmake --build build --target coro_tests
