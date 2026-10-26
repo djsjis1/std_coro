@@ -37,12 +37,25 @@
 namespace coro {
     namespace detail {
 
+        /// 一次挂起等待的登记记录。outcome 是「先到终态」的仲裁单元:
+        /// 0=pending, 1=cancelled, 2=timeout。取消与到期都只能 CAS 成功一次,
+        /// 因此恢复时看到的原因就是真正先到的那一个, 不会在 await_resume 里
+        /// 重新看共享布尔而被后到事件翻转。
+        struct cancel_wait_record {
+            std::coroutine_handle<> handle{};
+            EventLoop* loop = nullptr;
+            std::shared_ptr<std::atomic<int>> outcome;
+        };
+
+        /// 终态取值 (与 cancel_wait_record::outcome 一致)
+        enum class cancel_outcome : int { pending = 0, cancelled = 1, timeout = 2 };
+
         /// 取消状态: source 与所有 token/等待者共享。生命周期由 shared_ptr 保证,
         /// 因此 source 先于子协程析构也不会悬空。
         struct cancellation_state {
             std::mutex mutex;
             std::atomic<bool> cancelled{false};
-            std::vector<std::pair<std::coroutine_handle<>, EventLoop*>> waiters;
+            std::vector<cancel_wait_record> waiters;
             // 屏蔽作用域计数与延后标记都由 mutex 保护 (与 waiters 同一把锁):
             // 把它们放进 state 而不是放进协程帧, 是因为"当前哪个协程在跑"没法在
             // 唤醒/取消路径上可靠得知 —— 屏蔽的是**这个源**, 作用域由 RAII 对象决定。
@@ -89,7 +102,7 @@ namespace coro {
             }
 
             /// 摘一个等待者交给调用方唤醒 (每个等待者至多被摘走一次)
-            bool take_waiter(std::pair<std::coroutine_handle<>, EventLoop*>& out) {
+            bool take_waiter(cancel_wait_record& out) {
                 std::lock_guard lock(mutex);
                 if (waiters.empty())
                     return false;
@@ -98,16 +111,16 @@ namespace coro {
                 return true;
             }
 
-            void add_waiter(std::coroutine_handle<> h, EventLoop* loop) {
+            void add_waiter(std::coroutine_handle<> h, EventLoop* loop, std::shared_ptr<std::atomic<int>> outcome) {
                 std::lock_guard lock(mutex);
-                waiters.emplace_back(h, loop);
+                waiters.push_back(cancel_wait_record{h, loop, std::move(outcome)});
             }
 
             /// 等待者帧即将销毁 (被取消/提前退出): 摘链, 防止 cancel 唤醒野句柄
             void drop_waiter(std::coroutine_handle<> h) {
                 std::lock_guard lock(mutex);
                 for (auto it = waiters.begin(); it != waiters.end(); ++it) {
-                    if (it->first == h) {
+                    if (it->handle == h) {
                         waiters.erase(it);
                         return;
                     }
@@ -121,6 +134,8 @@ namespace coro {
             std::shared_ptr<cancellation_state> st;
             std::optional<std::chrono::steady_clock::time_point> deadline;
             std::shared_ptr<std::atomic<bool>> timer_token;
+            /// 本次等待的终态仲裁单元 (取消/超时共享同一份 shared_ptr)
+            std::shared_ptr<std::atomic<int>> outcome = std::make_shared<std::atomic<int>>(0);
             std::coroutine_handle<> registered{}; // add_waiter 用的句柄 (摘链依据)
 
             bool await_ready() const noexcept { return st->cancelled.load(); }
@@ -128,7 +143,7 @@ namespace coro {
             void await_suspend(std::coroutine_handle<> h) {
                 auto& loop = EventLoop::get();
                 registered = h;
-                st->add_waiter(h, &loop);
+                st->add_waiter(h, &loop, outcome);
                 if (st->cancelled.load()) {
                     // 竞态窗口: 检查之后、挂链之前发生了 cancel, 对方已不再能看到我们
                     retire();
@@ -137,28 +152,41 @@ namespace coro {
                 }
                 if (deadline.has_value()) {
                     timer_token = std::make_shared<std::atomic<bool>>(false);
-                    loop.schedule_timer(h, *deadline, timer_token);
+                    // expire_value=2(timeout): 到期入队时与取消竞争唯一终态
+                    loop.schedule_timer(h, *deadline, timer_token, outcome,
+                                        static_cast<int>(cancel_outcome::timeout));
                 }
             }
 
-            void await_resume() const {
-                if (timer_token)
-                    *timer_token = true; // 本次已消费, 堆里的定时器条目作废
-                retire();                // 正常结束也要摘链, 否则野句柄留在 waiters 里
+            void await_resume() {
+                retire(); // 先摘链并作废定时器条目, 再判定原因
+                switch (static_cast<cancel_outcome>(outcome->load())) {
+                case cancel_outcome::cancelled:
+                    throw CancelledError();
+                case cancel_outcome::timeout:
+                    throw TimeoutError();
+                case cancel_outcome::pending:
+                    break;
+                }
+                // 没经过仲裁单元就恢复了 (例如已被其它机制唤醒): 按共享状态兜底判定
                 if (st->cancelled.load())
                     throw CancelledError();
                 throw TimeoutError();
             }
 
-            /// 摘链必须挂在生命周期终点, 不能只挂在 await_resume: 任务被取消时
-            /// CancelledError 由框架的取消检查包装器抛出, **绕过本 awaiter 的
-            /// await_resume** —— 于是超时/取消后的协程帧销毁了, waiters 里却仍留着
-            /// 它的句柄, 之后任意一次 source.cancel() 都会对野句柄 schedule。
-            /// drop_waiter 按句柄查找, 摘不到即空操作, 所以移动导致的二次析构与
-            /// await_resume 已摘过的情况都安全。
-            void retire() const {
-                if (registered)
+            /// 本次等待的统一退役入口: 作废定时器堆条目 + 从 source 等待链摘除。
+            /// 必须同时做两件事 —— 只摘链会让远期 deadline 继续把事件循环拖到原期限
+            /// (has_work 看到 timer_heap_ 非空), 表现为“取消后程序迟迟不退出”。
+            /// Task 取消会绕过 await_resume 直接销毁帧, 因此析构也必须走这里。
+            void retire() {
+                if (timer_token) {
+                    *timer_token = true;
+                    timer_token.reset();
+                }
+                if (registered) {
                     st->drop_waiter(registered);
+                    registered = {};
+                }
             }
 
             ~context_wait_awaiter() { retire(); }
@@ -173,6 +201,10 @@ namespace coro {
         /// 同样不能做成 CancellationToken 的成员协程 —— 令牌是按值传递的临时量,
         /// 挂起后它可能先于等待者销毁。
         inline Task<void> token_wait(std::shared_ptr<cancellation_state> st) {
+            // 默认构造/移出的 token 没有共享状态, 约定为“已取消”: 等待立即完成。
+            // 若在这里继续构造 awaiter, await_ready 会解引用空 state_。
+            if (!st)
+                co_return;
             try {
                 co_await context_wait_awaiter{std::move(st), std::nullopt, nullptr};
             } catch (const CancelledError&) {
@@ -223,10 +255,19 @@ namespace coro {
 
         /// 把全部等待者摘走并投递回各自的 EventLoop 唤醒 (取消只发生一次, 摘链即消费)
         void wake_waiters() const {
-            std::pair<std::coroutine_handle<>, EventLoop*> waiter{};
+            detail::cancel_wait_record waiter{};
             while (state_->take_waiter(waiter)) {
-                if (waiter.second != nullptr)
-                    waiter.second->schedule(waiter.first);
+                if (waiter.loop == nullptr)
+                    continue;
+                if (waiter.outcome) {
+                    // 先到终态: 已由超时定下结果的等待者不再被“取消”覆盖。
+                    // 同时避免对同一帧重复入队 (它可能已经在 ready 队列里)。
+                    int expected = static_cast<int>(detail::cancel_outcome::pending);
+                    if (!waiter.outcome->compare_exchange_strong(
+                            expected, static_cast<int>(detail::cancel_outcome::cancelled)))
+                        continue;
+                }
+                waiter.loop->schedule(waiter.handle);
             }
         }
 
@@ -250,7 +291,13 @@ namespace coro {
         /// 根上下文: 无人能取消它, 也没有期限
         Context() : state_(std::make_shared<detail::cancellation_state>()) {}
 
-        /// 从取消源的令牌派生; 不传令牌时相当于根上下文
+        /// 从取消源的令牌派生; 不传令牌时相当于根上下文。
+        ///
+        /// 注意: 默认构造的 CancellationToken (无 owner) 经 token.cancelled()
+        /// 报告"已取消" (保守取向: 宁可取消), 而这里为它派生的是无人能取消的
+        /// 状态 —— 同一个令牌经两条路径得到相反结论。Context 需要可传递的
+        /// 取消链, 只能选择"永不取消"; 需要立即取消的调用方应显式使用
+        /// CancellationSource 或已取消的上下文。
         static Context from(CancellationToken token, std::optional<time_point> deadline = std::nullopt) {
             auto st = token.state_ ? token.state_ : std::make_shared<detail::cancellation_state>();
             return Context{std::move(st), deadline};
@@ -261,7 +308,7 @@ namespace coro {
         /// 只带期限、不带取消源的上下文
         template <typename Rep, typename Period> static Context with_timeout(std::chrono::duration<Rep, Period> d) {
             return Context{std::make_shared<detail::cancellation_state>(),
-                           std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::milliseconds>(d)};
+                           std::chrono::steady_clock::now() + std::chrono::ceil<std::chrono::milliseconds>(d)};
         }
 
         /// 子上下文: 继承父的取消关系; deadline 取父子中较早的那个。
@@ -271,9 +318,13 @@ namespace coro {
         /// 派生一个额外带期限的视图 (父不受影响)
         template <typename Rep, typename Period> Context with_deadline(std::chrono::duration<Rep, Period> d) const {
             const auto next =
-                std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::milliseconds>(d);
+                std::chrono::steady_clock::now() + std::chrono::ceil<std::chrono::milliseconds>(d);
             return Context{state_, earlier(deadline_, next)};
         }
+
+        /// 绝对期限视图: 取与现有期限中较早的一个。
+        /// 嵌套调用应传同一个 deadline —— 逐层传相对时长会把总时限不断延长。
+        Context with_deadline_at(time_point at) const { return Context{state_, earlier(deadline_, at)}; }
 
         bool cancelled() const noexcept { return state_->cancelled.load(); }
 
@@ -329,12 +380,19 @@ namespace coro {
 
         /// 析构: 若是最后一层且期间有取消请求, 立即补发 (置终态 + 唤醒等待者)
         ~cancellation_shield() {
-            if (state_ && state_->shield_exit()) {
-                std::pair<std::coroutine_handle<>, EventLoop*> waiter{};
-                while (state_->take_waiter(waiter)) {
-                    if (waiter.second != nullptr)
-                        waiter.second->schedule(waiter.first);
+            if (!state_ || !state_->shield_exit())
+                return;
+            detail::cancel_wait_record waiter{};
+            while (state_->take_waiter(waiter)) {
+                if (waiter.loop == nullptr)
+                    continue;
+                if (waiter.outcome) {
+                    int expected = static_cast<int>(detail::cancel_outcome::pending);
+                    if (!waiter.outcome->compare_exchange_strong(
+                            expected, static_cast<int>(detail::cancel_outcome::cancelled)))
+                        continue;
                 }
+                waiter.loop->schedule(waiter.handle);
             }
         }
 

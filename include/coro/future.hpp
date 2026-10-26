@@ -163,14 +163,17 @@ namespace coro {
         /// 这里故意在 state mutex 保护下完成“标记已领取 + schedule”这两个
         /// 动作。若先把 waiter swap 出锁再 schedule，等待者可能在这段窗口
         /// 被取消并销毁，随后通知线程会调度悬空 coroutine_handle。
+        ///
+        /// 与 Event/Semaphore/Lock 的 wait-epoch 机制的关系 (B01):
+        ///   Future 的每个登记只可能被通知一次 —— notify 在同锁内把 waiters
+        ///   清空，取消/销毁也在同锁内摘链。因此不存在“旧通知到达时帧已开始
+        ///   新一轮等待”的窗口，不需要额外的 epoch。FrameState 的 generation
+        ///   仍会拦住已销毁地址的投递。
         void notify() {
             std::lock_guard lock(state_->mtx);
-            for (auto& w : state_->waiters) {
-                if (w.loop)
-                    w.loop->schedule(w.handle);
-                else
-                    EventLoop::get().schedule(w.handle);
-            }
+            // Waiter.loop 由 await_suspend 以 &EventLoop::get() 写入, 恒非空
+            for (auto& w : state_->waiters)
+                w.loop->schedule(w.handle);
             state_->waiters.clear();
         }
 
@@ -298,7 +301,7 @@ namespace coro {
     //
     // 与 <T> 版本的区别:
     //   - 不需要 std::optional<T> 存储值 (void 没有值)
-    //   - set_value() 无参数, 只设置 has_result = true
+    //   - set_value() 无参数, 完成状态由 ready 承载
     //   - await_resume() 返回 void
     // ============================================================================
     template <> class Promise<void> {
@@ -327,7 +330,6 @@ namespace coro {
                 std::lock_guard lock(state_->mtx);
                 if (state_->ready)
                     throw std::logic_error("Promise: result already set");
-                state_->has_result = true;
                 state_->ready = true;
             }
             notify();
@@ -363,12 +365,9 @@ namespace coro {
 
         void notify() {
             std::lock_guard lock(state_->mtx);
-            for (auto& w : state_->waiters) {
-                if (w.loop)
-                    w.loop->schedule(w.handle);
-                else
-                    EventLoop::get().schedule(w.handle);
-            }
+            // Waiter.loop 由 await_suspend 以 &EventLoop::get() 写入, 恒非空
+            for (auto& w : state_->waiters)
+                w.loop->schedule(w.handle);
             state_->waiters.clear();
         }
 
@@ -395,10 +394,9 @@ namespace coro {
 
         struct SharedState {
             mutable std::mutex mtx;
-            bool has_result = false; // 是否已设置 (void 不需要存值)
             std::exception_ptr exception;
             std::vector<Waiter> waiters; // 多个等待者 (各带自己的 loop)
-            bool ready = false;
+            bool ready = false;          // 是否已完成 (set_value/set_exception 置位)
         };
 
         std::shared_ptr<SharedState> state_;

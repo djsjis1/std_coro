@@ -3,7 +3,9 @@
 #include "event_loop.hpp"
 #include "sleep.hpp"
 #include "shutdown.hpp"
+#include "sync.hpp"
 #include "task.hpp"
+#include "wait.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -65,8 +67,11 @@ namespace coro {
             std::atomic<size_t> rejected{0};
             std::atomic<size_t> exceptions{0};
             size_t capacity = 0;
+            /// 任务归零时 set(): 关停路径不再靠 1ms 轮询猜测是否排空。
+            std::shared_ptr<Event> idle_event;
 
             void finish(const std::shared_ptr<registry_entry>& e) {
+                bool became_empty = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (e->finished.exchange(true))
@@ -77,8 +82,25 @@ namespace coro {
                             break;
                         }
                     }
+                    became_empty = entries.empty();
                 }
                 active.fetch_sub(1);
+                if (became_empty) {
+                    std::shared_ptr<Event> ev;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        ev = idle_event;
+                    }
+                    if (ev)
+                        ev->set();
+                }
+            }
+
+            std::shared_ptr<Event> ensure_idle_event() {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!idle_event)
+                    idle_event = std::make_shared<Event>();
+                return idle_event;
             }
         };
 
@@ -200,24 +222,48 @@ namespace coro {
             /// 未被任务自身处理、由登记表兜底捕获的异常数
             size_t exception_count() const noexcept { return state_->exceptions.load(); }
 
+            /// 等到全部任务结束 (无超时)。基于完成通知, 不是轮询。
+            Task<void> wait_empty() {
+                if (empty())
+                    co_return;
+                auto ev = state_->ensure_idle_event();
+                while (!empty()) {
+                    ev->clear();
+                    if (empty())
+                        break;
+                    co_await ev->wait();
+                }
+            }
+
             /// 等待全部任务结束: 宽限期内不干预; 到点才请求取消, 再给 cancel_grace
             /// 收尾; 仍未结束就如实报告 unfinished —— grace 是"何时开始取消"的时刻,
-            /// 不是"可以强行销毁协程帧"的时刻。轮询 1ms 只用于关停路径, 不在热路径。
+            /// 不是"可以强行销毁协程帧"的时刻。
+            /// 等待走 registry 的完成通知 (Event), 不再 1ms 轮询。
             template <typename Rep1, typename Period1, typename Rep2, typename Period2>
             Task<shutdown_report> settle(std::chrono::duration<Rep1, Period1> grace,
                                          std::chrono::duration<Rep2, Period2> cancel_grace) {
                 shutdown_report report;
-                const auto drain_deadline = std::chrono::steady_clock::now() + grace;
-                while (!empty() && std::chrono::steady_clock::now() < drain_deadline)
-                    co_await coro::sleep(std::chrono::milliseconds(1));
+                auto drain = std::chrono::ceil<std::chrono::milliseconds>(grace);
+                if (drain.count() > 0 && !empty()) {
+                    try {
+                        co_await wait_for(wait_empty(), drain);
+                    } catch (const TimeoutError&) {
+                        // 宽限期到: 继续走取消阶段
+                    }
+                }
                 if (empty()) {
                     report.drained = true;
                     co_return report;
                 }
                 request_cancel_all();
-                const auto cancel_deadline = std::chrono::steady_clock::now() + cancel_grace;
-                while (!empty() && std::chrono::steady_clock::now() < cancel_deadline)
-                    co_await coro::sleep(std::chrono::milliseconds(1));
+                auto settle_window = std::chrono::ceil<std::chrono::milliseconds>(cancel_grace);
+                if (settle_window.count() > 0 && !empty()) {
+                    try {
+                        co_await wait_for(wait_empty(), settle_window);
+                    } catch (const TimeoutError&) {
+                        // 取消宽限也到点: 如实报告未完成
+                    }
+                }
                 report.drained = empty();
                 report.unfinished = size();
                 co_return report;

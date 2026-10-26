@@ -42,16 +42,22 @@ namespace coro {
     namespace detail {
         /// 当前事件循环的 IOCP 事件源 (memo 化类型化访问器)。
         /// EventLoop 本体不再声明平台类型 (解耦: 核心不知道平台细节), 类型
-        /// 解析收口在 IO 底座: 热路径 = 1 次 TLS 读 + 1 次指针比较, 与旧的
-        /// EventLoop 成员读同量级; dynamic_cast 只在 memo 未命中时发生,
-        /// 正常运行 = 每线程每事件源恰好一次 (set_event_source 禁止运行中替换,
-        /// 以源指针为键 double 保险)。
+        /// 解析收口在 IO 底座: 热路径 = 1 次 TLS 读 + 2 次标量比较, 与旧的
+        /// EventLoop 成员读同量级; dynamic_cast 只在 memo 未命中时发生。
+        /// memo 以 (源指针, epoch) 为键: swap_event_source 释放旧源后,
+        /// 新源可能复用同一地址, 仅凭指针会命中指向已析构对象的过期缓存。
         inline net::IocpEventSource* current_iocp() {
-            EventSource* src = EventLoop::get().event_source_ptr();
-            static thread_local std::pair<EventSource*, net::IocpEventSource*> memo{nullptr, nullptr};
-            if (memo.first != src)
-                memo = {src, dynamic_cast<net::IocpEventSource*>(src)};
-            return memo.second;
+            EventLoop& loop = EventLoop::get();
+            EventSource* src = loop.event_source_ptr();
+            struct Memo {
+                EventSource* src = nullptr;
+                uint64_t epoch = 0;
+                net::IocpEventSource* typed = nullptr;
+            };
+            static thread_local Memo memo;
+            if (memo.src != src || memo.epoch != loop.event_source_epoch())
+                memo = {src, loop.event_source_epoch(), dynamic_cast<net::IocpEventSource*>(src)};
+            return memo.typed;
         }
     } // namespace detail
 #endif
@@ -83,21 +89,20 @@ namespace coro {
             u->op_start();
         }
 
-        /// 当前事件循环的 io_uring 事件源 (memo 化类型化访问器, 语义同 current_iocp)
+        /// 当前事件循环的 io_uring 事件源 (memo 化类型化访问器, 语义同 current_iocp:
+        /// 以 (源指针, epoch) 为键, 规避 swap 后同地址复用的假命中)
         inline net::UringEventSource* current_uring() {
-            EventSource* src = EventLoop::get().event_source_ptr();
-            static thread_local std::pair<EventSource*, net::UringEventSource*> memo{nullptr, nullptr};
-            if (memo.first != src)
-                memo = {src, dynamic_cast<net::UringEventSource*>(src)};
-            return memo.second;
-        }
-
-        /// SQE 提交 + 挂起数统计的薄包装 (转发 uring_submit; ring 参数仅为
-        /// 调用点可读性保留)。net 与 unix 的 awaiter 共用, 原先定义在 net.hpp,
-        /// 曾迫使 unix.hpp 依赖 TCP 头 —— 现收编为 io 层公共设施。
-        inline void uring_submit_op(net::UringEventSource* u, io_uring* ring, detail::uring_op* op, io_uring_sqe* sqe) {
-            (void)ring;
-            uring_submit(u, sqe, op);
+            EventLoop& loop = EventLoop::get();
+            EventSource* src = loop.event_source_ptr();
+            struct Memo {
+                EventSource* src = nullptr;
+                uint64_t epoch = 0;
+                net::UringEventSource* typed = nullptr;
+            };
+            static thread_local Memo memo;
+            if (memo.src != src || memo.epoch != loop.event_source_epoch())
+                memo = {src, loop.event_source_epoch(), dynamic_cast<net::UringEventSource*>(src)};
+            return memo.typed;
         }
     } // namespace detail
 #endif

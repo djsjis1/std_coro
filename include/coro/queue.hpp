@@ -1,10 +1,12 @@
 #pragma once
 
+#include "exceptions.hpp"
 #include "sync.hpp"
 
 #include <algorithm>
 #include <deque>
 #include <optional>
+#include <stdexcept>
 
 // ============================================================================
 // coro::Queue<T> — 协程间通信队列 (类似 asyncio.Queue)
@@ -21,6 +23,10 @@
 //   - put: 队列满时挂起生产者, 直到有空间
 //   - get: 队列空时挂起消费者, 直到有数据
 //   - 可选 maxsize (默认无限)
+//
+// 线程契约: loop-local。等待队列里存的是 awaiter 帧内指针, 它们只在
+// 创建队列的 EventLoop 线程上被读写与唤醒, 因此不需要 wait-epoch; 跨线程
+// 请通过 dispatch 投递而不是直接操作队列。
 // ============================================================================
 
 namespace coro {
@@ -41,14 +47,18 @@ namespace coro {
           public:
             get_awaiter(Queue* q) : q_(q) {} // 保存指向所属队列的指针
 
-            /// 有数据? 有则直接返回 (快速路径, 不挂起)
+            /// 有数据? 有则直接返回 (快速路径, 不挂起)。
+            /// 已关闭且无存量时也直接进 await_resume, 在那里报 QueueShutDown。
             bool await_ready() const noexcept {
-                return q_->reserved_getters_ == 0 && q_->get_waiters_.empty() && !q_->items_.empty();
+                return q_->reserved_getters_ == 0 && q_->get_waiters_.empty() &&
+                       (!q_->items_.empty() || q_->shut_down_);
             }
 
             /// 没数据 → 把协程句柄登记到等待队列, 然后挂起
             void await_suspend(std::coroutine_handle<> h) {
                 handle_ = h;
+                if (q_->shut_down_ && q_->items_.empty())
+                    throw QueueShutDown{}; // 不进入等待链: 队列不会再产出任何元素
                 q_->get_waiters_.push_back(this);
                 q_->notify_getters();
             }
@@ -56,6 +66,13 @@ namespace coro {
             /// 被唤醒后: 取出队首数据, 并顺带叫醒一个生产者
             T await_resume() {
                 q_->remove_get_waiter(this);
+                if (q_->items_.empty()) {
+                    // graceful shutdown 排空之后, 取不到就是终止信号
+                    if (q_->shut_down_)
+                        throw QueueShutDown{};
+                    q_->notify_getters();
+                    throw QueueShutDown{}; // 不可达状态: 保留明确的失败而不是未定义行为
+                }
                 try {
                     auto item = std::move(q_->items_.front());
                     q_->items_.pop_front();
@@ -88,12 +105,14 @@ namespace coro {
             // 保存队列指针 + 待放入的数据
             put_awaiter(Queue* q, T item) : q_(q), item_(std::move(item)) {}
 
-            /// 有空间 (无限队列或未满)? 有则直接放 (快速路径, 不挂起)
-            bool await_ready() const noexcept { return !q_->full(); }
+            /// 有空间 (无限队列或未满) 且未关闭? 有则直接放 (快速路径, 不挂起)
+            bool await_ready() const noexcept { return !q_->shut_down_ && !q_->full(); }
 
             /// 满了 → 把协程句柄登记到等待队列, 然后挂起
             void await_suspend(std::coroutine_handle<> h) {
                 handle_ = h;
+                if (q_->shut_down_)
+                    throw QueueShutDown{}; // 已关闭: 不静默丢弃, 也不永久挂起
                 q_->put_waiters_.push_back(this);
                 q_->notify_putters();
             }
@@ -101,6 +120,8 @@ namespace coro {
             /// 被唤醒后: 放入数据, 并顺带叫醒一个消费者
             void await_resume() {
                 q_->remove_put_waiter(this);
+                if (q_->shut_down_)
+                    throw QueueShutDown{};
                 try {
                     q_->items_.push_back(std::move(item_));
                 } catch (...) {
@@ -132,17 +153,20 @@ namespace coro {
 
         /// 非阻塞取: 空 → nullopt (对标 Python q.get_nowait)
         std::optional<T> get_nowait() {
-            if (items_.empty() || reserved_getters_ != 0 || !get_waiters_.empty())
+            if (items_.empty() || reserved_getters_ != 0 || !get_waiters_.empty()) {
+                if (items_.empty() && shut_down_)
+                    throw QueueShutDown{}; // 已关闭且排空: 终止信号必须可观察
                 return std::nullopt;
+            }
             auto item = std::move(items_.front());
             items_.pop_front();
             notify_putters(); // 腾出空间 → 唤醒一个生产者
             return item;
         }
 
-        /// 非阻塞放: 满 → false (对标 Python q.put_nowait)
+        /// 非阻塞放: 满或已关闭 → false (对标 Python q.put_nowait)
         bool put_nowait(T item) {
-            if (full())
+            if (shut_down_ || full())
                 return false;
             items_.push_back(std::move(item));
             ++unfinished_tasks_; // 未完成任务计数 (join 依赖)
@@ -162,19 +186,70 @@ namespace coro {
         // ==================================================================
 
         /// 消费者处理完一个任务 (unfinished_tasks -1; 归零时唤醒所有 join 等待者)
+        /// 超额调用是调用方错误: 静默忽略会掩盖真实的处理次数错误,
+        /// 使 join 的业务不变量无法验证 (对标 Python 抛 ValueError)。
         void task_done() {
-            if (unfinished_tasks_ > 0) {
-                --unfinished_tasks_;
-                if (unfinished_tasks_ == 0) {
-                    while (!join_waiters_.empty()) {
-                        auto h = join_waiters_.front();
-                        join_waiters_.pop_front();
-                        EventLoop::get().schedule(h);
-                    }
+            if (unfinished_tasks_ == 0)
+                throw std::logic_error("Queue::task_done() called more times than put()");
+            --unfinished_tasks_;
+            if (unfinished_tasks_ == 0) {
+                while (!join_waiters_.empty()) {
+                    auto h = join_waiters_.front();
+                    join_waiters_.pop_front();
+                    EventLoop::get().schedule(h);
                 }
             }
-            // 计数为 0 时调用: 忽略 (Python 抛 ValueError, C++ 简化)
         }
+
+        // ==================================================================
+        // shutdown — 给永久等在 get/put 上的任务一个明确的终止出口
+        // ==================================================================
+        //
+        // graceful: 拒绝新的 put, 唤醒所有 put 等待者 (它们得到 QueueShutDown);
+        //           存量仍可被 get 排空, 排空后的 get 抛 QueueShutDown。
+        // immediate: 丢弃仍在队列里的元素并相应扣除 unfinished;
+        //           已经 get 出去的“在途项”仍需调用方 task_done。
+        // 幂等; graceful 可升级为 immediate; 不能重新打开同一个实例。
+        // ==================================================================
+        void shutdown(bool immediate = false) {
+            const bool was_shut = shut_down_;
+            shut_down_ = true;
+            if (immediate) {
+                // 只扣“仍在队列里”的那部分: 在途项仍由消费者负责
+                const size_t dropped = items_.size();
+                items_.clear();
+                if (dropped >= unfinished_tasks_)
+                    unfinished_tasks_ = 0;
+                else
+                    unfinished_tasks_ -= dropped;
+            }
+
+            // 唤醒所有 put 等待者: 它们的 await_resume 会抛 QueueShutDown
+            while (!put_waiters_.empty()) {
+                auto* waiter = put_waiters_.front();
+                put_waiters_.pop_front();
+                if (std::exchange(waiter->reserved_, false) && reserved_putters_ > 0)
+                    --reserved_putters_;
+                EventLoop::get().schedule(waiter->handle_);
+            }
+            // 唤醒所有 get 等待者: 有存量则仍可排空, 否则立即得到 QueueShutDown
+            while (!get_waiters_.empty()) {
+                auto* waiter = get_waiters_.front();
+                get_waiters_.pop_front();
+                if (std::exchange(waiter->reserved_, false) && reserved_getters_ > 0)
+                    --reserved_getters_;
+                EventLoop::get().schedule(waiter->handle_);
+            }
+            if (!was_shut && unfinished_tasks_ == 0) {
+                while (!join_waiters_.empty()) {
+                    auto h = join_waiters_.front();
+                    join_waiters_.pop_front();
+                    EventLoop::get().schedule(h);
+                }
+            }
+        }
+
+        bool shut_down() const noexcept { return shut_down_; }
 
         /// co_await q.join() 的 awaiter: 未完成任务归零前挂起
         struct join_awaiter {
@@ -262,6 +337,7 @@ namespace coro {
         std::deque<get_awaiter*> get_waiters_;             // 挂起的消费者队列 (FIFO)
         std::deque<std::coroutine_handle<>> join_waiters_; // join() 的等待者
         size_t unfinished_tasks_ = 0;                      // 已 put 未 task_done 的任务数
+        bool shut_down_ = false;                           // 已 shutdown (不可重新打开)
     };
 
 } // namespace coro

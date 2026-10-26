@@ -49,9 +49,15 @@ namespace coro {
     // 对标 asyncio.run(main()): 返回主协程的返回值 (void 任务返回 void)。
     //   int result = coro::run(compute());          // 直接拿到结果
     //   coro::run(background());                    // Task<> 版本
+    //
+    // 事件循环可能被 stop() 提前终止 (信号处理/外部调用): 主任务尚未完成时
+    // 必须显式报错 —— Task<void>::take_result() 只检查异常, 静默返回会
+    // 把"没跑完"伪装成"成功"。
     template <typename T> T run(Task<T> task) {
         task.start();
         EventLoop::get().run();
+        if (!task.is_ready())
+            throw std::runtime_error("coro::run: event loop stopped before the main task completed");
         if constexpr (std::is_void_v<T>)
             task.take_result();
         else

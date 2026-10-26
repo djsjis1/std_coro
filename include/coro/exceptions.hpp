@@ -109,6 +109,19 @@ namespace coro {
         std::size_t limit; ///< 当时生效的缓冲上限
     };
 
+    /// 队列已关闭 (对标 Python 3.13 的 asyncio.QueueShutDown)。
+    /// 与取消、超时、普通业务异常分开: 它是队列的终止状态, 不是某次操作的失败。
+    class QueueShutDown : public Error {
+      public:
+        QueueShutDown() : Error("queue has been shut down") {}
+    };
+
+    /// 执行器/线程池已满或已停止接收: 属于背压拒绝, 不是程序错误。
+    class OverloadError : public Error {
+      public:
+        explicit OverloadError(const std::string& what) : Error(what) {}
+    };
+
     class ExceptionGroup : public Error {
       public:
         explicit ExceptionGroup(std::vector<std::exception_ptr> exceptions)

@@ -238,6 +238,8 @@ auto [name, count] = co_await coro::gather(
 ```
 
 异常处理：任一任务失败 → 等待所有完成 → 重新抛出第一个异常。
+调用方在等待期间被取消时，剩余子任务会收到 `CancelledError` 优雅终止
+（对标 asyncio 的级联取消，子任务的清理逻辑照常执行）。
 
 ### 4. `Future/Promise` — 桥接回调到协程
 
@@ -567,6 +569,7 @@ cmake --build build-dev --target coro_stress
 | **Task 生命周期** | 析构未完成的 `Task` 会安全放弃/销毁该任务；若希望任务继续运行，必须保存 `spawn` 返回值，或明确调用 `detach()` |
 | **取消语义** | `Task::cancel()` 对标 Python：协程在下一个 await 点收到 `CancelledError`（可 catch 做清理），循环任务也能终止。请在事件循环线程调用；挂起在 I/O 上的任务会先取消底层 I/O（CancelIoEx / ASYNC_CANCEL），由完成包唤醒 |
 | **嵌套 run()** | 不支持（检测到嵌套调用会抛出 `std::runtime_error`，错误信息说明原因；异常后事件循环状态复位，可再次运行） |
+| **run() 提前终止** | 事件循环被 `stop()` 提前终止而主任务尚未完成时，`coro::run` 抛出 `std::runtime_error`（不会把未完成的主任务当作成功） |
 | **协作式调度** | 无栈协作式: 协程体内不要写不含 co_await 的死循环, 否则阻塞整个事件循环 (与 Python asyncio 相同, Go 无此限制) |
 | **lambda 协程** | 支持；捕获存放在闭包对象中，闭包必须活到协程结束，或改用无捕获 lambda + 参数 |
 

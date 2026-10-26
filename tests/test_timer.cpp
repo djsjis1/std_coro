@@ -134,6 +134,44 @@ namespace {
         co_return;
     }
 
+    // 往返用法: 上一次 wait 的 Task 未启动就丢弃, 名额必须归还;
+    // 取消挂起点也必须归还, 否则后续 wait 永久被拒。
+    coro::Task<bool> dropped_wait_releases_slot(bool* reuse_ok) {
+        coro::Timer timer{50ms};
+        {
+            auto first = timer.wait(); // 只创建, 不启动
+            (void)first;
+        } // 未启动的 Task 在此销毁
+        *reuse_ok = co_await timer.wait();
+        co_return true;
+    }
+
+    coro::Task<bool> cancelled_waiter_releases_slot(bool* reuse_ok) {
+        coro::Timer timer{10s};
+        auto pending = coro::spawn(wait_once(&timer, reuse_ok));
+        co_await coro::yield();
+        pending.cancel(); // 取消等待任务 (跳过 await_resume)
+        try {
+            co_await std::move(pending);
+        } catch (const coro::CancelledError&) {
+        }
+        // 等待名额已归还: 重新 reset 后必须能再次等待 (否则抛 StructuredConcurrencyError)
+        timer.reset(20ms);
+        *reuse_ok = co_await timer.wait();
+        co_return true;
+    }
+
+    coro::Task<bool> move_assignment_cancels_old_state(bool* old_woken, bool* new_expired) {
+        coro::Timer first{10s};
+        coro::Timer second{20ms};
+        auto waiting = coro::spawn(wait_once(&first, old_woken));
+        co_await coro::yield();
+        first = std::move(second); // 旧状态必须被终止 (等待者以 false 返回)
+        co_await std::move(waiting);
+        *new_expired = co_await first.wait();
+        co_return true;
+    }
+
 } // namespace
 
 TEST(TimerTest, WaitReturnsTrueOnExpiry) {
@@ -186,6 +224,29 @@ TEST(TimerTest, SecondWaiterIsRejectedNotSilentlyLost) {
 
 // 回归: 一次性 Timer 到期后若 reset 不重新开局, 用户按"循环 reset 表达周期"
 // 的写法会退化成满 CPU 的空转 (示例程序里实测到百万次打点)。
+TEST(TimerTest, DroppedWaitReleasesWaiterSlot) {
+    bool reuse_ok = false;
+    test_util::run_task([&] { return dropped_wait_releases_slot(&reuse_ok); });
+    EXPECT_TRUE(reuse_ok) << "未启动就被丢弃的 wait() 占住了等待名额";
+}
+
+TEST(TimerTest, CancelledWaiterReleasesSlotAndTimerEntry) {
+    bool reuse_ok = false;
+    const auto begin = clk::now();
+    test_util::run_task([&] { return cancelled_waiter_releases_slot(&reuse_ok); });
+    const auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - begin).count();
+    EXPECT_TRUE(reuse_ok) << "取消后的等待名额没有归还";
+    // 原 deadline 是 10s: 若退役时未作废堆条目, 事件循环会一直等到原期限
+    EXPECT_LT(cost, 5000) << "取消后定时器条目未作废, 事件循环被远期 deadline 拖住";
+}
+
+TEST(TimerTest, MoveAssignmentCancelsOldWaiter) {
+    bool old_woken = true, new_expired = false;
+    test_util::run_task([&] { return move_assignment_cancels_old_state(&old_woken, &new_expired); });
+    EXPECT_FALSE(old_woken) << "移动赋值后旧等待者没有被以 cancel 方式唤醒";
+    EXPECT_TRUE(new_expired) << "移动后新状态没有正常到期";
+}
+
 TEST(TimerTest, ResetAfterExpiryRearmsForNextWait) {
     std::atomic<int> ticks{0};
     const auto begin = clk::now();

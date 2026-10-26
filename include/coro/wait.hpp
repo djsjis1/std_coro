@@ -3,6 +3,7 @@
 #include "task.hpp"
 #include "sleep.hpp"
 #include "sync.hpp"
+#include "gather.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -69,7 +70,7 @@ namespace coro {
     Task<T> wait_for(Task<T> task, std::chrono::duration<Rep, Period> timeout) {
         // task / timer 都是本协程帧的局部对象 (地址稳定, 生命周期覆盖
         // 挂起期) —— 不再需要堆上 shared_ptr 保活。
-        auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+        auto timeout_ms = std::chrono::ceil<std::chrono::milliseconds>(timeout);
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
         Task<void> timer = detail::wait_for_timer_impl<T>(&task, timeout_ms, timed_out);
         timer.start();
@@ -100,7 +101,7 @@ namespace coro {
     // 主模板无法实例化 T=void (T result = co_await ... 对 void 非法)。
     template <typename Rep, typename Period>
     Task<void> wait_for(Task<void> task, std::chrono::duration<Rep, Period> timeout) {
-        auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+        auto timeout_ms = std::chrono::ceil<std::chrono::milliseconds>(timeout);
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
         Task<void> timer = detail::wait_for_timer_impl<void>(&task, timeout_ms, timed_out);
         timer.start();
@@ -116,85 +117,28 @@ namespace coro {
         }
     }
 
-    namespace detail {
-        template <typename T> struct wait_any_state {
-            mutable std::mutex mutex;
-            std::optional<T> result;
-            std::exception_ptr exc;
-            std::coroutine_handle<> cont;
-            EventLoop* cont_loop = nullptr;
-            bool done = false;
-            bool cont_dead = false;
+    // ============================================================================
+    // wait_until — 绝对截止时间版 wait_for (steady_clock)
+    // ============================================================================
+    // 嵌套调用应传同一个绝对 deadline: 逐层传相对 timeout 会把总时限不断延长。
+    // 已过期时以 0 超时进入超时路径 (不会变成“禁用超时”)。
+    template <typename T> Task<T> wait_until(Task<T> task, std::chrono::steady_clock::time_point deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (deadline <= now)
+            return wait_for(std::move(task), std::chrono::milliseconds(0));
+        return wait_for(std::move(task), deadline - now);
+    }
 
-            void install(std::coroutine_handle<> h, EventLoop* loop) {
-                std::lock_guard lock(mutex);
-                if (done || cont_dead)
-                    loop->schedule(h);
-                else {
-                    cont = h;
-                    cont_loop = loop;
-                }
-            }
+    // 组合等待的公共模式（D01：先统一语义矩阵，再收拢实现）
+    enum class WaitMode {
+        FirstCompleted,
+        FirstException,
+        AllCompleted,
+    };
 
-            void abandon() noexcept {
-                std::lock_guard lock(mutex);
-                cont_dead = true;
-                cont = nullptr;
-                cont_loop = nullptr;
-            }
-
-            bool complete(T value) {
-                std::coroutine_handle<> waiter;
-                EventLoop* loop = nullptr;
-                std::lock_guard lock(mutex);
-                if (done)
-                    return false;
-                result.emplace(std::move(value));
-                done = true;
-                if (cont && !cont_dead) {
-                    waiter = cont;
-                    loop = cont_loop;
-                    cont = nullptr;
-                    cont_loop = nullptr;
-                    loop->schedule(waiter);
-                }
-                return true;
-            }
-
-            bool fail(std::exception_ptr error) {
-                std::coroutine_handle<> waiter;
-                EventLoop* loop = nullptr;
-                std::lock_guard lock(mutex);
-                if (done)
-                    return false;
-                exc = std::move(error);
-                done = true;
-                if (cont && !cont_dead) {
-                    waiter = cont;
-                    loop = cont_loop;
-                    cont = nullptr;
-                    cont_loop = nullptr;
-                    loop->schedule(waiter);
-                }
-                return true;
-            }
-        };
-
-        // wait_any 的 monitor 协程: 命名函数 (参数进帧)。
-        // 第一个完成的 monitor 设置 result 并唤醒调用方。
-        // monitor 自持有 Task, 不能保存调用方协程帧中的裸指针。
-        // wait_any 返回后其余 monitor 仍会继续运行, 因此 Task 必须在堆上
-        // 由 shared_ptr 保活, 否则调用方被取消/销毁后会出现 UAF。
-        template <typename T>
-        Task<void> wait_any_monitor(std::shared_ptr<Task<T>> task, std::shared_ptr<wait_any_state<T>> state) {
-            try {
-                T val = co_await std::move(*task);
-                state->complete(std::move(val));
-            } catch (...) {
-                state->fail(std::current_exception());
-            }
-        }
-    } // namespace detail
+    // 前向声明: 已弃用的 wait_any 现在只是 wait_tasks 的薄适配,
+    // 不再维护第二套 state/monitor 状态机。
+    template <typename T> Task<std::vector<T>> wait_tasks(std::vector<Task<T>> tasks, WaitMode mode);
 
     // ============================================================================
     // wait_any — FIRST_COMPLETED (两路竞速)
@@ -202,30 +146,12 @@ namespace coro {
     template <typename T>
     [[deprecated("use wait_tasks(..., coro::WaitMode::FirstCompleted) for dynamic task sets")]] Task<T>
     wait_any(Task<T> t1, Task<T> t2) {
-        auto state = std::make_shared<detail::wait_any_state<T>>();
-        // 取消守卫: 调用方帧被取消销毁时, 置 cont_dead 防止 monitor schedule 悬空句柄
-        struct _cancel_guard {
-            std::shared_ptr<detail::wait_any_state<T>>& s;
-            ~_cancel_guard() { s->abandon(); }
-        } _g{state};
-
-        // 将任务移到堆上交给 monitor 共享持有, 调用方帧提前销毁也安全。
-        auto task1 = std::make_shared<Task<T>>(std::move(t1));
-        auto task2 = std::make_shared<Task<T>>(std::move(t2));
-        Task<void> m1 = detail::wait_any_monitor<T>(std::move(task1), state);
-        Task<void> m2 = detail::wait_any_monitor<T>(std::move(task2), state);
-        m1.start();
-        m1.detach(); // fire-and-forget: monitor 帧自持有到完成
-        m2.start();
-        m2.detach();
-
-        // 挂起调用方, 在 await_suspend 中设置 cont。
-        // monitor 已加入就绪队列但尚未运行, 所以 cont 先于 monitor 完成被设置。
-        co_await suspend_awaiter{[state](std::coroutine_handle<> h) { state->install(h, &EventLoop::get()); }};
-
-        if (state->exc)
-            std::rethrow_exception(state->exc);
-        co_return std::move(*state->result);
+        std::vector<Task<T>> tasks;
+        tasks.reserve(2);
+        tasks.push_back(std::move(t1));
+        tasks.push_back(std::move(t2));
+        auto results = co_await wait_tasks(std::move(tasks), WaitMode::FirstCompleted);
+        co_return std::move(results.front());
     }
 
     // ============================================================================
@@ -240,151 +166,24 @@ namespace coro {
     // ============================================================================
 
     namespace detail {
-        // N 路 monitor 也必须共享持有整个任务容器, 不能引用调用方帧。
-        template <typename T>
-        Task<void> wait_any_n_monitor(std::shared_ptr<std::vector<Task<T>>> tasks, size_t index,
-                                      std::shared_ptr<wait_any_state<T>> state) {
-            try {
-                T val = co_await std::move((*tasks)[index]);
-                state->complete(std::move(val));
-            } catch (...) {
-                state->fail(std::current_exception());
-            }
-        }
+        // 已弃用的 N 路 wait_any 不再单独维护 monitor; 见 wait_any 的薄适配实现。
     } // namespace detail
 
     template <typename T>
     [[deprecated("use wait_tasks(..., coro::WaitMode::FirstCompleted)")]] Task<T> wait_any(std::vector<Task<T>> tasks) {
         if (tasks.empty())
             throw std::invalid_argument("wait_any: empty task list");
-        if (tasks.size() == 1)
-            co_return co_await std::move(tasks[0]);
-
-        auto state = std::make_shared<detail::wait_any_state<T>>();
-        // 取消守卫 (见两路版注释)
-        struct _cancel_guard {
-            std::shared_ptr<detail::wait_any_state<T>>& s;
-            ~_cancel_guard() { s->abandon(); }
-        } _g{state};
-        auto owned_tasks = std::make_shared<std::vector<Task<T>>>(std::move(tasks));
-        for (size_t i = 0; i < owned_tasks->size(); i++) {
-            Task<void> m = detail::wait_any_n_monitor<T>(owned_tasks, i, state);
-            m.start();
-            m.detach();
-        }
-
-        co_await suspend_awaiter{[state](std::coroutine_handle<> h) { state->install(h, &EventLoop::get()); }};
-
-        if (state->exc)
-            std::rethrow_exception(state->exc);
-        co_return std::move(*state->result);
+        auto results = co_await wait_tasks(std::move(tasks), WaitMode::FirstCompleted);
+        co_return std::move(results.front());
     }
 
-    namespace detail {
-        template <typename T> struct gather_all_state {
-            mutable std::mutex mutex;
-            // optional 槽位避免要求 T 可默认构造；任务完成后再逐项 move 到结果。
-            std::vector<std::optional<T>> results;
-            size_t remaining = 0;
-            std::coroutine_handle<> cont;
-            EventLoop* cont_loop = nullptr;
-            std::exception_ptr exc;
-            bool cont_dead = false;
-
-            void install(std::coroutine_handle<> h, EventLoop* loop) {
-                std::lock_guard lock(mutex);
-                if (remaining == 0 || cont_dead)
-                    loop->schedule(h);
-                else {
-                    cont = h;
-                    cont_loop = loop;
-                }
-            }
-
-            void abandon() noexcept {
-                std::lock_guard lock(mutex);
-                cont_dead = true;
-                cont = nullptr;
-                cont_loop = nullptr;
-            }
-
-            void complete(size_t index, std::optional<T> value, std::exception_ptr error) {
-                std::coroutine_handle<> waiter;
-                EventLoop* loop = nullptr;
-                std::lock_guard lock(mutex);
-                if (error) {
-                    if (!exc)
-                        exc = std::move(error);
-                } else {
-                    results[index].emplace(std::move(*value));
-                }
-                if (--remaining == 0 && cont && !cont_dead) {
-                    waiter = cont;
-                    loop = cont_loop;
-                    cont = nullptr;
-                    cont_loop = nullptr;
-                    loop->schedule(waiter);
-                }
-            }
-
-            std::vector<T> take_results() {
-                std::lock_guard lock(mutex);
-                std::vector<T> out;
-                out.reserve(results.size());
-                for (auto& value : results)
-                    out.push_back(std::move(*value));
-                return out;
-            }
-        };
-
-        // gather_all 的 monitor 共享持有任务容器, 防止调用方取消后容器失效。
-        template <typename T>
-        Task<void> gather_all_monitor(size_t index, std::shared_ptr<std::vector<Task<T>>> tasks,
-                                      std::shared_ptr<gather_all_state<T>> state) {
-            std::optional<T> value;
-            std::exception_ptr error;
-            try {
-                value.emplace(co_await std::move((*tasks)[index]));
-            } catch (...) {
-                error = std::current_exception();
-            }
-            state->complete(index, std::move(value), std::move(error));
-        }
-    } // namespace detail
-
     // ============================================================================
-    // gather_all — 动态数量 gather
+    // gather_all — 动态数量 gather (wait_tasks 的薄适配, 不再维护独立状态机)
     // ============================================================================
     template <typename T>
     [[deprecated("use wait_tasks(..., coro::WaitMode::AllCompleted)")]] Task<std::vector<T>>
     gather_all(std::vector<Task<T>> tasks) {
-        if (tasks.empty())
-            co_return std::vector<T>{};
-
-        auto s = std::make_shared<detail::gather_all_state<T>>();
-        s->results.resize(tasks.size());
-        s->remaining = tasks.size();
-        auto owned_tasks = std::make_shared<std::vector<Task<T>>>(std::move(tasks));
-        // 取消守卫: 调用方帧被取消销毁时, 置 cont_dead 防止 monitor schedule 悬空句柄
-        struct _cancel_guard {
-            std::shared_ptr<detail::gather_all_state<T>>& s;
-            ~_cancel_guard() { s->abandon(); }
-        } _g{s};
-
-        // 每个 monitor 用命名协程函数 (参数进帧, 避免临时闭包悬空);
-        // start + detach: monitor 帧自持有运行到完成, 无需堆上 Task 对象
-        for (size_t i = 0; i < owned_tasks->size(); i++) {
-            Task<void> mon = detail::gather_all_monitor(i, owned_tasks, s);
-            mon.start();
-            mon.detach();
-        }
-
-        // 挂起调用方, 在 await_suspend 回调中设置 cont
-        co_await suspend_awaiter{[s](std::coroutine_handle<> h) { s->install(h, &EventLoop::get()); }};
-
-        if (s->exc)
-            std::rethrow_exception(s->exc);
-        co_return s->take_results();
+        co_return co_await wait_tasks(std::move(tasks), WaitMode::AllCompleted);
     }
 
     // ============================================================================
@@ -396,102 +195,16 @@ namespace coro {
     //
     // 与 gather 的区别: gather 返回 tuple<T...> 但 void 不能放入 tuple,
     //                 gather_void 专门处理 void task, 不返回结果。
+    //
+    // 已弃用: gather 的结果 tuple 中 void 位置是 std::monostate, 直接
+    // co_await gather(...) 并忽略返回值即可 —— 本入口只是它的薄委托,
+    // 不再维护第三套并发计数状态机。
     // ============================================================================
-
-    namespace detail {
-        // gather_void 的共享状态: 计数器 + 调用方句柄 + 第一个异常
-        struct gather_void_state {
-            mutable std::mutex mutex;
-            size_t count = 0;
-            std::coroutine_handle<> caller;
-            EventLoop* caller_loop = nullptr;
-            std::exception_ptr first_exception; // 第一个异常 (全部完成后重新抛出)
-            bool cont_dead = false;
-
-            void install(std::coroutine_handle<> h, EventLoop* loop) {
-                std::lock_guard lock(mutex);
-                if (count == 0 || cont_dead)
-                    loop->schedule(h);
-                else {
-                    caller = h;
-                    caller_loop = loop;
-                }
-            }
-
-            void abandon() noexcept {
-                std::lock_guard lock(mutex);
-                cont_dead = true;
-                caller = nullptr;
-                caller_loop = nullptr;
-            }
-
-            void complete(std::exception_ptr error) {
-                std::coroutine_handle<> waiter;
-                EventLoop* loop = nullptr;
-                std::lock_guard lock(mutex);
-                if (error && !first_exception)
-                    first_exception = std::move(error);
-                if (--count == 0 && caller && !cont_dead) {
-                    waiter = caller;
-                    loop = caller_loop;
-                    caller = nullptr;
-                    caller_loop = nullptr;
-                    loop->schedule(waiter);
-                }
-            }
-        };
-
-        // gather_void 的 monitor 共享持有 tuple, 防止调用方协程帧提前销毁。
-        template <typename Tuple, size_t I>
-        Task<void> gather_void_monitor(std::shared_ptr<Tuple> tasks, std::shared_ptr<gather_void_state> state) {
-            // 无论成败都计数 (防止异常路径死锁);
-            // 异常不吞: 记录第一个, 全部完成后由调用方重新抛出
-            std::exception_ptr error;
-            try {
-                co_await std::move(std::get<I>(*tasks));
-            } catch (...) {
-                error = std::current_exception();
-            }
-            state->complete(std::move(error));
-        }
-
-        template <typename... Ts> Task<void> gather_void_impl(std::tuple<Task<Ts>...> tasks) {
-            if constexpr (sizeof...(Ts) == 0) {
-                co_return;
-            }
-            auto state = std::make_shared<gather_void_state>();
-            state->count = sizeof...(Ts);
-            auto owned_tasks = std::make_shared<std::tuple<Task<Ts>...>>(std::move(tasks));
-            // 取消守卫: 调用方帧被取消销毁时, 置 cont_dead 防止 monitor schedule 悬空句柄
-            struct _cancel_guard {
-                std::shared_ptr<gather_void_state>& s;
-                ~_cancel_guard() { s->abandon(); }
-            } _g{state};
-
-            auto launch = [&]<size_t... Is>(std::index_sequence<Is...>) {
-                (([&] {
-                     using Tuple = std::tuple<Task<Ts>...>;
-                     Task<void> mon = gather_void_monitor<Tuple, Is>(owned_tasks, state);
-                     mon.start();
-                     mon.detach(); // monitor 帧自持有运行到完成
-                 }()),
-                 ...);
-            };
-            launch(std::index_sequence_for<Ts...>{});
-
-            // 挂起, 在 await_suspend 中设置 caller
-            co_await suspend_awaiter{[&state](std::coroutine_handle<> h) { state->install(h, &EventLoop::get()); }};
-
-            // 所有任务结束后: 传播第一个异常 (对标 asyncio.gather 语义)
-            if (state->first_exception)
-                std::rethrow_exception(state->first_exception);
-            co_return;
-        }
-    } // namespace detail
 
     template <typename... Ts>
     [[deprecated("use gather(...) and ignore its tuple result")]] Task<void> gather_void(Task<Ts>... tasks) {
-        return detail::gather_void_impl(std::make_tuple(std::move(tasks)...));
+        co_await gather(std::move(tasks)...);
+        co_return;
     }
 
     // ============================================================================
@@ -512,12 +225,6 @@ namespace coro {
     //
     // 实现与 gather_all 同构 (monitor 协程模式), 见 detail::wait_tasks_monitor。
     // ============================================================================
-
-    enum class WaitMode {
-        FirstCompleted,
-        FirstException,
-        AllCompleted,
-    };
 
     namespace detail {
         template <typename T> struct wait_tasks_state {

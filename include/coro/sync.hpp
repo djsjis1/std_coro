@@ -38,11 +38,18 @@ namespace coro {
         struct sync_waiter {
             std::coroutine_handle<> handle{};
             EventLoop* loop = nullptr;
+            /// 注册时从 loop 取得的等待身份; 0 = 未登记 (兼容旧路径)
+            uint64_t epoch = 0;
         };
 
-        /// 把等待者调度回它「家」的事件循环
+        /// 把等待者调度回它「家」的事件循环。
+        /// 带 epoch 时走 schedule_if_current: 旧通知不得唤醒帧的新一轮等待。
         inline void schedule_waiter(const sync_waiter& w) {
-            (w.loop ? w.loop : &EventLoop::get())->schedule(w.handle);
+            EventLoop* target = w.loop ? w.loop : &EventLoop::get();
+            if (w.epoch != 0)
+                target->schedule_if_current(w.handle, w.epoch);
+            else
+                target->schedule(w.handle);
         }
 
         /// 从等待队列摘除指定句柄 (协程帧销毁/被取消时的僵尸清理)。
@@ -83,32 +90,52 @@ namespace coro {
         Lock(const Lock&) = delete;
         Lock& operator=(const Lock&) = delete;
 
-        /// 获取锁。如果锁空闲则立即获取并设 locked_=true,
-        /// 否则挂起当前协程排队等待
-        bool await_ready() noexcept {
-            // 总是进入 await_suspend 以便获取协程句柄设置 owner
-            return false;
-        }
+        /// 获取锁的 awaiter。每个等待者持有独立的等待身份 (epoch),
+        /// 旧通知不得唤醒帧的新一轮等待。
+        struct acquire_awaiter {
+            Lock* lock;
+            std::coroutine_handle<> handle_{};
+            EventLoop* loop_ = nullptr;
+            uint64_t epoch_ = 0;
 
-        bool await_suspend(std::coroutine_handle<> h) {
-            std::lock_guard lk(mtx_);
-            // 重入检测: 如果当前协程已持有锁, 增加计数并立即恢复
-            if (owner_ == h.address()) {
-                ++recursion_count_;
-                return false; // 不挂起, 立即恢复
-            }
-            // 如果锁空闲, 获取锁并设置所有者
-            if (!locked_) {
-                locked_ = true;
-                owner_ = h.address();
-                return false; // 不挂起, 立即恢复
-            }
-            // 否则加入等待队列 (记录等待者的家 loop, 供跨线程唤醒路由)
-            waiters_.push_back({h, &EventLoop::get()});
-            return true;
-        }
+            explicit acquire_awaiter(Lock* l) noexcept : lock(l) {}
 
-        bool await_resume() const noexcept { return true; }
+            bool await_ready() const noexcept { return false; }
+
+            bool await_suspend(std::coroutine_handle<> h) {
+                handle_ = h;
+                loop_ = &EventLoop::get();
+                std::lock_guard lk(lock->mtx_);
+                // 重入检测: 如果当前协程已持有锁, 增加计数并立即恢复
+                if (lock->owner_ == h.address()) {
+                    ++lock->recursion_count_;
+                    return false; // 不挂起, 立即恢复
+                }
+                // 如果锁空闲, 获取锁并设置所有者
+                if (!lock->locked_) {
+                    lock->locked_ = true;
+                    lock->owner_ = h.address();
+                    return false; // 不挂起, 立即恢复
+                }
+                // 否则加入等待队列 (记录等待者的家 loop, 供跨线程唤醒路由)
+                epoch_ = loop_->begin_wait(h);
+                lock->waiters_.push_back({h, loop_, epoch_});
+                return true;
+            }
+
+            bool await_resume() noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(handle_, epoch_);
+                return true;
+            }
+
+            /// 取消/销毁: 结束等待登记并摘链; 已被点名移交则把锁传下去
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(h, epoch_);
+                lock->on_waiter_destroyed(h);
+            }
+        };
 
         /// 释放锁。如果有等待者, 直接将锁移交给队首等待者 (locked_ 保持 true)
         /// 如果没有等待者, 设 locked_=false
@@ -132,8 +159,8 @@ namespace coro {
                 detail::schedule_waiter(next);
         }
 
-        /// 获取锁 (返回自身引用供 co_await 使用)
-        Lock& acquire() { return *this; }
+        /// 获取锁 (返回按值的 awaiter —— 等待身份不能存在共享的 Lock 对象上)
+        acquire_awaiter acquire() { return acquire_awaiter{this}; }
 
         /// 等待者协程帧被销毁时, 从等待队列摘除僵尸句柄
         /// (否则 release 时 schedule 已销毁的帧 → UB)
@@ -156,10 +183,20 @@ namespace coro {
         /// 时移交。被通知者被唤醒时即已持有锁, 无需再经历一次 acquire 往返 ——
         /// 这正是经典 condition_variable 的实现技巧 (notify 把等待者移到
         /// 互斥量队列), 也是 "wait() 返回时重新持有锁" 语义的落地方式。
+        ///
+        /// 死亡等待者防御: notify 摘链与这里移交之间, 等待者可能恰好被取消
+        /// 销毁 (跨线程场景)。若把锁移交给死帧或把死帧入队, 锁会永久滞留
+        /// (无 UB 的死锁)。持 mtx_ 复核等待 epoch: 已注销说明对方收尾已跑
+        /// 或正在跑 —— 收尾若看到 owner==自己 会自己传锁; 复核失败则直接
+        /// 丢弃本次移交 (与"等待者被取消"语义一致)。
+        /// 注: 复核在持 mtx_ 时取 loop 的 queue_mutex_, 库内不存在
+        /// queue_mutex_ → mtx_ 的反向嵌套, 无死锁风险。
         void hand_off(detail::sync_waiter w) {
             bool direct = false;
             {
                 std::lock_guard lk(mtx_);
+                if (!w.loop || !w.loop->is_wait_current(w.handle, w.epoch))
+                    return; // 等待者已死: 不得点名、不得入队
                 if (!locked_) {
                     locked_ = true;
                     owner_ = w.handle.address();
@@ -170,6 +207,8 @@ namespace coro {
             }
             if (direct)
                 detail::schedule_waiter(w);
+            // direct 路径调度未落地 (false): 等待者恰在此刻死亡, 其收尾路径
+            // (Lock::on_waiter_destroyed) 会看到 owner==自己 并把锁传下去。
         }
 
         // ==================================================================
@@ -200,6 +239,8 @@ namespace coro {
         struct guard_awaiter {
             Lock* lock;
             std::coroutine_handle<> my_handle{}; // 获取者身份 (Guard 校验用)
+            EventLoop* loop_ = nullptr;
+            uint64_t epoch_ = 0;
 
             bool await_ready() noexcept {
                 // 总是进入 await_suspend 以便获取协程句柄设置 owner
@@ -207,6 +248,7 @@ namespace coro {
             }
             bool await_suspend(std::coroutine_handle<> h) {
                 my_handle = h;
+                loop_ = &EventLoop::get();
                 std::lock_guard lk(lock->mtx_);
                 if (lock->owner_ == h.address()) {
                     ++lock->recursion_count_;
@@ -217,13 +259,22 @@ namespace coro {
                     lock->owner_ = h.address();
                     return false;
                 }
-                lock->waiters_.push_back({h, &EventLoop::get()});
+                epoch_ = loop_->begin_wait(h);
+                lock->waiters_.push_back({h, loop_, epoch_});
                 return true;
             }
-            Guard await_resume() noexcept { return Guard{lock, my_handle.address()}; }
+            Guard await_resume() noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(my_handle, epoch_);
+                return Guard{lock, my_handle.address()};
+            }
 
-            /// 挂起期间被取消/销毁: 摘链 + 若已被点名移交则把锁传下去 (同 Lock)
-            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept { lock->on_waiter_destroyed(h); }
+            /// 挂起期间被取消/销毁: 结束等待登记 + 摘链 + 若已被点名移交则把锁传下去
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(h, epoch_);
+                lock->on_waiter_destroyed(h);
+            }
         };
 
         guard_awaiter guard() noexcept { return {this}; }
@@ -231,6 +282,22 @@ namespace coro {
         bool is_locked() const noexcept {
             std::lock_guard lk(mtx_);
             return locked_;
+        }
+
+        /// 某个协程帧当前是否持有本锁 (Condition 取消收尾路径使用)
+        bool is_owned_by(const void* frame) const noexcept {
+            std::lock_guard lk(mtx_);
+            return owner_ == frame;
+        }
+
+        /// 指定句柄是否已在锁等待队列里 (幂等性检查, 避免重复入队)
+        bool has_waiter(std::coroutine_handle<> h) const noexcept {
+            std::lock_guard lk(mtx_);
+            for (const auto& w : waiters_) {
+                if (w.handle == h)
+                    return true;
+            }
+            return false;
         }
 
       private:
@@ -304,12 +371,13 @@ namespace coro {
         Semaphore(const Semaphore&) = delete;
         Semaphore& operator=(const Semaphore&) = delete;
 
-        /// 获取许可的 awaiter 基础: 句柄 + 预留标记 + 家 loop。
+        /// 获取许可的 awaiter 基础: 句柄 + 预留标记 + 家 loop + 等待 epoch。
         /// acquire 与 guard 两种等待者共用同一队列, 因此抽出公共基类。
         struct waiter {
             std::coroutine_handle<> h{};
             EventLoop* loop = nullptr; // 挂起时所在的事件循环 (跨线程唤醒路由)
             bool reserved = false;     // 许可已被点名交给我 (取消时必须传下去)
+            uint64_t epoch = 0;        // 本次等待的身份 (旧通知不得唤醒新等待)
         };
 
         struct acquire_awaiter : waiter {
@@ -337,14 +405,23 @@ namespace coro {
                 }
                 this->h = h;
                 this->loop = &EventLoop::get();
+                this->epoch = this->loop->begin_wait(h);
                 sem->waiters_.push_back(this);
                 return true;
             }
 
-            bool await_resume() noexcept { return true; }
+            bool await_resume() noexcept {
+                if (loop && epoch != 0)
+                    loop->end_wait(h, epoch);
+                return true;
+            }
 
             /// 取消/销毁路径: 摘链; 已被点名的许可传给下一位
-            void on_waiter_destroyed(std::coroutine_handle<>) noexcept { sem->remove_waiter(this); }
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
+                if (loop && epoch != 0)
+                    loop->end_wait(h, epoch);
+                sem->remove_waiter(this);
+            }
         };
 
         /// 获取许可。如果有可用许可, await_ready 返回 true 立即通过;
@@ -353,19 +430,30 @@ namespace coro {
 
         /// 释放许可 (可从任意线程调用, 唤醒路由回等待者的家 loop)
         void release() {
-            waiter* w = nullptr;
+            // 通知信息必须在锁内拷出: waiter 节点住在等待者协程帧里,
+            // 解锁后再读 w->h/w->loop, 对方可能已经被取消并销毁了帧 (具体的
+            // 悬空读取窗口)。节点身份仍用裸指针做“我已点名”的记录, 但
+            // 读取它的字段只在持锁时进行。
+            std::coroutine_handle<> target{};
+            EventLoop* target_loop = nullptr;
+            uint64_t target_epoch = 0;
             {
                 std::lock_guard lk(mtx_);
                 if (!waiters_.empty()) {
-                    w = waiters_.front();
+                    waiter* w = waiters_.front();
                     waiters_.pop_front();
                     w->reserved = true; // 许可直接移交给它 (permits_ 保持 0)
+                    target = w->h;
+                    target_loop = w->loop;
+                    target_epoch = w->epoch;
                 } else {
                     ++permits_;
                 }
             }
-            if (w)
-                detail::schedule_waiter({w->h, w->loop});
+            // 用注册时拿到的 epoch 投递: 若等待者已被取消并开始了新等待,
+            // 这次迟到通知会被丢弃, 不会提前唤醒它。
+            if (target && target_loop)
+                target_loop->schedule_if_current(target, target_epoch);
         }
 
         /// 等待者被取消/销毁时的收尾 (按身份精确处理, 与 Queue 相同)
@@ -422,13 +510,22 @@ namespace coro {
                 }
                 this->h = h;
                 this->loop = &EventLoop::get();
+                this->epoch = this->loop->begin_wait(h);
                 sem->waiters_.push_back(this);
                 return true;
             }
-            Guard await_resume() noexcept { return Guard{sem}; }
+            Guard await_resume() noexcept {
+                if (loop && epoch != 0)
+                    loop->end_wait(h, epoch);
+                return Guard{sem};
+            }
 
             /// 同 acquire_awaiter: 摘链 + 预留许可的传递
-            void on_waiter_destroyed(std::coroutine_handle<>) noexcept { sem->remove_waiter(this); }
+            void on_waiter_destroyed(std::coroutine_handle<>) noexcept {
+                if (loop && epoch != 0)
+                    loop->end_wait(h, epoch);
+                sem->remove_waiter(this);
+            }
         };
 
         guard_awaiter guard() noexcept { return guard_awaiter{this}; }
@@ -468,28 +565,49 @@ namespace coro {
         Event(const Event&) = delete;
         Event& operator=(const Event&) = delete;
 
-        /// 等待事件被 set()
-        bool await_ready() const noexcept { return set_.load(std::memory_order_acquire); }
+        /// 一次等待的 awaiter。按值返回 (而不是把 Event 自己当 awaiter),
+        /// 因为每个等待者需要独立的 epoch: 旧通知不得唤醒同一个 Event
+        /// 上的新一次等待。
+        class wait_awaiter {
+          public:
+            explicit wait_awaiter(Event& ev) noexcept : ev_(&ev) {}
 
-        bool await_suspend(std::coroutine_handle<> h) {
-            std::lock_guard lk(mtx_);
-            // await_ready() 看到 false 后, 其他线程可能已经 set() 并清空了
-            // 当时的等待队列。锁内二次检查防止本协程随后入队而永远漏唤醒。
-            if (set_.load(std::memory_order_acquire))
-                return false;
-            waiters_.push_back({h, &EventLoop::get()});
-            return true;
-        }
+            bool await_ready() const noexcept { return ev_->is_set(); }
 
-        void await_resume() const noexcept {}
+            bool await_suspend(std::coroutine_handle<> h) {
+                h_ = h;
+                loop_ = &EventLoop::get();
+                epoch_ = loop_->begin_wait(h);
+                std::lock_guard lk(ev_->mtx_);
+                // await_ready() 看到 false 后, 其他线程可能已经 set() 并清空了
+                // 当时的等待队列。锁内二次检查防止本协程随后入队而永远漏唤醒。
+                if (ev_->set_.load(std::memory_order_acquire))
+                    return false;
+                ev_->waiters_.push_back(detail::sync_waiter{h, loop_, epoch_});
+                return true;
+            }
 
-        Event& wait() { return *this; }
+            void await_resume() const noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(h_, epoch_);
+            }
 
-        /// 等待者协程帧被销毁时, 从等待队列摘除僵尸句柄
-        void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
-            std::lock_guard lk(mtx_);
-            detail::erase_waiter(waiters_, h);
-        }
+            /// 等待者协程帧被销毁: 从队列摘除, 并结束本次等待登记。
+            void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(h_, epoch_);
+                std::lock_guard lk(ev_->mtx_);
+                detail::erase_waiter(ev_->waiters_, h);
+            }
+
+          private:
+            Event* ev_;
+            std::coroutine_handle<> h_{};
+            EventLoop* loop_ = nullptr;
+            uint64_t epoch_ = 0;
+        };
+
+        wait_awaiter wait() { return wait_awaiter{*this}; }
 
         /// 触发事件: 唤醒所有等待者 (路由回各自的家 loop)
         void set() {
@@ -502,7 +620,9 @@ namespace coro {
             while (!to_wake.empty()) {
                 auto w = to_wake.front();
                 to_wake.pop_front();
-                detail::schedule_waiter(w);
+                // 带 epoch 投递: 已取消并开始新等待的帧不会被这次唤醒提前恢复。
+                if (w.loop != nullptr)
+                    w.loop->schedule_if_current(w.handle, w.epoch);
             }
         }
 
@@ -565,28 +685,64 @@ namespace coro {
 
         struct wait_awaiter {
             Condition* cond;
+            std::coroutine_handle<> handle_{};
+            EventLoop* loop_ = nullptr;
+            uint64_t epoch_ = 0;
 
             explicit wait_awaiter(Condition* c) noexcept : cond(c) {}
 
             bool await_ready() const noexcept { return false; }
 
             void await_suspend(std::coroutine_handle<> h) {
+                handle_ = h;
+                loop_ = &EventLoop::get();
+                epoch_ = loop_->begin_wait(h);
                 // 排队 + 释放锁 (原子于事件循环单线程: await_suspend 完成后
                 // 控制权才回到事件循环, 通知方不会插队)
                 {
                     std::lock_guard lk(cond->mtx_);
-                    cond->waiters_.push_back({h, &EventLoop::get()});
+                    cond->waiters_.push_back({h, loop_, epoch_});
                 }
                 cond->lock_->release();
             }
 
-            void await_resume() const noexcept {} // 被唤醒时锁已被移交给本协程
+            /// 被唤醒时锁已被移交给本协程; 结束本次等待登记。
+            void await_resume() noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(handle_, epoch_);
+            }
+
+            /// 取消收尾: **先重新取得锁, 再让取消传播** (对标 asyncio.Condition)。
+            /// 否则调用方在 catch(CancelledError) 里会误以为仍处于临界区,
+            /// 而实际锁已经交还 —— 互斥不变量被默默破坏。
+            /// 返回 true 表示接管: 帧保持挂起, 等到锁到手后再恢复;
+            /// 恢复时包装层抛 CancelledError, 作用域内 Guard 析构正常释放锁。
+            bool on_cancel_requested() {
+                // 1) 还没被 notify: 先从 condition 队列摘链
+                {
+                    std::lock_guard lk(cond->mtx_);
+                    detail::erase_waiter(cond->waiters_, handle_);
+                }
+                // 2) 已经持有锁 (notify 直接移交) 或已在锁队列: 确保会被唤醒即可
+                if (cond->lock_->is_owned_by(handle_.address())) {
+                    if (loop_)
+                        loop_->schedule_if_current(handle_, epoch_);
+                    return true;
+                }
+                if (!cond->lock_->has_waiter(handle_))
+                    cond->lock_->hand_off({handle_, loop_, epoch_});
+                // hand_off 会直接移交并调度, 或排在持有者之后由 release() 移交; 
+                // 两种路径都在锁到手之后才会恢复本帧。
+                return true;
+            }
 
             /// 等待者协程被取消/销毁: 从 condition 队列和锁队列两边都尝试
             /// 摘除 (摘除不存在的句柄是无操作 —— 等待者可能尚未被 notify
             /// 转移, 也可能已转移)。若锁已被点名移交给自己,
             /// Lock::on_waiter_destroyed 会把锁继续传下去 (不泄漏)。
             void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
+                if (loop_ && epoch_ != 0)
+                    loop_->end_wait(h, epoch_);
                 {
                     std::lock_guard lk(cond->mtx_);
                     detail::erase_waiter(cond->waiters_, h);

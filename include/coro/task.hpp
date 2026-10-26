@@ -204,6 +204,15 @@ namespace coro {
             T, std::void_t<decltype(std::declval<T&>().on_waiter_destroyed(std::declval<std::coroutine_handle<>>()))>>
             : std::true_type {};
 
+        // 检测 awaiter 是否能“延后取消”: 提供 on_cancel_requested() 的等待者
+        // 会在 Task::cancel() 时先做清理 (如取消子任务并等待它们退出), 帧保持着
+        // 挂起, 直到清理完成后再由 await_resume 抛 CancelledError。
+        // 这是结构化收尾 (TaskGroup::wait) 的核心: 取消不得跳过 join 屏障。
+        template <typename T, typename = void> struct has_on_cancel_requested : std::false_type {};
+        template <typename T>
+        struct has_on_cancel_requested<T, std::void_t<decltype(std::declval<T&>().on_cancel_requested())>>
+            : std::true_type {};
+
         template <typename T> void notify_waiter_destroyed(T& inner, std::coroutine_handle<> h) {
             if constexpr (has_on_waiter_destroyed<T>::value)
                 inner.on_waiter_destroyed(h);
@@ -249,6 +258,16 @@ namespace coro {
             cancel_check_awaiter(stored_t a, Promise* p, const std::atomic<bool>* flag)
                 : inner(std::forward<Awaiter>(a)), promise(p), cancel_flag(flag) {}
 
+            // 自定义析构会隐式抑制移动构造, 而包装对象是按值返回的:
+            // 内层 awaiter 一旦不可拷贝 (如 channel 携带 unique_ptr 的发送), 就编不过。
+            // 移动时把 my_handle 交出去, 避免源对象析构重复通知。
+            cancel_check_awaiter(cancel_check_awaiter&& other) noexcept
+                : inner(std::forward<Awaiter>(other.inner)), promise(other.promise), cancel_flag(other.cancel_flag),
+                  my_handle(std::exchange(other.my_handle, std::coroutine_handle<>{})) {}
+            cancel_check_awaiter(const cancel_check_awaiter&) = delete;
+            cancel_check_awaiter& operator=(const cancel_check_awaiter&) = delete;
+            cancel_check_awaiter& operator=(cancel_check_awaiter&&) = delete;
+
             ~cancel_check_awaiter() {
                 // 注意: 不清除 cancel_hook_ / cancel_hook_self_。
                 // 钩子在 await_suspend 时被下一次 I/O 覆盖, 或随帧销毁失效。
@@ -286,7 +305,16 @@ namespace coro {
                     promise->cancel_hook_self_ = &inner;
                     promise->pending_io_ = true; // 标记有挂起的底层 I/O 可被取消
                 }
-                using inner_result_t = decltype(inner.await_suspend(h));
+                if constexpr (has_on_cancel_requested<inner_t>::value) {
+                    // 告诉 Task::cancel(): 本次等待可以延后取消。
+                    // 钩子返回 true 表“已接管”, cancel() 不得再唤醒帧。
+                    promise->defer_cancel_self_ = &inner;
+                    promise->defer_cancel_hook_ = [](void* self) -> bool {
+                        return static_cast<inner_t*>(self)->on_cancel_requested();
+                    };
+                }
+            using inner_result_t = decltype(inner.await_suspend(h));
+            try {
                 if constexpr (std::is_void_v<inner_result_t>) {
                     inner.await_suspend(h);
                     // void: 总是挂起 (无需传播)
@@ -314,6 +342,21 @@ namespace coro {
                     }
                     return transfer_to;
                 }
+            } catch (...) {
+                // 内层 await_suspend 抛出 (如等待队列 push 失败 / Task 误用防护):
+                // 挂起未成立, 本包装对象与 inner 都将随全表达式销毁。
+                // 必须复位本帧的挂起/IO 状态与钩子 —— 它们指向的 inner 即将失效,
+                // 留着会让后续 Task::cancel()/析构 调用悬空函数指针 (UB)。
+                // my_handle 保持非空: 析构时 notify_waiter_destroyed 照常执行,
+                // inner 若已把自己登记进等待队列, 借此摘除僵尸句柄。
+                promise->suspended_ = false;
+                promise->pending_io_ = false;
+                promise->defer_cancel_self_ = nullptr;
+                promise->defer_cancel_hook_ = nullptr;
+                promise->cancel_hook_ = nullptr;
+                promise->cancel_hook_self_ = nullptr;
+                throw;
+            }
             }
 
             decltype(auto) await_resume() {
@@ -324,12 +367,22 @@ namespace coro {
                 promise->suspended_ = false;
                 // 底层 I/O 已完成: cancel() 不再需要取消它
                 promise->pending_io_ = false;
+                // 本次等待已结束: 不再接管后续取消请求
+                promise->defer_cancel_self_ = nullptr;
+                promise->defer_cancel_hook_ = nullptr;
                 // 取消注入点: 恢复时若已被取消, 抛 CancelledError
                 // (不执行 inner.await_resume, 底层结果直接丢弃 — Python 语义)
                 // 注入后立即清除标志: 取消只注入一次。若协程体 catch 了
                 // CancelledError (取消保护/清理), 任务可以正常完成。
                 if (cancel_flag->load(std::memory_order_acquire)) {
                     promise->cancelled_.store(false, std::memory_order_release);
+                    if constexpr (has_on_cancel_requested<inner_t>::value) {
+                        // 可延后取消的等待者已经把清理做完了: 先让它报出业务结果
+                        // (例如 ExceptionGroup), 再传播取消。inner 抛出的异常直接
+                        // 替代 CancelledError —— join 屏障的业务结局优先于取消本身。
+                        my_handle = nullptr;
+                        (void)inner.await_resume();
+                    }
                     throw CancelledError{};
                 }
                 my_handle = nullptr; // 正常恢复: 析构时无需再清理等待队列
@@ -398,8 +451,11 @@ namespace coro {
             // ---- 以下方法由 final_awaiter 调用 ----
 
             /// 将结果从 promise 的 variant 移到 Task 的 optional
-            /// 必须在协程帧销毁前调用
-            void store_result() {
+            /// 必须在协程帧销毁前调用。
+            /// 该函数在 final_suspend 的 noexcept 路径上调用: T 的移动构造可以抛出
+            /// (不是 nothrow-movable), 用户安装的异常报告回调也可能抛出。任何抛出
+            /// 逃出去都会 terminate 进程, 因此这里自己兜住并转为异常结果。
+            void store_result() noexcept {
                 if (task_) {
                     // 如果被取消了, 设置 CancelledError 异常
                     if (cancelled_.load(std::memory_order_acquire)) {
@@ -407,7 +463,13 @@ namespace coro {
                     }
                     // 如果 variant 的 index 为 1 (存储了 T), 移动结果
                     else if (result_.index() == 1) {
-                        task_->result_.emplace(std::move(std::get<1>(result_)));
+                        try {
+                            task_->result_.emplace(std::move(std::get<1>(result_)));
+                        } catch (...) {
+                            // 结果移交失败: 把异常当成该任务的结局, 仍然完成下面
+                            // 的清句柄/登记/continuation (不能半途终止)
+                            task_->exception_ = std::current_exception();
+                        }
                     }
                     // 如果有异常, 也传递过去
                     if (exception_) {
@@ -417,7 +479,12 @@ namespace coro {
                 } else if (exception_) {
                     // detach 的任务: 异常无处可去, 交给全局回调报告
                     // (对标 Python 的 "Task exception was never retrieved")
-                    detail::detached_exception_handler()(exception_);
+                    // 回调是用户可替换的 std::function, 不得让其异常逃出 noexcept
+                    try {
+                        detail::detached_exception_handler()(exception_);
+                    } catch (...) {
+                        std::fprintf(stderr, "[coro] detached exception handler threw; original exception dropped\n");
+                    }
                 }
             }
 
@@ -481,6 +548,12 @@ namespace coro {
             // 仅事件循环线程访问 (cancel 由事件循环线程发起)。
             void (*cancel_hook_)(void*) = nullptr;
             void* cancel_hook_self_ = nullptr;
+
+            // ---- 可延后取消的等待 (由 wrapper 注册) ----
+            // 非空表示当前 wait 接管了取消: Task::cancel() 调用钩子后
+            // 不再唤醒帧, 由该等待在完成自身清理后自然恢复。
+            bool (*defer_cancel_hook_)(void*) = nullptr;
+            void* defer_cancel_self_ = nullptr;
         };
 
         // ==================================================================
@@ -698,6 +771,15 @@ namespace coro {
                     // 不直接 schedule: 必须等完成包先消费 OVERLAPPED,
                     // 协程帧销毁才是安全的。
                     p.cancel_hook_(p.cancel_hook_self_);
+                } else if (p.defer_cancel_self_ && p.defer_cancel_hook_) {
+                    // 当前等待接管了取消 (如 TaskGroup 的 join 屏障):
+                    // 只请它开始清理, 不唤醒帧 —— 帧必须在子任务全部退出后才恢复。
+                    if (p.defer_cancel_hook_(p.defer_cancel_self_))
+                        return;
+                    // 钩子返回 false 说明本次无法延后 (例如尚未开始等待),
+                    // 退回普通的强制唤醒路径。
+                    EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();
+                    loop.schedule(handle_);
                 } else if (p.suspended_) {
                     // 挂起在时间/同步/任务等待上: 强制唤醒,
                     // 协程恢复时在 await_resume 处抛出 CancelledError。
@@ -779,7 +861,7 @@ namespace coro {
             /// co_return; 或协程体自然结束 → 调用 return_void()
             void return_void() noexcept {}
 
-            void store_result() {
+            void store_result() noexcept {
                 if (task_) {
                     // 如果被取消了, 设置 CancelledError 异常
                     if (cancelled_.load(std::memory_order_acquire)) {
@@ -790,7 +872,11 @@ namespace coro {
                     task_->ready_ = true;
                 } else if (exception_) {
                     // detach 的任务: 异常无处可去, 交给全局回调报告
-                    detail::detached_exception_handler()(exception_);
+                    try {
+                        detail::detached_exception_handler()(exception_);
+                    } catch (...) {
+                        std::fprintf(stderr, "[coro] detached exception handler threw; original exception dropped\n");
+                    }
                 }
             }
 
@@ -808,6 +894,9 @@ namespace coro {
             std::atomic<bool> cancelled_ = false; // atomic: cancel 可跨线程 (Scheduler 场景)
             bool suspended_ = false;              // 挂起标记 (同 Task<T>)
             bool pending_io_ = false;             // 底层 I/O 挂起标记 (同 Task<T>)
+            // 可延后取消的等待 (同 Task<T>): 非空表示当前 wait 接管了取消请求
+            bool (*defer_cancel_hook_)(void*) = nullptr;
+            void* defer_cancel_self_ = nullptr;
             EventLoop* target_loop_ = nullptr;    // 目标事件循环 (同 Task<T>)
 
             // 取消钩子: 同 Task<T>::promise_type
@@ -939,6 +1028,12 @@ namespace coro {
                     // 挂起在网络 I/O 上: 取消底层 I/O, 由完成包唤醒
                     // pending_io_ 确保钩子在 I/O 完成后不再被调用
                     p.cancel_hook_(p.cancel_hook_self_);
+                } else if (p.defer_cancel_self_ && p.defer_cancel_hook_) {
+                    // 同 Task<T>: 本等待接管取消 (如 join 屏障), 不唤醒帧
+                    if (p.defer_cancel_hook_(p.defer_cancel_self_))
+                        return;
+                    EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();
+                    loop.schedule(handle_);
                 } else if (p.suspended_) {
                     // 挂起中: 强制唤醒 — 调度到目标 loop (而非调用者线程的 loop)
                     EventLoop& loop = p.target_loop_ ? *p.target_loop_ : EventLoop::get();

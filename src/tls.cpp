@@ -179,12 +179,24 @@ namespace coro::tls {
             throw TlsError("SSL_set_app_data failed", ERR_get_error());
         if (impl_->role == TlsContext::role::client) {
             SSL_set_connect_state(impl_->ssl);
-            if (context.hostname_verification_ && SSL_set1_host(impl_->ssl, hostname.c_str()) != 1)
-                throw TlsError("SSL_set1_host failed", ERR_get_error());
-            if (!hostname.empty()) {
+            bool host_is_ip = false;
+            if (context.hostname_verification_) {
+                if (auto* ip = a2i_IPADDRESS(hostname.c_str())) {
+                    // IP 主机名: SSL_set1_host 走 DNS ID 校验, 永远不匹配
+                    // iPAddress SAN —— 合法的 https://<IPv4>/ 证书也会握手失败。
+                    // IP 必须用 X509_VERIFY_PARAM_set1_ip_asc 写入期望地址。
+                    ASN1_OCTET_STRING_free(ip);
+                    host_is_ip = true;
+                    if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(impl_->ssl), hostname.c_str()) != 1)
+                        throw TlsError("cannot set expected peer IP address", ERR_get_error());
+                } else if (SSL_set1_host(impl_->ssl, hostname.c_str()) != 1) {
+                    throw TlsError("SSL_set1_host failed", ERR_get_error());
+                }
+            }
+            if (!hostname.empty() && !host_is_ip) {
                 auto* ip = a2i_IPADDRESS(hostname.c_str());
                 if (ip)
-                    ASN1_OCTET_STRING_free(ip);
+                    ASN1_OCTET_STRING_free(ip); // IP 不发 SNI (RFC 6066: 字面 IP 禁止)
                 else {
                     ERR_clear_error(); // 非 IP 是普通 DNS 主机名, 清理解析探测的错误。
                     if (SSL_set_tlsext_host_name(impl_->ssl, hostname.c_str()) != 1)

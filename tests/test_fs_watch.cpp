@@ -161,7 +161,7 @@ TEST(FsWatchTest, RecursiveTracksExistingRenamedAndNewDirectories) {
 #ifdef _WIN32
 TEST(FsWatchTest, TerminalErrorIsRetainedAcrossNextAndMove) {
     coro::fs::DirectoryWatcher watcher;
-    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}};
     aw.op.error = ERROR_ACCESS_DENIED;
     aw.await_resume();
     EXPECT_FALSE(watcher.valid());
@@ -179,7 +179,7 @@ TEST(FsWatchTest, TerminalErrorIsRetainedAcrossNextAndMove) {
 
 TEST(FsWatchTest, ZeroByteCompletionIsRecoverableOverflow) {
     coro::fs::DirectoryWatcher watcher;
-    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}};
     aw.await_resume();
     auto next = watcher.next();
     next.start();
@@ -190,7 +190,7 @@ TEST(FsWatchTest, ZeroByteCompletionIsRecoverableOverflow) {
 
 TEST(FsWatchTest, MalformedRecordsStopWatcher) {
     coro::fs::DirectoryWatcher watcher;
-    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}, {}};
+    coro::fs::DirectoryWatcher::changes_awaiter aw{&watcher, {}};
     aw.op.transferred = 1; // 连固定记录头都不完整
     aw.await_resume();
     EXPECT_EQ(watcher.error(), ERROR_INVALID_DATA);

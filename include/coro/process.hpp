@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -120,7 +121,9 @@ namespace coro {
             Process& operator=(const Process&) = delete;
 
             bool valid() const { return proc_ != nullptr; }
-            int pid() const { return (int)(uintptr_t)proc_; }
+            /// 真实进程 ID (不是句柄值):
+            /// 旧实现把 HANDLE 截断成 int 当 PID 返回, 与子进程自报的 PID 完全不同。
+            int pid() const { return (int)pid_; }
 
             pipe::PipeEnd* stdin_pipe() { return stdin_ ? &*stdin_ : nullptr; }
             pipe::PipeEnd* stdout_pipe() { return stdout_ ? &*stdout_ : nullptr; }
@@ -158,6 +161,7 @@ namespace coro {
                     CloseHandle(proc_);
                     proc_ = nullptr;
                 }
+                pid_ = 0;
                 stdin_.reset();
                 stdout_.reset();
                 stderr_.reset();
@@ -165,6 +169,7 @@ namespace coro {
 
             void move_from(Process&& o) {
                 proc_ = std::exchange(o.proc_, nullptr);
+                pid_ = std::exchange(o.pid_, 0u);
                 wait_registration_ = std::exchange(o.wait_registration_, nullptr);
                 wait_context_ = std::move(o.wait_context_);
                 stdin_ = std::move(o.stdin_);
@@ -174,6 +179,7 @@ namespace coro {
             }
 
             HANDLE proc_ = nullptr;
+            DWORD pid_ = 0; // 真实进程 ID (dwProcessId)
             HANDLE wait_registration_ = nullptr;
             std::shared_ptr<detail_proc::wait_context> wait_context_;
             std::optional<pipe::PipeEnd> stdin_, stdout_, stderr_;
@@ -231,7 +237,14 @@ namespace coro {
                     return false;
                 }
                 *parent_side = pipe::PipeEnd(server); // 关联当前 loop 的 IOCP
-                *child_side = client;                 // 子进程继承
+                // IOCP 关联失败时 PipeEnd 构造已关服务端句柄并记录错误码;
+                // 子端句柄这里补关。无条件 return true 会把坏管道交给子进程
+                // (stdio 立即 EOF) 且丢失错误码 —— spawn 静默产出坏结果。
+                if (!parent_side->has_value() || !(*parent_side)->valid()) {
+                    CloseHandle(client);
+                    return false;
+                }
+                *child_side = client; // 子进程继承
                 return true;
             };
 
@@ -314,6 +327,8 @@ namespace coro {
             PROCESS_INFORMATION pi{};
             BOOL ok = CreateProcessW(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT,
                                      nullptr, nullptr, &si.StartupInfo, &pi);
+            // 错误码必须紧跟在 CreateProcessW 之后快照: 后面的清理调用会覆盖 GetLastError
+            const int create_error = ok ? 0 : (int)GetLastError();
             DeleteProcThreadAttributeList(si.lpAttributeList);
             for (HANDLE h : {child_stdin, child_stdout, child_stderr})
                 if (h != INVALID_HANDLE_VALUE && h != fallback)
@@ -322,11 +337,12 @@ namespace coro {
                 CloseHandle(fallback);
 
             if (!ok) {
-                io::set_error((int)GetLastError());
+                io::set_error(create_error);
                 co_return Process{};
             }
             CloseHandle(pi.hThread); // 只留进程句柄
             out.proc_ = pi.hProcess;
+            out.pid_ = pi.dwProcessId;
 
             // ---- 退出通知: 系统线程池等进程句柄 → Promise 跨线程路由 ----
             auto state = std::make_shared<Promise<int>>();
@@ -372,8 +388,23 @@ namespace coro {
             Process() = default;
             ~Process() = default;
 
-            Process(Process&&) noexcept = default;
-            Process& operator=(Process&&) noexcept = default;
+            /// 移出对象必须失去控制权: 旧实现用默认移动 (只复制 pid_),
+            /// 于是 moved-from 仍 valid(), terminate/kill 还会作用于原子进程。
+            Process(Process&& other) noexcept
+                : pid_(std::exchange(other.pid_, -1)), stdin_(std::move(other.stdin_)),
+                  stdout_(std::move(other.stdout_)), stderr_(std::move(other.stderr_)),
+                  exit_future_(std::move(other.exit_future_)) {}
+
+            Process& operator=(Process&& other) noexcept {
+                if (this != &other) {
+                    pid_ = std::exchange(other.pid_, -1);
+                    stdin_ = std::move(other.stdin_);
+                    stdout_ = std::move(other.stdout_);
+                    stderr_ = std::move(other.stderr_);
+                    exit_future_ = std::move(other.exit_future_);
+                }
+                return *this;
+            }
             Process(const Process&) = delete;
             Process& operator=(const Process&) = delete;
 
@@ -417,10 +448,13 @@ namespace coro {
             }
 
             int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+            // 子进程侧必须保持阻塞 stdio: 普通程序不处理 EAGAIN,
+            // 把 NONBLOCK 一起继承下去会让大输出出现短写/失败。
+            // 因此管道先只带 CLOEXEC, 之后只给父端加 O_NONBLOCK。
             auto mk = [&](bool capture, int* fds) -> bool {
                 if (!capture)
                     return true;
-                if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+                if (pipe2(fds, O_CLOEXEC) != 0) {
                     io::set_error(errno);
                     return false;
                 }
@@ -481,17 +515,25 @@ namespace coro {
 
             ::close(exec_status[1]);
 
-            // 父进程: 关子进程侧, 持父进程侧
+            // 父进程: 关子进程侧, 持父进程侧 (父端非阻塞, 子端保持阻塞)
+            auto set_nonblock = [](int fd) {
+                const int flags = ::fcntl(fd, F_GETFL, 0);
+                if (flags >= 0)
+                    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            };
             if (opt.capture_stdin) {
                 ::close(in_pipe[0]);
+                set_nonblock(in_pipe[1]);
                 out.stdin_.emplace(in_pipe[1]);
             }
             if (opt.capture_stdout) {
                 ::close(out_pipe[1]);
+                set_nonblock(out_pipe[0]);
                 out.stdout_.emplace(out_pipe[0]);
             }
             if (opt.capture_stderr) {
                 ::close(err_pipe[1]);
+                set_nonblock(err_pipe[0]);
                 out.stderr_.emplace(err_pipe[0]);
             }
 
@@ -503,7 +545,9 @@ namespace coro {
             ::close(exec_status[0]);
             if (status_bytes > 0) {
                 int status = 0;
-                (void)waitpid(pid, &status, 0);
+                // exec 失败: 同步回收子进程, 不能让失败的启动留下僵尸
+                while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
                 io::set_error(exec_error);
                 co_return Process{};
             }
@@ -511,7 +555,8 @@ namespace coro {
                 const int error = errno;
                 ::kill(pid, SIGKILL);
                 int status = 0;
-                (void)waitpid(pid, &status, 0);
+                while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
                 io::set_error(error);
                 co_return Process{};
             }
@@ -523,8 +568,21 @@ namespace coro {
             int reap_pid = pid;
             std::thread([state, reap_pid] {
                 int status = 0;
-                waitpid(reap_pid, &status, 0);
-                int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+                // EINTR 必须重试: 否则会把 status=0 当成“正常退出 0”,
+                // 子进程还成为没有回收者的僵尸。
+                pid_t reaped;
+                do {
+                    reaped = ::waitpid(reap_pid, &status, 0);
+                } while (reaped < 0 && errno == EINTR);
+                int code;
+                if (reaped < 0)
+                    code = -1; // 回收失败: 不伪造退出码
+                else if (WIFEXITED(status))
+                    code = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status))
+                    code = 128 + WTERMSIG(status);
+                else
+                    code = 255;
                 state->set_value(code);
             }).detach();
 
@@ -539,31 +597,90 @@ namespace coro {
         // 便捷函数 — 运行到退出并收集 stdout
         // ==================================================================
 
+        /// 子进程双向通信结果 (对标 Python 的 communicate 返回值)
+        struct CommunicateResult {
+            int exit_code = -1;
+            std::string out;
+            std::string err;
+            bool output_truncated = false; ///< 超过 max_output 后不再追加
+            bool input_closed = true;      ///< stdin 是否已成功写完并关闭
+        };
+
+        namespace detail_proc {
+
+            /// 写完全部输入后关闭写端 (子进程看到 EOF)
+            inline coro::Task<bool> feed_stdin(pipe::PipeEnd* w, std::string data) {
+                if (!w)
+                    co_return true;
+                std::size_t off = 0;
+                while (off < data.size()) {
+                    const int n = co_await w->write(data.data() + off, data.size() - off);
+                    if (n <= 0)
+                        co_return false;
+                    off += static_cast<std::size_t>(n);
+                }
+                w->close();
+                co_return true;
+            }
+
+            /// 读到底 (EOF); 超过上限只标记, 不再缓存 —— 防止子进程无界输出吃内存
+            inline coro::Task<bool> drain_output(pipe::PipeEnd* rd, std::string* into, std::size_t max_bytes,
+                                                bool* truncated) {
+                if (!rd)
+                    co_return true;
+                char buf[4096];
+                for (;;) {
+                    const int n = co_await rd->read(buf, sizeof(buf));
+                    if (n == 0)
+                        co_return true;
+                    if (n < 0)
+                        co_return false; // 读错误不能伪装成 EOF
+                    if (into->size() + static_cast<std::size_t>(n) > max_bytes) {
+                        const std::size_t room = max_bytes > into->size() ? max_bytes - into->size() : 0;
+                        into->append(buf, room);
+                        *truncated = true;
+                    } else {
+                        into->append(buf, static_cast<std::size_t>(n));
+                    }
+                }
+            }
+
+        } // namespace detail_proc
+
+        /// 并发写 stdin、读 stdout/stderr 并等退出 (对标 asyncio.subprocess.communicate)。
+        /// 三条流必须并发推进: 顺序读 stdout 再读 stderr 会在子进程写满另一条流时死锁。
+        /// input/max_output 均显式有界; 未捕获的流为 nullptr, 对应任务直接完成。
+        inline Task<CommunicateResult> communicate(Process& p, std::string input = {},
+                                                   std::size_t max_output = 1u << 20) {
+            CommunicateResult result;
+            auto feed = coro::spawn(detail_proc::feed_stdin(p.stdin_pipe(), std::move(input)));
+            auto read_out = coro::spawn(
+                detail_proc::drain_output(p.stdout_pipe(), &result.out, max_output, &result.output_truncated));
+            auto read_err = coro::spawn(
+                detail_proc::drain_output(p.stderr_pipe(), &result.err, max_output, &result.output_truncated));
+            try {
+                result.exit_code = co_await p.wait();
+                result.input_closed = co_await std::move(feed);
+                (void)co_await std::move(read_out);
+                (void)co_await std::move(read_err);
+            } catch (...) {
+                // 被取消/失败: 把取消停到辅助任务上, 避免它们继续借用本帧的 result
+                feed.cancel();
+                read_out.cancel();
+                read_err.cancel();
+                throw;
+            }
+            co_return result;
+        }
+
         /// 运行命令到退出, 返回 {退出码, stdout 内容} (stderr 直通控制台)
+        /// 现在只是 communicate 的薄包装: 读循环与错误处理只保一份。
         inline Task<std::pair<int, std::string>> run_capture(std::vector<std::string> args) {
             Process p = co_await spawn(std::move(args), {.capture_stdout = true});
             if (!p.valid())
                 co_return std::make_pair(-1, std::string{});
-            // 并发: 读输出 + 等退出 (读挂起在管道空/EOF 上, 退出后 EOF 唤醒)
-            std::string out;
-            std::vector<coro::Task<bool>> jobs;
-            struct Reader {
-                static coro::Task<bool> drain(pipe::PipeEnd* rd, std::string* into) {
-                    if (!rd)
-                        co_return true;
-                    char buf[4096];
-                    while (true) {
-                        int n = co_await rd->read(buf, sizeof(buf));
-                        if (n <= 0)
-                            co_return true; // EOF / 错误
-                        into->append(buf, (size_t)n);
-                    }
-                }
-            };
-            auto reader = coro::spawn(Reader::drain(p.stdout_pipe(), &out));
-            int code = co_await p.wait();
-            co_await std::move(reader);
-            co_return std::make_pair(code, std::move(out));
+            auto result = co_await communicate(p);
+            co_return std::make_pair(result.exit_code, std::move(result.out));
         }
 #endif // _WIN32 || CORO_URING_ENABLED
 

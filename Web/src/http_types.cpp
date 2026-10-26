@@ -169,7 +169,10 @@ void http_response::header(const std::string& name, const std::string& value, bo
 //   keep-alive 模式下, 客户端需要靠 Content-Length 来判断响应体何时结束.
 //   如果没有 Content-Length, 客户端不知道什么时候响应接收完毕,
 //   会一直等待直到超时. 即使 body 为空也要发 Content-Length: 0.
-std::string http_response::build() const {
+//
+// omit_body: HEAD 应答 —— Content-Length 保持 GET 语义的值, 但不输出
+// 响应体字节 (RFC 9110 §9.3.2: HEAD 的表示头应与 GET 一致)。
+std::string http_response::build(bool omit_body) const {
     // http_protocol 是底层序列化器(在 thirdparty/http 中),
     // 提供链式 API: status_line() → header() → body() → build()
     http_protocol p;
@@ -182,7 +185,11 @@ std::string http_response::build() const {
         p.header(h.first, h.second); // 每个头部: "Name: Value\r\n"
     }
     p.header("Content-Length", std::to_string(body.size()));
-    p.body(body);     // 先输出 "\r\n"(头部与主体的分隔线), 再输出 body
+    // "\r\n" 分隔线后按需输出 body (HEAD 只保留头部与 Content-Length)
+    if (omit_body)
+        p.body(std::string{});
+    else
+        p.body(body);
     return p.build(); // 拼接成完整报文
 }
 std::string mime_type(const std::string& path) {

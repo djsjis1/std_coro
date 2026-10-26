@@ -77,6 +77,7 @@ public:
     // ---- 可选的用户回调,按需赋值 ----
     void_callback message_begin;                       // 消息开始(结果已清空)
     void_callback message_complete;                    // 消息完整结束
+    void_callback headers_complete;                    // 头部接收完毕 (可开始流式消费 body)
     data_callback url;                                 // URL 数据块
     data_callback body;                                // 消息体数据块
     data_callback header_field;                        // 头部字段数据块

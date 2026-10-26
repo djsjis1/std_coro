@@ -220,7 +220,12 @@ namespace coro {
                 if (buf_.size() >= max_)
                     detail::throw_overflow(max_); // 到顶: 明确失败, 不再无节制增长
                 const std::size_t remaining = max_ - buf_.size();
-                const std::size_t bigger = buf_.size() + (remaining < 1024 ? remaining : 1024);
+                // 几何扩容 (至少翻倍): 旧实现每次只加 1024, 长行/逐字节输入下
+                // 会把“读满缓冲”变成 O(n²/1024) 次 realloc + memcpy。
+                std::size_t grow = buf_.size() > 0 ? buf_.size() : 1024;
+                if (grow < 1024)
+                    grow = 1024;
+                const std::size_t bigger = buf_.size() + (remaining < grow ? remaining : grow);
                 buf_.resize(bigger); // 只扩容量; 新尾部属于"未用"区, 由 used_ 排除在外
                 room = buf_.size() - used_;
             }
@@ -239,34 +244,50 @@ namespace coro {
             std::size_t take = buffered() < n ? buffered() : n;
             std::memcpy(dst, buf_.data() + head_, take);
             head_ += take;
+            rewind_marks(take);
             return take;
         }
 
         std::string take_bytes(std::size_t n) {
             std::string out(buf_.data() + head_, n);
             head_ += n;
+            rewind_marks(n);
             return out;
         }
 
-        /// 缓冲里第一个 delim 的偏移 (可能跨 fill 边界, 所以每次都整段扫)
+        /// 消费了 n 字节后同步扫描游标 (游标相对 head_, 所以要一起前移)
+        void rewind_marks(std::size_t consumed) noexcept {
+            scan_mark_ = scan_mark_ > consumed ? scan_mark_ - consumed : 0;
+            byte_mark_ = byte_mark_ > consumed ? byte_mark_ - consumed : 0;
+        }
+
+        /// 缓冲里第一个 delim 的偏移。
+        /// 用扫描游标避免“每读入一小块就从头顶重扫整段缓冲”——长行 + 逐字节
+        /// 到达时那是 O(n²)。游标只跳过“不可能再匹配”的区段: 保留 delim.size()-1
+        /// 字节重叠, 分隔符跨块时不会漏。
         std::optional<std::size_t> scan(std::string_view delim) const {
             if (delim.empty() || buffered() < delim.size())
                 return std::nullopt;
             const char* base = buf_.data() + head_;
-            std::size_t left = buffered() - delim.size();
-            for (std::size_t i = 0; i <= left; ++i) {
+            const std::size_t left = buffered() - delim.size();
+            std::size_t start = scan_mark_ < left ? scan_mark_ : left;
+            for (std::size_t i = start; i <= left; ++i) {
                 if (std::memcmp(base + i, delim.data(), delim.size()) == 0)
                     return i;
             }
+            scan_mark_ = left + 1; // 下次从 overlap 起点继续 (left 已是最后一个候选)
             return std::nullopt;
         }
 
         std::optional<std::size_t> find_byte(char c) const {
             const char* base = buf_.data() + head_;
-            for (std::size_t i = 0; i < buffered(); ++i) {
+            const std::size_t size = buffered();
+            std::size_t start = byte_mark_ < size ? byte_mark_ : size;
+            for (std::size_t i = start; i < size; ++i) {
                 if (base[i] == c)
                     return i;
             }
+            byte_mark_ = size;
             return std::nullopt;
         }
 
@@ -274,6 +295,8 @@ namespace coro {
         std::vector<char> buf_; ///< size() 恒为**容量** (不是有效长度)
         std::size_t used_ = 0;  ///< 已填入的字节数 ([0, used_) 有效)
         std::size_t head_ = 0;  ///< 下一个待消费字节的位置
+        mutable std::size_t scan_mark_ = 0; ///< delimiter 扫描游标 (相对 head_)
+        mutable std::size_t byte_mark_ = 0; ///< 单字节扫描游标 (相对 head_)
         std::size_t max_;       ///< 缓冲硬上限: fill 到此即报错, 不再无节制增长
         bool eof_ = false;
     };

@@ -2,7 +2,7 @@
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 20,
+    "minor": 25,
     "patch": 0
   },
   "configurePresets": [
@@ -55,7 +55,8 @@
     },
     {
       "name": "dev",
-      "displayName": "开发验证：全特性 + 测试 + 示例 + 压测",
+      "displayName": "开发验证：原生 I/O + 并发扩展 + Web + 测试/示例/压测",
+      "description": "不含 HTTP client 与 TLS（两者在这里不验证）；需要它们请用 client / tls-client 预设",
       "inherits": "base",
       "cacheVariables": {
         "CORO_BUILD_TESTS": "ON",
@@ -66,32 +67,103 @@
         "CORO_ENABLE_WEB": "ON",
         "CORO_ENABLE_CONCURRENCY_EXT": "ON"
       }
+    },
+    {
+      "name": "concurrency",
+      "displayName": "并发扩展专项（Timer/Context/channel/select/rate）",
+      "inherits": "base",
+      "cacheVariables": {
+        "CORO_ENABLE_NATIVE_IO": "ON",
+        "CORO_ENABLE_URING": "ON",
+        "CORO_ENABLE_CONCURRENCY_EXT": "ON",
+        "CORO_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "client",
+      "displayName": "HTTP 客户端（非 TLS 路径，Windows/Linux 均可用）",
+      "inherits": "native",
+      "cacheVariables": {
+        "CORO_ENABLE_HTTP_CLIENT": "ON",
+        "CORO_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "tls-client",
+      "displayName": "HTTP 客户端 + TLS（需仓库内 OpenSSL 源码）",
+      "inherits": "client",
+      "cacheVariables": {
+        "CORO_ENABLE_TLS": "ON",
+        "CORO_REQUIRE_TLS": "ON"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "dev-debug",
+      "displayName": "开发验证（Debug 配置）",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "core",
       "configurePreset": "core",
+      "configuration": "Release",
       "jobs": 2
     },
     {
       "name": "native",
       "configurePreset": "native",
+      "configuration": "Release",
       "jobs": 2
     },
     {
       "name": "web",
       "configurePreset": "web",
+      "configuration": "Release",
       "jobs": 2
     },
     {
       "name": "tls",
       "configurePreset": "tls",
+      "configuration": "Release",
       "jobs": 2
     },
     {
       "name": "dev",
       "configurePreset": "dev",
+      "configuration": "Release",
+      "jobs": 2
+    },
+    {
+      "name": "concurrency",
+      "configurePreset": "concurrency",
+      "configuration": "Release",
+      "jobs": 2
+    },
+    {
+      "name": "client",
+      "configurePreset": "client",
+      "configuration": "Release",
+      "jobs": 2
+    },
+    {
+      "name": "tls-client",
+      "configurePreset": "tls-client",
+      "configuration": "Release",
+      "jobs": 2
+    },
+    {
+      "name": "dev-debug",
+      "configurePreset": "dev-debug",
+      "configuration": "Debug",
       "jobs": 2
     }
   ],
@@ -99,11 +171,34 @@
     {
       "name": "dev",
       "configurePreset": "dev",
+      "configuration": "Release",
       "output": {
         "outputOnFailure": true
       },
       "execution": {
         "timeout": 120
+      }
+    },
+    {
+      "name": "concurrency",
+      "configurePreset": "concurrency",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 120
+      }
+    },
+    {
+      "name": "dev-debug",
+      "configurePreset": "dev-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 300
       }
     }
   ]

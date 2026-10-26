@@ -111,7 +111,18 @@ void http_parse::setup_callbacks() {
         });
     };
     settings_.on_headers_complete = [](llhttp_t* parser) -> int {
-        return llhttp_get_type(parser) == HTTP_RESPONSE && self(parser)->response_to_head_ ? 1 : 0;
+        auto* p = self(parser);
+        return p->callback([&] {
+            // 头部一完成就把状态行发布出去: 流式消费方在 body 到达前
+            // 就需要知道 status_code / 版本。
+            p->http_version = std::to_string(llhttp_get_http_major(parser)) + "." +
+                              std::to_string(llhttp_get_http_minor(parser));
+            if (llhttp_get_type(parser) == HTTP_RESPONSE)
+                p->status_code = llhttp_get_status_code(parser);
+            if (p->headers_complete)
+                p->headers_complete();
+            return llhttp_get_type(parser) == HTTP_RESPONSE && p->response_to_head_ ? 1 : 0;
+        });
     };
     settings_.on_body = [](llhttp_t* parser, const char* at, size_t length) -> int {
         auto* p = self(parser);

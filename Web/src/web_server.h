@@ -66,6 +66,11 @@ class web_server {
     /// 写完一份响应的总时限(默认 30s; <=0 关闭)
     void set_write_timeout(std::chrono::milliseconds timeout) { write_timeout_ms_.store(timeout.count()); }
 
+    /// 单个 handler 的执行时限(默认 0 = 不限时)。超时的 handler 协程被
+    /// 取消 (要求 handler 取消安全: 挂起点抛 CancelledError, RAII 清理
+    /// 正常执行), 客户端收到 503 且连接关闭。
+    void set_handler_timeout(std::chrono::milliseconds timeout) { handler_timeout_ms_.store(timeout.count()); }
+
     /// accept 循环(常驻, 直到 stop())。在事件循环线程运行。
     /// 启动前注册内建 GET /__stats (保留路径), 再冻结路由表。
     /// 统计端点同样经过全局中间件, 可通过中间件限制访问。
@@ -117,6 +122,7 @@ class web_server {
     std::atomic<long long> idle_timeout_ms_{30000};
     std::atomic<long long> request_timeout_ms_{30000};
     std::atomic<long long> write_timeout_ms_{30000};
+    std::atomic<long long> handler_timeout_ms_{0}; // <=0 = handler 不限时
     size_t max_body_ = 8 * 1024 * 1024;
     bool verbose_ = true;
     // 最后构造、最先析构: join worker 时其余被访问的成员仍存活。

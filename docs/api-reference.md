@@ -54,7 +54,7 @@ namespace coro {
 
 | API | 语义 |
 |---|---|
-| `coro::run(task)` | 启动任务并驱动**当前线程**的事件循环直到无工作。返回主协程 `co_return` 值；主协程的异常在此重新抛出。嵌套调用直接返回。 |
+| `coro::run(task)` | 启动任务并驱动**当前线程**的事件循环直到无工作。返回主协程 `co_return` 值；主协程的异常在此重新抛出。嵌套调用抛出 `std::runtime_error`；循环被 `stop()` 提前终止而主任务未完成时同样抛错（不会把未完成当成功）。 |
 
 `coro.hpp` 聚合**核心 + 高级并发**头文件（event_loop / task / exceptions /
 sleep / gather / future / sync / queue / schedule / wait / task_group /
@@ -717,11 +717,12 @@ namespace coro {
 
 - 所有任务在 gather 点**一起启动**；总耗时 ≈ 最慢者。
 - 结果按参数顺序放入 tuple（结构化绑定友好）；`Task<void>` 可参与
-  （对应位置仅等待，无值）。
+  （对应位置为 `std::monostate`）。
 - 异常：第一个异常被记录，**其余任务继续跑完**，全部结束后重抛
-  第一个异常（对标 `asyncio.gather` 默认）。
-- 不支持 `Task<void>` 放 tuple 取值场景？——void 可以放进参数列表，
-  只是该位置无返回值；需要"取值"就用非 void 任务。
+  第一个异常（wait-all 语义；`asyncio.gather` 默认是首异常立即传播，
+  需要 fail-fast 请用 `TaskGroup`）。
+- 调用方在等待期间被取消：剩余子任务收到 `CancelledError` 优雅终止
+  （级联取消，对标 asyncio；子任务的清理逻辑照常执行）。
 
 ### 兼容组合器：gather_all / gather_void（deprecated）
 

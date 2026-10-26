@@ -3,6 +3,8 @@
 
 #include <coro/coro.hpp>
 
+#include "test_util.h"
+
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -95,4 +97,31 @@ TEST(SchedulerTest, CoexistsWithManualLoop) {
     EXPECT_EQ(sched_done.load(), 1);
     EXPECT_EQ(main_counter.load(), 1);
     EXPECT_EQ(main_done, 1);
+}
+
+// ── 停止接收 + 可 await 的完成通知 ──
+TEST(SchedulerTest, JoinWaitsForTasksAndStopRejectsNew) {
+    coro::Scheduler sched(2);
+    std::atomic<int> done{0};
+    for (int i = 0; i < 8; ++i)
+        sched.spawn_any([&done] { return work(5, &done); });
+
+    sched.stop_accepting();
+    bool rejected = false;
+    try {
+        sched.spawn_any([&done] { return work(1, &done); });
+    } catch (const coro::OverloadError&) {
+        rejected = true;
+    }
+    EXPECT_FALSE(sched.accepting());
+
+    bool joined = false;
+    test_util::run_task([&]() -> coro::Task<> {
+        co_await sched.join();
+        joined = true;
+    });
+
+    EXPECT_TRUE(rejected) << "停止后 spawn_any 必须明确拒绝";
+    EXPECT_TRUE(joined) << "join() 未被完成通知唤醒";
+    EXPECT_EQ(done.load(), 8) << "join() 返回时所有已分发任务必须已完成";
 }

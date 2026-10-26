@@ -1,19 +1,22 @@
 #pragma once
 
 #include "io.hpp"
+#include "sync.hpp"
 #include "task.hpp"
 
 #ifdef _WIN32
 // windows.h 已由 io.hpp 引入; signal.h 由 <csignal> 提供
 #elif defined(__linux__)
+#include <cerrno>
 #include <csignal>
-#include <sys/eventfd.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <unistd.h>
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <csignal>
 #include <functional>
@@ -70,11 +73,13 @@
 //   Windows → 无真信号。控制台事件 (SetConsoleCtrlHandler: Ctrl+C /
 //             Ctrl+Break / 关窗) + CRT raise() (signal() 处理器) 双路桥接,
 //             经「逐等待者 loop 路由」唤醒协程 (同 future.hpp 的模式)。
-//   Linux   → sigaction 处理器把信号号写入 eventfd (async-signal-safe),
-//             全局 reader 线程 poll eventfd → 分发到各线程的 manager,
+//   Linux   → sigaction 处理器把信号号逐字节写入 self-pipe (async-signal-safe),
+//             全局 reader 线程读管道 → 分发到各线程的 manager,
 //             manager 按信号号唤醒本 loop 的等待者。
-//             信号不阻塞: 任意线程收到都进 handler → eventfd → 分发,
+//             不用 eventfd: 它是累加计数器, 并发/连续信号会相加成另一个编号。
+//             信号不阻塞: 任意线程收到都进 handler → 管道 → 分发,
 //             多线程程序无需提前 pthread_sigmask。
+//             管道满时按信号号合并 (不承诺实时信号的逐次不丢)。
 //
 // Windows 信号映射 (控制台事件, 与注册表无关, 常驻):
 //   CTRL_C_EVENT → SIGINT   CTRL_BREAK_EVENT → SIGBREAK
@@ -125,10 +130,61 @@ namespace coro {
             // ==================================================================
             // Windows 信号管理器 (进程级单例; 控制台线程 / raise 线程投递)
             // ==================================================================
+            class manager; // 前向声明: 桥接的泵线程需要调用 manager::deliver
+
             struct waiter_entry {
                 void* awaiter;                  // wait_awaiter 指针 (帧内, 稳定)
                 std::coroutine_handle<> handle; // 等待协程
                 EventLoop* loop;                // 等待者所在的 loop (唤醒路由)
+            };
+
+            /// 信号 → 事件循环的安全桥接。
+            /// CRT/控制台处理器里**不能**加锁、分配或调用调度器 (它们可能在
+            /// 任意线程、甚至正在持锁的循环线程上被调用, 直接 deliver 会死锁)。
+            /// 处理器只置 atomic 位 + SetEvent; 专用 pump 线程负责真正的分发。
+            class signal_bridge {
+              public:
+                static signal_bridge& instance() {
+                    static signal_bridge b;
+                    return b;
+                }
+
+                /// 幂等建立事件对象与泵线程
+                void ensure_started() {
+                    std::call_once(once_, [this] {
+                        event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                        if (event_ == nullptr)
+                            return;
+                        pump_ = std::thread([this] { pump_loop(); });
+                    });
+                }
+
+                /// 信号处理器专用: 只做原子置位 + 唤醒 (不锁、不分配)
+                void post(int sig) noexcept {
+                    if (sig <= 0 || sig >= 64 || event_ == nullptr)
+                        return;
+                    pending_[static_cast<std::size_t>(sig)].store(true, std::memory_order_release);
+                    SetEvent(event_);
+                }
+
+                ~signal_bridge() {
+                    stop_.store(true, std::memory_order_release);
+                    if (event_ != nullptr)
+                        SetEvent(event_);
+                    if (pump_.joinable())
+                        pump_.join();
+                    if (event_ != nullptr)
+                        CloseHandle(event_);
+                }
+
+              private:
+                void pump_loop(); // 定义在 manager 之后 (需要完整类型)
+
+                std::array<std::atomic<bool>, 64> pending_{};
+                HANDLE event_ = nullptr;
+                std::thread pump_;
+                std::atomic<bool> stop_{false};
+                std::once_flag once_;
             };
 
             class manager {
@@ -169,12 +225,9 @@ namespace coro {
                         wake.swap(it->second);
                         waiters_.erase(it);
                     }
-                    for (auto& w : wake) {
-                        if (w.loop)
-                            w.loop->schedule(w.handle);
-                        else
-                            EventLoop::get().schedule(w.handle);
-                    }
+                    // waiter_entry.loop 由 add() 以 &EventLoop::get() 写入, 恒非空
+                    for (auto& w : wake)
+                        w.loop->schedule(w.handle);
                 }
 
                 /// CRT raise() 能到达的信号 (std::signal 的合法集合)
@@ -195,6 +248,7 @@ namespace coro {
 
                 /// 为信号安装 CRT 处理器 (allow 时调用; 控制台处理器一并确保)
                 void install(int sig) {
+                    signal_bridge::instance().ensure_started(); // 泵线程就绪后再装处理器
                     std::lock_guard lock(mtx_);
                     if (!console_installed_) {
                         console_installed_ = true;
@@ -241,7 +295,8 @@ namespace coro {
                         default:
                             return FALSE;
                     }
-                    get().deliver(sig);
+                    // 控制台处理器运行在系统注入的线程上: 同样只置位 + 唤醒
+                    signal_bridge::instance().post(sig);
                     return TRUE; // 已消费: 阻止默认终止行为 (优雅关停的前提)
                 }
 
@@ -250,7 +305,7 @@ namespace coro {
                     // (实证: 第二次 raise 直接走默认动作 exit(3)), 每次重装。
                     // (真实控制台事件走 SetConsoleCtrlHandler 路径, 不受影响)
                     std::signal(sig, &manager::c_handler);
-                    get().deliver(sig);
+                    signal_bridge::instance().post(sig);
                 }
 
                 std::mutex mtx_;
@@ -258,23 +313,33 @@ namespace coro {
                 bool console_installed_ = false;
             };
 
+            inline void signal_bridge::pump_loop() {
+                while (!stop_.load(std::memory_order_acquire)) {
+                    WaitForSingleObject(event_, 200);
+                    for (int sig = 1; sig < 64; ++sig) {
+                        if (pending_[static_cast<std::size_t>(sig)].exchange(false, std::memory_order_acq_rel))
+                            manager::get().deliver(sig);
+                    }
+                }
+            }
+
 #elif defined(__linux__)
 
             // ==================================================================
             // Linux 信号基础设施
             // ==================================================================
-            // 实现策略: sigaction + eventfd + 全局 reader 线程
+            // 实现策略: sigaction + self-pipe + 全局 reader 线程
             //
-            // 背景: signalfd 的 poll() 只能看到调用线程的 pending 信号,
-            //   跨线程 poll signalfd 无法看到其他线程 raise 的信号。
-            //   io_uring 在 kernel <5.14 也不支持 signalfd。
-            //   因此改用 sigaction 信号处理器 + eventfd 跨线程通知。
+            // 为什么不是 eventfd: eventfd 是累加计数器, 写进去的不是“一条消息”。
+            // 连续写入信号号 n1、n2 后读出的是 n1+n2 —— 会被当成第三个信号,
+            // 同一信号两次也会变成另一个编号。信号号必须逐字节传递。
             //
             // 架构:
-            //   1. 全局 eventfd (进程级单例)
-            //   2. sigaction 处理器: 向 eventfd 写入信号编号 (async-signal-safe)
-            //   3. 全局 reader 线程: poll eventfd → 分发到全部已注册的 manager
-            //   4. 每 loop 一个 manager (thread_local): 维护等待者列表
+            //   1. 进程级非阻塞 self-pipe (O_CLOEXEC), handler 侧只 write 一个字节
+            //   2. 管道满 (EAGAIN) 时记入 per-signal 的 lock-free 待决位图,
+            //      由 reader 线程在排空管道后补发 (合并语义, 不承诺逐次不丢)
+            //   3. 全局 reader 线程 poll → 分发给各 loop 的 manager
+            //   4. 每 loop 一个 manager (thread_local), 维护等待者列表
             // ==================================================================
 
             struct waiter_entry {
@@ -282,14 +347,76 @@ namespace coro {
                 std::coroutine_handle<> handle;
             };
 
+            /// 每个事件循环的等待集合。用 shared_ptr 保活: reader 线程只持有
+            /// weak_ptr 快照, thread_local manager 随线程退出销毁时, 不会留下
+            /// 可被解引用的悬空指针。
+            struct manager_core {
+                std::map<int, std::vector<waiter_entry>> waiters;
+                mutable std::mutex mtx;
+                EventLoop* loop = nullptr; ///< 构造时确定 (本线程 loop), 之后只读
+
+                void add(int sig, void* awaiter, std::coroutine_handle<> h) {
+                    std::lock_guard lock(mtx);
+                    waiters[sig].push_back({awaiter, h});
+                }
+
+                void remove(int sig, void* awaiter) {
+                    std::lock_guard lock(mtx);
+                    auto it = waiters.find(sig);
+                    if (it == waiters.end())
+                        return;
+                    std::erase_if(it->second, [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
+                    if (it->second.empty())
+                        waiters.erase(it);
+                }
+
+                /// 投递: 唤醒该信号的全部当前等待者 (从 reader 线程调用)
+                void deliver(int sig) {
+                    std::vector<waiter_entry> wake;
+                    {
+                        std::lock_guard lock(mtx);
+                        auto it = waiters.find(sig);
+                        if (it == waiters.end() || it->second.empty())
+                            return;
+                        wake.swap(it->second);
+                        waiters.erase(it);
+                    }
+                    for (auto& w : wake) {
+                        if (w.handle && loop_ != nullptr)
+                            loop_->schedule(w.handle);
+                    }
+                }
+
+                bool has_waiters() const {
+                    std::lock_guard lock(mtx);
+                    return !waiters.empty();
+                }
+
+                bool has_waiters_sig(int sig) const {
+                    std::lock_guard lock(mtx);
+                    auto it = waiters.find(sig);
+                    return it != waiters.end() && !it->second.empty();
+                }
+
+                EventLoop* loop_ptr() const noexcept { return loop_; }
+                void set_loop(EventLoop* l) noexcept { loop_ = l; }
+
+              private:
+                EventLoop* loop_ = nullptr;
+            };
+
             // ── 全局信号基础设施 (进程级单例) ──
             struct global_signal_state {
-                int efd = -1;
+                int rfd = -1; ///< reader 端 (非阻塞)
+                int wfd = -1; ///< handler 端 (非阻塞)
                 std::thread reader_thread;
                 std::atomic<bool> stopped{false};
                 std::mutex managers_mtx;
-                std::vector<struct manager*> managers;
+                std::vector<std::weak_ptr<manager_core>> managers;
                 std::once_flag init_flag;
+                /// 管道满时的兜底位图 (每个信号一位, 1..63)。
+                /// atomic<bool> 恒定 lock-free, 在信号处理器中读写安全。
+                std::array<std::atomic<bool>, 64> pending{};
 
                 static global_signal_state& instance() {
                     static global_signal_state s;
@@ -300,26 +427,37 @@ namespace coro {
                     stopped.store(true, std::memory_order_release);
                     if (reader_thread.joinable())
                         reader_thread.join();
-                    if (efd >= 0)
-                        ::close(efd);
+                    if (rfd >= 0)
+                        ::close(rfd);
+                    if (wfd >= 0)
+                        ::close(wfd);
                 }
 
-                /// 建立 eventfd + reader 线程 (不装任何 sigaction;
+                /// 建立 self-pipe + reader 线程 (不装任何 sigaction;
                 /// sigaction 由 ensure_installed 按信号逐个安装)
                 void ensure_initialized() {
                     std::call_once(init_flag, [this] {
-                        efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+                        int fds[2] = {-1, -1};
+                        if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0)
+                            return; // 拿不到管道: 后续 write 分支自然 no-op, 不崩溃
+                        rfd = fds[0];
+                        wfd = fds[1];
                         reader_thread = std::thread([this] { reader_loop(); });
                     });
                 }
 
-                /// 幂等为 sig 安装 sigaction (先确保 efd/reader 线程存在)。
+                /// 幂等为 sig 安装 sigaction (先确保 pipe/reader 线程存在)。
                 /// 重复安装同一 handler 无副作用, 无需去重集合。
                 void ensure_installed(int sig) {
                     ensure_initialized();
                     struct sigaction sa {};
                     sa.sa_handler = &global_signal_state::signal_handler;
-                    sa.sa_flags = 0; // 不用 SA_RESTART, 让 poll 可中断
+                    // SA_RESTART: 处理器是进程级的 —— 没有 RESTART 时, 任何
+                    // 线程收到允许的信号都会让该线程当前的阻塞系统调用以
+                    // EINTR 失败 (to_thread 工作者的读写、用户自己的 syscall
+                    // 随机被打断)。reader 线程的 poll 本来就带 200ms 超时,
+                    // 不依赖信号打断 (self-pipe 写入让它立即返回)。
+                    sa.sa_flags = SA_RESTART;
                     sigemptyset(&sa.sa_mask);
                     sigaction(sig, &sa, nullptr);
                 }
@@ -332,144 +470,116 @@ namespace coro {
                     sigaction(sig, &sa, nullptr);
                 }
 
-                static void signal_handler(int sig) {
-                    auto& s = instance();
-                    if (s.efd >= 0) {
-                        uint64_t val = (uint64_t)sig;
-                        // write() 是 async-signal-safe
-                        ::write(s.efd, &val, sizeof(val));
-                    }
+                /// 投递一条记录。信号上下文与普通上下文共用; 失败走合并位图。
+                void post(int sig) noexcept {
+                    if (wfd < 0)
+                        return;
+                    const unsigned char rec = static_cast<unsigned char>(sig & 0x7F);
+                    if (::write(wfd, &rec, 1) != 1)
+                        mark_pending(sig);
+                }
+
+                void mark_pending(int sig) noexcept {
+                    if (sig > 0 && sig < 64)
+                        pending[static_cast<std::size_t>(sig)].store(true, std::memory_order_release);
+                }
+
+                static void signal_handler(int sig) noexcept {
+                    // 处理器内只做: 保存 errno → write/原子位 → 恢复 errno。
+                    // 不加锁、不分配、不调调度器 (那些在 reader 线程做)。
+                    const int saved = errno;
+                    instance().post(sig);
+                    errno = saved;
                 }
 
                 void reader_loop(); // 定义在 manager 之后 (需要完整类型)
 
-                /// 任意线程的 manager 是否仍有 sig 的等待者 (disallow 前检查)
-                bool any_waiters(int sig);
-
-                void register_manager(manager* m) {
-                    std::lock_guard lock(managers_mtx);
-                    managers.push_back(m);
+                /// 把一个信号分发给当前所有 manager (副本持有 shared_ptr, 保证存活)
+                void dispatch(int sig) {
+                    std::vector<std::shared_ptr<manager_core>> snapshot;
+                    {
+                        std::lock_guard lock(managers_mtx);
+                        std::erase_if(managers,
+                                      [](const std::weak_ptr<manager_core>& w) { return w.expired(); });
+                        snapshot.reserve(managers.size());
+                        for (auto& w : managers) {
+                            if (auto core = w.lock())
+                                snapshot.push_back(std::move(core));
+                        }
+                    }
+                    for (auto& core : snapshot)
+                        core->deliver(sig);
                 }
 
-                void unregister_manager(manager* m) {
+                /// 任意线程的 manager 是否仍有 sig 的等待者 (disallow 前检查)
+                bool any_waiters(int sig) {
+                    std::vector<std::shared_ptr<manager_core>> snapshot;
+                    {
+                        std::lock_guard lock(managers_mtx);
+                        for (auto& w : managers) {
+                            if (auto core = w.lock())
+                                snapshot.push_back(std::move(core));
+                        }
+                    }
+                    for (auto& core : snapshot) {
+                        if (core->has_waiters_sig(sig))
+                            return true;
+                    }
+                    return false;
+                }
+
+                void register_manager(const std::shared_ptr<manager_core>& core) {
                     std::lock_guard lock(managers_mtx);
-                    std::erase(managers, m);
+                    managers.push_back(core);
                 }
             };
 
             class manager {
               public:
+                /// 首次使用时创建并登记 core; 线程退出时 weak_ptr 自动失效
                 static manager& get() {
                     static thread_local manager m;
                     return m;
                 }
 
+                manager() : core_(std::make_shared<manager_core>()) {
+                    core_->set_loop(&EventLoop::get());
+                    global_signal_state::instance().register_manager(core_);
+                }
+
                 void add(int sig, void* awaiter, std::coroutine_handle<> h) {
-                    auto& gs = global_signal_state::instance();
-                    gs.ensure_installed(sig); // 幂等: sigaction + efd + reader 线程
-                    {
-                        std::lock_guard lock(wmtx_);
-                        waiters_[sig].push_back({awaiter, h});
-                    }
-                    loop_ = &EventLoop::get();
-                    // 注册到全局基础设施
-                    {
-                        std::lock_guard lock(gs.managers_mtx);
-                        if (std::find(gs.managers.begin(), gs.managers.end(), this) == gs.managers.end())
-                            gs.managers.push_back(this);
-                    }
+                    global_signal_state::instance().ensure_installed(sig); // 幂等
+                    core_->add(sig, awaiter, h);
                 }
 
-                void remove(int sig, void* awaiter) {
-                    {
-                        std::lock_guard lock(wmtx_);
-                        auto it = waiters_.find(sig);
-                        if (it != waiters_.end()) {
-                            std::erase_if(it->second,
-                                          [awaiter](const waiter_entry& w) { return w.awaiter == awaiter; });
-                            if (it->second.empty())
-                                waiters_.erase(it);
-                        }
-                    }
-                    // 无任何等待者时注销 (reader 线程不再分发到本 manager)
-                    if (!has_waiters()) {
-                        auto& gs = global_signal_state::instance();
-                        std::lock_guard lock(gs.managers_mtx);
-                        std::erase(gs.managers, this);
-                    }
-                }
+                void remove(int sig, void* awaiter) { core_->remove(sig, awaiter); }
 
-                /// 投递: 唤醒该信号的全部当前等待者
-                /// 从 reader 线程调用, 用 loop_ 调度到正确的 EventLoop
-                void deliver(int sig) {
-                    std::vector<waiter_entry> wake;
-                    {
-                        std::lock_guard lock(wmtx_);
-                        auto it = waiters_.find(sig);
-                        if (it == waiters_.end() || it->second.empty())
-                            return;
-                        wake.swap(it->second);
-                        waiters_.erase(it);
-                    }
-                    for (auto& w : wake) {
-                        if (w.handle && loop_)
-                            loop_->schedule(w.handle);
-                    }
-                }
+                void deliver(int sig) { core_->deliver(sig); }
 
-                /// 本 manager 是否还有任何等待者
-                bool has_waiters() const {
-                    std::lock_guard lock(wmtx_);
-                    return !waiters_.empty();
-                }
+                bool has_waiters() const { return core_->has_waiters(); }
 
-                /// 本 manager 是否有 sig 的等待者 (disallow 检查用)
-                bool has_waiters_sig(int sig) const {
-                    std::lock_guard lock(wmtx_);
-                    auto it = waiters_.find(sig);
-                    return it != waiters_.end() && !it->second.empty();
-                }
+                bool has_waiters_sig(int sig) const { return core_->has_waiters_sig(sig); }
 
               private:
-                std::map<int, std::vector<waiter_entry>> waiters_;
-                mutable std::mutex wmtx_;
-                EventLoop* loop_ = nullptr;
+                std::shared_ptr<manager_core> core_;
             };
 
             // reader_loop 定义 (需要 manager 完整类型)
             inline void global_signal_state::reader_loop() {
                 while (!stopped.load(std::memory_order_acquire)) {
-                    struct pollfd pfd = {.fd = efd, .events = POLLIN};
-                    int pr = ::poll(&pfd, 1, 200);
-                    if (pr <= 0)
-                        continue;
-                    if (!(pfd.revents & POLLIN))
-                        continue;
-                    uint64_t val = 0;
-                    ssize_t nr = ::read(efd, &val, sizeof(val));
-                    if (nr == (ssize_t)sizeof(val)) {
-                        int sig = (int)val;
-                        std::vector<manager*> snapshot;
-                        {
-                            std::lock_guard lock(managers_mtx);
-                            snapshot = managers;
-                        }
-                        for (auto* m : snapshot)
-                            m->deliver(sig);
+                    struct pollfd pfd = {.fd = rfd, .events = POLLIN};
+                    const int pr = ::poll(&pfd, 1, 200);
+                    if (pr > 0 && (pfd.revents & POLLIN)) {
+                        unsigned char rec = 0;
+                        while (::read(rfd, &rec, 1) == 1)
+                            dispatch(rec); // 逐字节: 每个字节就是一条独立记录
+                    }
+                    // 管道满期间被合并的信号在这里补发
+                    for (int sig = 1; sig < 64; ++sig) {
+                        if (pending[static_cast<std::size_t>(sig)].exchange(false, std::memory_order_acq_rel))
+                            dispatch(sig);
                     }
                 }
-            }
-
-            inline bool global_signal_state::any_waiters(int sig) {
-                std::vector<manager*> snapshot;
-                {
-                    std::lock_guard lock(managers_mtx);
-                    snapshot = managers;
-                }
-                for (auto* m : snapshot)
-                    if (m->has_waiters_sig(sig))
-                        return true;
-                return false;
             }
 
 #endif
@@ -536,14 +646,11 @@ namespace coro {
 #ifdef _WIN32
             detail_signal::manager::get().deliver(sig);
 #else
-            // 与 signal_handler 同路径: 写 eventfd 由 reader 线程分发,
+            // 与 signal_handler 同路径: 写 self-pipe 由 reader 线程分发,
             // 调用线程无关紧要, 天然线程安全
             auto& gs = detail_signal::global_signal_state::instance();
             gs.ensure_initialized();
-            if (gs.efd >= 0) {
-                uint64_t val = (uint64_t)sig;
-                ::write(gs.efd, &val, sizeof(val));
-            }
+            gs.post(sig);
 #endif
         }
 
@@ -594,24 +701,49 @@ namespace coro {
         //
         // 用法: coro::signal::handle(SIGTERM, [] { return shutdown_task(); });
         //   - 每次信号到达, 在「注册时的 loop」上执行 factory() 返回的协程
-        //   - 处理是串行的 (上一个完成前新信号排队: 底层是等待者队列)
-        //   - 常驻设施: 内部循环协程自持有, 生命周期到事件循环结束
+        //   - 收集与执行分离: 收集协程持续注册等待, 因此 factory 运行期间的
+        //     信号不会被丢掉, 而是计数合并后逐个执行 (标准信号允许合并)
+        //   - 常驻设施: 内部协程自持有, 生命周期到 handler 注销/事件循环结束
         //   - factory 抛出的异常由 detached 任务报告机制兜底
         //   - 未注册的信号: 同步抛 std::invalid_argument (不等首信号)
         // ==================================================================
         namespace detail_signal {
             struct handle_state {
-                int sig;
+                int sig = 0;
                 std::function<Task<>()> factory;
-                Task<> self; // 常驻循环协程 (由 handler 注册对象持有)
+                Event wake;               ///< 收集端→执行端的唤醒事件
+                std::atomic<int> pending{0}; ///< 待执行次数 (合并计数)
+                Task<> collector;         ///< 持续等待信号的收集协程
+                Task<> self;              ///< 串行执行 factory 的循环协程
             };
+
+            /// 收集端: 始终处于“等待下一个信号”的状态, 因此业务执行期间的
+            /// 信号也能被记录 (旧实现只在两次 factory 之间注册, 会丢信号)。
+            inline Task<> handle_collect(std::shared_ptr<handle_state> st) {
+                try {
+                    while (true) {
+                        co_await wait(st->sig);
+                        st->pending.fetch_add(1, std::memory_order_release);
+                        st->wake.set();
+                    }
+                } catch (const CancelledError&) {
+                    // handler 注销: 收集端被取消, 正常收尾
+                }
+            }
 
             inline Task<> handle_loop(std::shared_ptr<handle_state> st) {
                 try {
                     while (true) {
-                        co_await wait(st->sig);
-                        auto t = st->factory();
-                        co_await std::move(t); // 串行执行, 避免处理重入
+                        if (st->pending.load(std::memory_order_acquire) > 0) {
+                            st->wake.clear();
+                            int n = st->pending.exchange(0, std::memory_order_acq_rel);
+                            for (int i = 0; i < n; ++i) {
+                                auto t = st->factory();
+                                co_await std::move(t); // 串行执行, 避免处理重入
+                            }
+                            continue;
+                        }
+                        co_await st->wake.wait();
                     }
                 } catch (const CancelledError&) {
                     // handler 注销 (stop/析构): 常驻循环被取消, 正常收尾
@@ -626,15 +758,28 @@ namespace coro {
             handler() = default;
             explicit handler(std::shared_ptr<detail_signal::handle_state> st) : st_(std::move(st)) {}
 
-            handler(handler&&) noexcept = default;
-            handler& operator=(handler&&) noexcept = default;
+            handler(handler&& other) noexcept : st_(std::move(other.st_)) {}
+
+            /// 移动赋值必须先停掉旧注册, 否则旧状态的常驻协程会永远留在 loop 里,
+            /// 阻止事件循环退出 (旧实现用默认移动赋值直接覆盖 st_)。
+            handler& operator=(handler&& other) noexcept {
+                if (this != &other) {
+                    stop();
+                    st_ = std::move(other.st_);
+                }
+                return *this;
+            }
             handler(const handler&) = delete;
             handler& operator=(const handler&) = delete;
 
             /// 手动注销 (幂等)
             void stop() {
-                if (st_ && st_->self.handle() != nullptr)
+                if (!st_)
+                    return;
+                if (st_->self.handle() != nullptr)
                     st_->self.cancel(); // 挂起在 wait 上的循环协程被取消收尾
+                if (st_->collector.handle() != nullptr)
+                    st_->collector.cancel();
                 st_.reset();
             }
 
@@ -651,6 +796,8 @@ namespace coro {
             auto st = std::make_shared<detail_signal::handle_state>();
             st->sig = sig;
             st->factory = std::move(factory);
+            st->collector = detail_signal::handle_collect(st);
+            st->collector.start();
             st->self = detail_signal::handle_loop(st);
             st->self.start();
             return handler(st);

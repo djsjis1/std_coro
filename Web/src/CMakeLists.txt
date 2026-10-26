@@ -16,6 +16,7 @@ endif()
 
 add_library(coro_web STATIC http_types.cpp web_server.cpp)
 add_library(coro::web ALIAS coro_web)
+coro_dev_warnings(coro_web)
 target_include_directories(coro_web PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(coro_web PUBLIC coro::io router::router PRIVATE coro::http_protocol)
 if(MSVC)

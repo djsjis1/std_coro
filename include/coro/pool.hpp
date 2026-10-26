@@ -263,6 +263,7 @@ namespace coro {
             st_->factory = std::move(factory);
             st_->max_agents = opts.max_agents;
             st_->max_idle = opts.max_idle;
+            owner_ = &EventLoop::get();
         }
 
         Pool(const Pool&) = delete;
@@ -280,7 +281,15 @@ namespace coro {
         ~Pool() { close(); }
 
         /// 借一个资源: 优先复用空闲, 其次在额度内新建, 否则排队等待。
-        Task<PoolLease<T>> acquire() { return acquire_impl(st_); }
+        /// 契约: loop-local —— 必须在创建本池的 EventLoop 线程调用;
+        /// moved-from 的 Pool 不能 ``acquire`` (明确报错而不是解引用空状态)。
+        Task<PoolLease<T>> acquire() {
+            if (!st_)
+                throw StructuredConcurrencyError("Pool::acquire on a moved-from Pool");
+            if (owner_ != nullptr && &EventLoop::get() != owner_)
+                throw StructuredConcurrencyError("Pool::acquire must run on the pool's owning event loop");
+            return acquire_impl(st_);
+        }
 
         std::size_t idle_count() const noexcept { return st_ ? st_->idle.size() : 0; }
         std::size_t in_use_count() const noexcept { return st_ ? st_->in_use : 0; }
@@ -312,8 +321,6 @@ namespace coro {
                     reservation.active = false;
                     co_return lease;
                 }
-                if (st->closed)
-                    co_return PoolLease<T>{}; // 池已关: 无效句柄, 由调用方判 valid()
                 if (!st->can_create()) {
                     // 到上限: 排队。唤醒后回到循环顶部重新竞争 (可能已被别人抢走)
                     detail::pool_acquire_awaiter<T> aw{st};
@@ -332,6 +339,7 @@ namespace coro {
         }
 
         std::shared_ptr<detail::pool_state<T>> st_;
+        EventLoop* owner_ = nullptr; ///< 创建时所在 loop (loop-local 契约的可验证依据)
     };
 
 } // namespace coro

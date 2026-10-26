@@ -8,8 +8,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 // ============================================================================
 // coro::rate_limiter — 令牌桶限流 (计划 M3c)
@@ -38,6 +40,17 @@ namespace coro {
         /// 定点数刻度: 1 个令牌 = RATE_TOKEN_SCALE 份。补充速率可以是"每秒 0.5 个"
         /// 这种小数, 用定点表示就不需要浮点原子量。
         inline constexpr std::int64_t rate_token_scale = 1024;
+
+        /// 把“令牌个数”换成定点份数, 并拒绝会溢出的输入
+        /// (旧实现直接 n * 1024, 大 n 会变成负数并在后续比较里静默失效)。
+        inline std::int64_t rate_scale_tokens(std::uint64_t n) {
+            constexpr std::uint64_t max_units =
+                static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) /
+                static_cast<std::uint64_t>(rate_token_scale);
+            if (n > max_units)
+                throw std::invalid_argument("rate_limiter: token count is out of range");
+            return static_cast<std::int64_t>(n) * rate_token_scale;
+        }
 
         /// 桶的共享状态。放堆上并由 shared_ptr 持有: 等待中的协程可能比 rate_limiter
         /// 对象活得久 (与 Timer/Channel 同一理由 —— 绝不能让协程帧捕获 this)。
@@ -72,9 +85,13 @@ namespace coro {
                         if (periods > 0) {
                             // 一次跳多个周期时直接按"经过时间 × 速率"补, 避免循环累加;
                             // 上限截到 capacity, 防止长期空闲后攒出一大桶突发。
-                            const long double grown =
-                                static_cast<long double>(old_tokens) + static_cast<long double>(per * periods);
-                            next = grown >= static_cast<long double>(cap) ? cap : static_cast<std::int64_t>(grown);
+                            // 乘法必须在 long double 里做: 先算 per * periods 会在
+                            // 转 double 之前就溢出 (signed overflow 是 UB)。
+                            const long double grown = static_cast<long double>(old_tokens) +
+                                                      static_cast<long double>(per) * static_cast<long double>(periods);
+                            next = grown >= static_cast<long double>(cap)
+                                       ? cap
+                                       : static_cast<std::int64_t>(grown < 0 ? 0 : grown);
                             next_last = old_last + periods * period;
                         }
                     }
@@ -100,6 +117,7 @@ namespace coro {
             }
 
             /// 距离"够扣 need 份"还要多久 (微秒)。桶此刻已够则返回 0。
+            /// 返回 -1 表示“这个桶永远不会再补充”(不可能满足)。
             std::int64_t wait_us_for(std::int64_t need) {
                 for (;;) {
                     const std::int64_t have = settle_and_peek();
@@ -110,15 +128,33 @@ namespace coro {
                     if (per <= 0 || period <= 0)
                         return -1; // 永不补充: 调用方按错误处理
                     const std::int64_t missing = need - have;
-                    const std::int64_t periods = (missing + per - 1) / per;
-                    return periods * period;
+                    // (missing + per - 1) / per 在 missing 接近 INT64_MAX 时会溢出;
+                    // 改成先减一再加一, 商不变而中间值不越界。
+                    const std::int64_t periods = (missing - 1) / per + 1;
+                    const long double us = static_cast<long double>(periods) * static_cast<long double>(period);
+                    if (us >= static_cast<long double>((std::numeric_limits<std::int64_t>::max)()))
+                        return (std::numeric_limits<std::int64_t>::max)();
+                    std::int64_t wait = static_cast<std::int64_t>(us);
+                    // 扣掉本周期已经过去的部分: 否则每次都多睡一个整周期
+                    const std::int64_t elapsed = now_us() - last_us.load(std::memory_order_relaxed);
+                    if (elapsed > 0) {
+                        const std::int64_t in_period = elapsed % period;
+                        wait = wait > in_period ? wait - in_period : 1;
+                    }
+                    return wait < 1 ? 1 : wait;
                 }
             }
         };
 
         /// 等待并扣减 need 份。抢输的对手多睡一轮再试: 有界延迟、无死锁、无泄漏。
         inline Task<> rate_acquire(std::shared_ptr<rate_state> st, std::int64_t need) {
+            if (need <= 0)
+                co_return;
             for (;;) {
+                // 需求超过桶容量就永远不可能满足 (以及 set_rate 下调后也会如此):
+                // 立即报错, 不要循环 sleep 到进程结束。
+                if (st->capacity.load(std::memory_order_relaxed) < need)
+                    throw StructuredConcurrencyError("rate_limiter: requested tokens exceed bucket capacity");
                 if (st->try_consume(need))
                     co_return;
                 const std::int64_t wait = st->wait_us_for(need);
@@ -142,12 +178,15 @@ namespace coro {
             : state_(std::make_shared<detail::rate_state>()) {
             using namespace std::chrono;
             const std::int64_t period_us = duration_cast<microseconds>(period).count();
-            const std::int64_t cap = static_cast<std::int64_t>(capacity) * detail::rate_token_scale;
-            const std::int64_t per = static_cast<std::int64_t>(refill_per_period == 0 ? capacity : refill_per_period) *
-                                     detail::rate_token_scale;
+            if (capacity == 0)
+                throw std::invalid_argument("rate_limiter: capacity must be > 0");
+            if (period_us <= 0)
+                throw std::invalid_argument("rate_limiter: period must be > 0");
+            const std::int64_t cap = detail::rate_scale_tokens(capacity);
+            const std::int64_t per = detail::rate_scale_tokens(refill_per_period == 0 ? capacity : refill_per_period);
             state_->capacity.store(cap);
             state_->refill.store(per);
-            state_->period_us.store(period_us < 1 ? 1 : period_us);
+            state_->period_us.store(period_us);
             state_->tokens.store(cap); // 初始满桶: 冷启动不该先被限流
             state_->last_us.store(detail::rate_state::now_us());
             state_->owner = &EventLoop::get();
@@ -160,13 +199,12 @@ namespace coro {
         Task<> acquire() const { return detail::rate_acquire(state_, detail::rate_token_scale); }
 
         /// 取 n 个令牌 (原子: 要么一次拿到 n 个, 要么一个都不拿)。
-        Task<> acquire_n(std::uint64_t n) const {
-            return detail::rate_acquire(state_, static_cast<std::int64_t>(n) * detail::rate_token_scale);
-        }
+        /// n 超过桶容量时立即以异常拒绝 (永不应当发生无限等待)。
+        Task<> acquire_n(std::uint64_t n) const { return detail::rate_acquire(state_, detail::rate_scale_tokens(n)); }
 
         /// 非阻塞: 有就扣, 没有立即返回 false (用于降级/快速失败路径)。
         bool try_acquire(std::uint64_t n = 1) const {
-            return state_->try_consume(static_cast<std::int64_t>(n) * detail::rate_token_scale);
+            return state_->try_consume(detail::rate_scale_tokens(n));
         }
 
         /// 当前可用令牌数 (向下取整)。只用于观测与展示, 不要拿它做判断后再扣 ——
@@ -176,10 +214,12 @@ namespace coro {
         }
 
         /// 距下次能取 n 个令牌还有多久; n 已可满足时返回 0。供 429 Retry-After 之类用。
-        /// 模板参数直接是目标 duration 类型 (调用处写 retry_after<std::chrono::milliseconds>(1))
+        /// “永不补充”时返回该 duration 的最大值 —— 不用 0 冒充“立即可重试”。
         template <typename Duration> Duration retry_after(std::uint64_t n = 1) const {
-            const std::int64_t us = state_->wait_us_for(static_cast<std::int64_t>(n) * detail::rate_token_scale);
-            return std::chrono::duration_cast<Duration>(std::chrono::microseconds(us < 0 ? 0 : us));
+            const std::int64_t us = state_->wait_us_for(detail::rate_scale_tokens(n));
+            if (us < 0)
+                return (Duration::max)();
+            return std::chrono::duration_cast<Duration>(std::chrono::microseconds(us));
         }
 
         /// 运行时改速率 (例如按订阅档位热更新)。桶里已有的令牌不重置。
@@ -188,13 +228,16 @@ namespace coro {
                       std::uint64_t refill_per_period = 0) const {
             using namespace std::chrono;
             const std::int64_t period_us = duration_cast<microseconds>(period).count();
-            state_->capacity.store(static_cast<std::int64_t>(capacity) * detail::rate_token_scale);
-            state_->refill.store(static_cast<std::int64_t>(refill_per_period == 0 ? capacity : refill_per_period) *
-                                 detail::rate_token_scale);
-            state_->period_us.store(period_us < 1 ? 1 : period_us);
+            if (capacity == 0)
+                throw std::invalid_argument("rate_limiter: capacity must be > 0");
+            if (period_us <= 0)
+                throw std::invalid_argument("rate_limiter: period must be > 0");
+            const std::int64_t cap = detail::rate_scale_tokens(capacity);
+            state_->capacity.store(cap);
+            state_->refill.store(detail::rate_scale_tokens(refill_per_period == 0 ? capacity : refill_per_period));
+            state_->period_us.store(period_us);
             // 若调小后当前存量超过新容量, 截一下, 否则要空转很久才收敛
             std::int64_t expected = state_->tokens.load();
-            const std::int64_t cap = state_->capacity.load();
             if (expected > cap)
                 state_->tokens.compare_exchange_strong(expected, cap);
         }

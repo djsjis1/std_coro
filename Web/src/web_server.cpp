@@ -142,8 +142,12 @@ coro::Task<> web_server::serve() {
         if (!conn.valid()) {
             if (!running_.load(std::memory_order_acquire))
                 break; // stop() 关闭了监听 socket, accept 失败是预期行为, 正常退出
-            std::lock_guard lock(g_log_mutex);
-            std::cerr << "[web] accept failed, retrying..." << std::endl;
+            {
+                // 锁作用域不得跨 co_await: 持 std::mutex 挂起会把其他 worker 的
+                // 日志一起堵在锁上 (阻塞式锁 + 协程挂起 = 跨挂起持锁)。
+                std::lock_guard lock(g_log_mutex);
+                std::cerr << "[web] accept failed, retrying..." << std::endl;
+            }
             co_await coro::sleep(10ms); // 等 10ms 再重试, 避免错误时死循环空转
             continue;
         }
@@ -168,10 +172,26 @@ coro::Task<> web_server::serve() {
             sp->shutdown();
             break;
         }
-        scheduler_.spawn_any([this, sp]() mutable {
-            sp->reattach(); // 在 worker 线程上关联 IOCP
-            return handle_connection(std::move(sp));
-        });
+        // 注册成功后如果派发失败 (分配/线程已停), 必须把集合与计数回滚:
+        // 否则 connections_ 会永久留一个已死连接, in_flight 也永远不会减。
+        try {
+            scheduler_.spawn_any([this, sp]() mutable {
+                if (!sp->reattach()) {
+                    // IOCP 关联失败: 该连接上的 I/O 完成包无处投递, 后续读写
+                    // 会静默失效。直接放弃这条连接 (关 socket + 摘集合)。
+                    sp->close();
+                    unregister_connection(sp);
+                    return coro::Task<>{};
+                }
+                return handle_connection(std::move(sp));
+            });
+        } catch (...) {
+            unregister_connection(sp);
+            sp->shutdown();
+            if (!running_.load(std::memory_order_acquire))
+                break;
+            throw;
+        }
         // spawn_any 本身不等待 handle_connection 完成, 它只是"发射"一个协程
         // 到 worker 线程, 然后立即返回, serve() 循环继续 accept 下一个连接
     }
@@ -283,7 +303,24 @@ coro::Task<> web_server::process_connection(coro::net::TcpStream& conn) {
             // ---- 路由分发: 根据 method + url 找到对应 handler 并执行 ----
             // dispatch 返回 http_response, co_await 挂起直到 handler 完成
             // (handler 内部可能 co_await sleep / 数据库查询等异步操作)
-            http_response resp = co_await dispatch(req);
+            // HEAD 复用 GET 资源语义 (router 回落到 GET 树), 响应体按 HEAD 规则省略
+            const bool is_head = req.method == "HEAD";
+            http_response resp;
+            const auto handler_timeout = std::chrono::milliseconds(handler_timeout_ms_.load(std::memory_order_relaxed));
+            if (handler_timeout.count() > 0) {
+                // handler 执行限时: 永不完成的 handler 会把连接与槽位钉死到
+                // stop() (客户端断开也唤醒不了挂起的 dispatch)。超时取消
+                // handler 协程 (要求 handler 是取消安全的: 挂起点会收到
+                // CancelledError, RAII 清理正常执行), 回 503 后关闭连接。
+                try {
+                    resp = co_await coro::wait_for(dispatch(req), handler_timeout);
+                } catch (const coro::TimeoutError&) {
+                    resp = http_response::error(503, "handler timeout");
+                    req.keep_alive = false; // handler 被取消, 连接状态不可信, 回包即关
+                }
+            } else {
+                resp = co_await dispatch(req);
+            }
 
             // ---- 序列化响应为 HTTP 报文并发送 ----
             // resp.build() 生成类似:
@@ -292,7 +329,7 @@ coro::Task<> web_server::process_connection(coro::net::TcpStream& conn) {
             //   Content-Length: 13\r\n
             //   \r\n
             //   Hello, World!
-            std::string wire = resp.build();
+            std::string wire = resp.build(is_head);
             try {
                 const auto timeout = std::chrono::milliseconds(write_timeout_ms_.load(std::memory_order_relaxed));
                 if (!co_await write_with_timeout(conn, wire, timeout))

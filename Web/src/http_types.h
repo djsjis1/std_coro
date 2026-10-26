@@ -66,7 +66,10 @@ struct http_response {
     void header(const std::string& name, const std::string& value, bool replace = false);
 
     /// 序列化为完整 HTTP 报文(强制 Content-Length, keep-alive 需要响应边界)
-    std::string build() const;
+    ///
+    /// omit_body=true: HEAD 应答 —— 保留头部与"GET 将发送的" Content-Length,
+    /// 但不输出响应体字节 (RFC 9110: HEAD 的表示头与 GET 一致, 无 body)。
+    std::string build(bool omit_body = false) const;
 };
 
 /// 按文件扩展名推断 MIME 类型 (如 "a.html" → "text/html; charset=utf-8")

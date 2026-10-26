@@ -116,7 +116,81 @@ namespace {
         *group_done = group.done();
     }
 
+    // ── 场景 8: 父任务在 wait() 上被取消 → 先等子任务清理完再传播取消 ──
+    struct scope_probe {
+        static std::atomic<int> alive;
+        scope_probe() { alive.fetch_add(1); }
+        ~scope_probe() { alive.fetch_sub(1); }
+    };
+    std::atomic<int> scope_probe::alive{0};
+
+    /// 子任务收到取消后还要异步等一段才完成清理
+    coro::Task<> slow_cleanup_child(std::atomic<int>* alive_during_cleanup) {
+        bool cancelled = false;
+        try {
+            co_await coro::sleep(10s);
+        } catch (const coro::CancelledError&) {
+            cancelled = true; // MSVC 不允许在 catch 块内 co_await
+        }
+        if (cancelled) {
+            co_await coro::sleep(20ms); // 真实的异步清理窗口
+            *alive_during_cleanup = scope_probe::alive.load();
+        }
+    }
+
+    coro::Task<> cancelled_parent_waits(std::atomic<int>* alive_during_cleanup, bool* cleaned) {
+        scope_probe probe; // 父作用域资源: 子任务清理期间必须仍然存活
+        coro::TaskGroup group;
+        group.spawn(slow_cleanup_child(alive_during_cleanup));
+        co_await group.wait(); // 父任务在此被取消: 必须等子任务退出后才恢复
+        *cleaned = true;
+    }
+
+    /// 在父任务确实挂起之后才发起取消 (避免“还没进入 wait 就 cancel”的无效时序)
+    coro::Task<> cancel_parent_later(coro::Task<>* parent, int delay_ms) {
+        co_await coro::sleep(std::chrono::milliseconds(delay_ms));
+        parent->cancel();
+    }
+
 } // namespace
+
+TEST(TaskGroupTest, CancelledParentWaitsForChildCleanup) {
+    std::atomic<int> alive_during_cleanup{-1};
+    bool cleaned = false;
+    auto parent = cancelled_parent_waits(&alive_during_cleanup, &cleaned);
+    parent.start();
+    auto killer = coro::spawn(cancel_parent_later(&parent, 10));
+    coro::EventLoop::get().run();
+    try {
+        parent.take_result();
+    } catch (const coro::CancelledError&) {
+    }
+    EXPECT_FALSE(cleaned) << "父任务在取消路径上不应走到 wait() 之后";
+    EXPECT_EQ(alive_during_cleanup.load(), 1) << "子任务清理时父作用域资源不应已被销毁";
+    EXPECT_EQ(scope_probe::alive.load(), 0) << "父帧结束后资源应已释放";
+}
+
+TEST(TaskGroupTest, SpawnAfterChildFailureIsRejected) {
+    coro::TaskGroup group;
+    bool rejected = false;
+    int ran = 0;
+    auto run = [&]() -> coro::Task<> {
+        group.spawn(failing_task(1, "boom"));
+        co_await coro::sleep(20ms); // 等子任务真的失败, 组转入 closing
+        try {
+            group.spawn(worker_sleep(1, &ran));
+        } catch (const coro::StructuredConcurrencyError&) {
+            rejected = true;
+        }
+        try {
+            co_await group.wait();
+        } catch (const coro::ExceptionGroup&) {
+        }
+    };
+    auto t = run();
+    test_util::run_task([&] { return std::move(t); });
+    EXPECT_TRUE(rejected) << "首次失败后组必须关闭准入";
+}
 
 TEST(TaskGroupTest, AllSucceed) {
     int count = 0;

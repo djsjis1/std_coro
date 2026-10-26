@@ -114,6 +114,107 @@ namespace {
     }
 
     // ── Queue::join 空队列立即返回 ──
+    // ── Queue::shutdown (E01 回归) ──
+    coro::Task<> queue_graceful_shutdown(int* drained, bool* shut, bool* put_failed) {
+        coro::Queue<int> q; // 无界
+        co_await q.put(1);
+        q.shutdown(false); // graceful: 存量可排空, 新 put 被拒绝
+        *drained += co_await q.get();
+        try {
+            co_await q.get();
+        } catch (const coro::QueueShutDown&) {
+            *shut = true;
+        }
+        try {
+            co_await q.put(2);
+        } catch (const coro::QueueShutDown&) {
+            *put_failed = true;
+        }
+        co_return;
+    }
+
+    /// 挂起等待一个元素 (immediate shutdown 时以 QueueShutDown 结束)
+    coro::Task<> queue_get_one(coro::Queue<int>* q) { (void)co_await q->get(); }
+
+    coro::Task<> queue_immediate_shutdown(int* unfinished_after_drop, bool* got_shutdown) {
+        // 1) 丢弃存量: unfinished 只扣仍在队列里的项
+        {
+            coro::Queue<int> q(4);
+            co_await q.put(1);
+            co_await q.put(2);
+            q.shutdown(true);
+            *unfinished_after_drop = (int)q.unfinished_count();
+        }
+        // 2) 空队列上挂起的 get 必须被唤醒 (而不是永久等永远不会来的元素)
+        coro::Queue<int> empty;
+        auto waiter = coro::spawn(queue_get_one(&empty));
+        co_await coro::yield();
+        empty.shutdown(true);
+        try {
+            co_await std::move(waiter);
+        } catch (const coro::QueueShutDown&) {
+            *got_shutdown = true;
+        }
+        co_return;
+    }
+
+    coro::Task<> queue_task_done_overflow(bool* threw) {
+        coro::Queue<int> q;
+        co_await q.put(7);
+        (void)co_await q.get();
+        q.task_done();
+        try {
+            q.task_done(); // 超额: 必须报错而不是静默忽略
+        } catch (const std::logic_error&) {
+            *threw = true;
+        }
+        co_return;
+    }
+
+    /// 挂起在 cond.wait 上, 被取消时应在仍持锁的状态下接住异常
+    coro::Task<> cond_wait_then_catch(coro::Condition* cond, bool* caught) {
+        coro::Lock* lock = cond->lock();
+        auto g = co_await lock->guard();
+        try {
+            co_await cond->wait();
+        } catch (const coro::CancelledError&) {
+            *caught = true;
+            throw;
+        }
+    }
+
+    // ── Condition: 取消后必须先重新持锁, 再传播取消 ──
+    coro::Task<> cond_cancel_holds_lock(bool* caught, bool* lock_usable) {
+        coro::Lock lock;
+        coro::Condition cond(&lock);
+        bool finished_while_locked = false;
+        bool caught_in_child = false;
+
+        auto child = coro::spawn(cond_wait_then_catch(&cond, &caught_in_child));
+        co_await coro::yield(); // 子任务已持锁并挂起在 wait 上 (锁已交还)
+        {
+            auto g = co_await lock.guard(); // 父任务持锁
+            child.cancel();
+            co_await coro::yield(); // 子任务应阻塞在"重新拿锁"上, 不能提前结束
+            finished_while_locked = child.is_ready();
+        } // 父任务释放 → 子任务拿到锁 → 抛 CancelledError → Guard 释放
+        try {
+            co_await std::move(child);
+        } catch (const coro::CancelledError&) {
+        }
+        *caught = caught_in_child;
+        // 锁没被泄漏: 应能立即再次获取
+        {
+            auto g2 = co_await lock.guard();
+            *lock_usable = true;
+        }
+        // 子任务若在父任务仍持锁时就已结束, 说明取消跳过了"重获锁"
+        if (finished_while_locked)
+            *lock_usable = false;
+        co_return;
+    }
+
+    // ── Queue::join 空队列立即返回 ──
     coro::Task<> queue_join_empty(bool* join_done) {
         coro::Queue<int> q;
         co_await q.join();
@@ -598,6 +699,36 @@ TEST(SyncExtendedTest, QueueUnfinishedCount) {
     test_util::run_task([&] { return queue_unfinished(&before_done, &after_done); });
     EXPECT_EQ(before_done, 2); // put 了 2 个, 还没 task_done
     EXPECT_EQ(after_done, 1);  // task_done 了 1 个
+}
+
+TEST(SyncExtendedTest, QueueGracefulShutdownDrainsThenSignals) {
+    int drained = 0;
+    bool shut = false, put_failed = false;
+    test_util::run_task([&] { return queue_graceful_shutdown(&drained, &shut, &put_failed); });
+    EXPECT_EQ(drained, 1) << "graceful shutdown 仍必须允许排空存量";
+    EXPECT_TRUE(shut) << "排空后的 get 应抛 QueueShutDown";
+    EXPECT_TRUE(put_failed) << "shutdown 后的 put 应报 QueueShutDown 而不是静默丢弃";
+}
+
+TEST(SyncExtendedTest, QueueImmediateShutdownWakesWaiters) {
+    int unfinished = -1;
+    bool got_shutdown = false;
+    test_util::run_task([&] { return queue_immediate_shutdown(&unfinished, &got_shutdown); });
+    EXPECT_TRUE(got_shutdown) << "immediate shutdown 必须唤醒挂起的 get";
+    EXPECT_EQ(unfinished, 0) << "丢弃的存量应从 unfinished 中扣除";
+}
+
+TEST(SyncExtendedTest, QueueTaskDoneOverflowThrows) {
+    bool threw = false;
+    test_util::run_task([&] { return queue_task_done_overflow(&threw); });
+    EXPECT_TRUE(threw) << "超额 task_done 必须报错, 不能静默忽略";
+}
+
+TEST(SyncExtendedTest, ConditionCancelReacquiresLockBeforePropagating) {
+    bool caught = false, lock_usable = false;
+    test_util::run_task([&] { return cond_cancel_holds_lock(&caught, &lock_usable); });
+    EXPECT_TRUE(caught) << "子任务应在持锁状态下收到 CancelledError";
+    EXPECT_TRUE(lock_usable) << "取消后锁必须可用 (未被泄漏, 也未在无锁时提前展开)";
 }
 
 // ── Condition: waiter_count ──

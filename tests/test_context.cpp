@@ -202,6 +202,54 @@ TEST(ContextTest, TokenOutlivesItsSourceSafely) {
 
 namespace {
 
+    /// 默认构造的 token 约定为“已取消”: wait_cancelled 必须立即完成,
+    /// 而不能把空 state_ 交给会无条件解引用的 awaiter。
+    coro::Task<> default_token_wait_completes(bool* completed) {
+        coro::CancellationToken token;
+        co_await token.wait_cancelled();
+        *completed = true;
+        co_return;
+    }
+
+    /// 取消跟随一个很远的 deadline: 取消后事件循环不得等原期限。
+    coro::Task<> cancel_with_far_deadline(coro::CancellationSource* src, int* reason) {
+        auto ctx = coro::Context::from(src->token()).with_deadline(1h);
+        co_await wait_reason(&ctx, reason);
+        co_return;
+    }
+
+} // namespace
+
+TEST(ContextTest, DefaultTokenWaitCompletesImmediately) {
+    bool completed = false;
+    const auto begin = std::chrono::steady_clock::now();
+    test_util::run_task([&] { return default_token_wait_completes(&completed); });
+    const auto cost =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+    EXPECT_TRUE(completed);
+    EXPECT_LT(cost, 2000) << "默认 token 的等待没有立即完成";
+}
+
+TEST(ContextTest, CancelDoesNotLeaveFarDeadlineInLoop) {
+    coro::CancellationSource src;
+    int reason = 0;
+    const auto begin = std::chrono::steady_clock::now();
+    auto waiter = [&] {
+        auto t = cancel_with_far_deadline(&src, &reason);
+        t.start();
+        coro::EventLoop::get().dispatch([&src] { src.cancel(); });
+        coro::EventLoop::get().run();
+        t.take_result();
+    };
+    waiter();
+    const auto cost =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+    EXPECT_EQ(reason, 1) << "取消应当是先到原因";
+    EXPECT_LT(cost, 5000) << "取消后 timer token 未作废, 事件循环被 1h deadline 拖住";
+}
+
+namespace {
+
     /// 帧局部探针: 计数当前存活的协程帧 (帧销毁即 -1)
     struct frame_probe {
         static std::atomic<int> alive;

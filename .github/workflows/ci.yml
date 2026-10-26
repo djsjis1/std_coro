@@ -54,7 +54,8 @@ jobs:
 
       - name: Check formatting
         run: |
-          find include router examples tests Web/src Web/main.cpp playground/main.cpp \
+          find include src tcp_udp router examples tests Web/src Web/main.cpp playground/main.cpp \
+            thirdparty/http/src \
             \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) -print0 | \
           xargs -0 -r clang-format-18 --dry-run --Werror
 
@@ -117,6 +118,7 @@ jobs:
             -DCORO_ENABLE_HTTP_CLIENT=ON \
             -DCORO_BUILD_TESTS=ON \
             -DCORO_BUILD_EXAMPLES=ON \
+            -DCORO_BUILD_BENCHMARKS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
@@ -153,6 +155,11 @@ jobs:
           ./build/core-smoke/coro_core_smoke
           # HTTP 客户端组件: 从复制后的前缀配置, 证明导入路径不依赖原构建目录
           cp -r "$PWD/build/install-root" "$PWD/build/install-moved"
+          # 导出文件不得泄漏源码/构建绝对路径 (否则“可迁移”只是复制目录的巧合)
+          if grep -R -n -E "($PWD|$GITHUB_WORKSPACE)" "$PWD/build/install-moved" --include='*.cmake' --include='*.txt'; then
+            echo "::error::installed CMake files leak source or build absolute paths"
+            exit 1
+          fi
           cmake -S tests/package_smoke -B build/package-smoke-client \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_PREFIX_PATH="$PWD/build/install-moved" \
@@ -193,6 +200,20 @@ jobs:
         if: matrix.build_type == 'Release'
         timeout-minutes: 5
         run: ./build/coro_stress
+
+      # F03 基线: 只记录数据, 不设硬性阀值 (共享 runner 上微秒门槛不可靠)。
+      # 目标: 任何性能改动都能与基线对比, 而不是靠主观感觉。
+      - name: Record runtime baseline (Release only)
+        if: matrix.build_type == 'Release'
+        timeout-minutes: 5
+        run: |
+          ./build/coro_bench 1 | tee bench-baseline.txt
+          {
+            echo "## coro_bench baseline (${{ matrix.label }})"
+            echo '```'
+            cat bench-baseline.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build and test logs
         if: failure()
@@ -245,7 +266,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build tests
-        run: cmake --build build --target coro_tests
+        run: cmake --build build --target coro_tests coro_header_check
 
       - name: Run TLS and HTTP client tests
         timeout-minutes: 15
@@ -328,10 +349,16 @@ jobs:
 
       - name: Configure CMake
         # Windows 上 TLS 仍不支持, 所以客户端在这里只验证非 TLS 路径。
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_HTTP_CLIENT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON
+        # 并发扩展必须显式开启: 默认 OFF 时 Timer/Context/channel/select/rate
+        # 等代码和用例会被条件编译排除, 绿色并不代表这些功能在 Windows 可用。
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_HTTP_CLIENT=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=ON
 
       - name: Build all targets
-        run: cmake --build build --config ${{ matrix.build_type }}
+        # 先落盘到 build.log (上传用的就是它), 再显式回传退出码:
+        # 管道会改写 $LASTEXITCODE, 不检查就会把编译失败误判成成功。
+        run: |
+          cmake --build build --config ${{ matrix.build_type }} 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run unit tests
         timeout-minutes: 5
@@ -421,7 +448,19 @@ jobs:
       - name: Run stress test (Release only)
         if: matrix.build_type == 'Release'
         timeout-minutes: 5
-        run: build\Release\coro_stress.exe
+        run: |
+          build\Release\coro_stress.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.build_type }}-logs
+          path: |
+            build.log
+            ctest-console.txt
+            build/Testing/Temporary/
 
   # ============================================================
   # Sanitizer 构建 (Linux)
@@ -448,7 +487,9 @@ jobs:
       CC: ${{ matrix.cc }}
       CXXFLAGS: ${{ matrix.flags }}
       CFLAGS: ${{ matrix.flags }}
-      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+      # detect_leaks=1: 不能全局关掉泄漏检查再看绿色。若确有带来源的上游噪声,
+      # 用 LSAN_OPTIONS=suppressions=ci/lsan.supp 做局部抑制, 不要整类关闭。
+      ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
       TSAN_OPTIONS: "abort_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:abort_on_error=1"
     steps:
@@ -464,8 +505,10 @@ jobs:
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCORO_REQUIRE_URING=ON -DCORO_ENABLE_WEB=ON -DCORO_ENABLE_CONCURRENCY_EXT=ON -DCORO_ENABLE_HTTP_CLIENT=ON -DCORO_BUILD_TESTS=ON -DCORO_BUILD_EXAMPLES=OFF
 
-      - name: Build (tests only)
-        run: cmake --build build --target coro_tests
+      - name: Build (tests + header self-check)
+        # 只构建 coro_tests 会漏掉公共头自检: 头文件隐式依赖 / 条件编译错误
+        # 在“能跑测试”的构建里完全看不出来。
+        run: cmake --build build --target coro_tests coro_header_check
 
 
       - name: Run tests with sanitizer
@@ -490,10 +533,13 @@ jobs:
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y cppcheck
 
-      - name: Run cppcheck (core library)
+      - name: Run cppcheck (core library + first-party sources)
         run: |
           # header-only 库必须显式传入头文件；目录扫描会跳过 .hpp。
+          # src/tcp_udp 与自维护的 thirdparty/http 包装也是第一方代码,
+          # 只查 include/coro 会把实现文件与 HTTP 解析全部漏掉。
           headers=(include/coro/*.hpp)
+          first_party=(src/*.cpp tcp_udp/*.hpp thirdparty/http/src/*.cpp)
           test -f "${headers[0]}"
           cppcheck --version
           # 隐藏逐文件进度，保留诊断；局部抑制仅用于已说明原因的代码位置。
@@ -505,9 +551,9 @@ jobs:
           cppcheck --quiet --enable=warning,performance,portability \
             --language=c++ --std=c++20 --inline-suppr \
             --suppress=missingIncludeSystem --suppress=toomanyconfigs \
-            -I include -I thirdparty/liburing/src/include \
+            -I include -I src -I tcp_udp -I thirdparty/liburing/src/include \
             --error-exitcode=1 \
-            "${headers[@]}" 2>&1 | tee cppcheck.log
+            "${headers[@]}" "${first_party[@]}" 2>&1 | tee cppcheck.log
 
       - name: Upload cppcheck report
         if: always()
@@ -547,7 +593,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
 
       - name: Build tests
-        run: cmake --build build --target coro_tests
+        run: cmake --build build --target coro_tests coro_header_check
 
 
       - name: Run tests
@@ -566,7 +612,8 @@ jobs:
             --gcov-tool gcov-13 \
             --ignore-errors mismatch,gcov,negative
           lcov --remove coverage.info \
-            '/usr/*' '*/thirdparty/*' '*/tests/*' '*/examples/*' \
+            '/usr/*' '*/tests/*' '*/examples/*' \
+            '*/thirdparty/openssl/*' '*/thirdparty/liburing/*' '*/thirdparty/googletest*' \
             --output-file coverage_filtered.info \
             --ignore-errors mismatch,unused
           genhtml coverage_filtered.info --output-directory coverage_report

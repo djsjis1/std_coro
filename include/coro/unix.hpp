@@ -2,10 +2,12 @@
 
 #include "event_loop.hpp"
 #include "io.hpp"
+#include "pipe.hpp" // io::poll (connect 的 EINPROGRESS 等待)
 #include "task.hpp"
 
 #include <cerrno>
 #include <coroutine>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -17,7 +19,9 @@
 #endif
 
 #if CORO_HAS_UNIX
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #endif
@@ -50,8 +54,10 @@
 //      通过 has_cancel_op trait 检测到 awaiter 提供了 `static cancel_op(void*)`, 自动把
 //      `&awaiter` 作为 self 注册进 promise。uring_op 本身只有 continuation/result/error
 //      三个字段。
-//   3. 文件系统路径 socket 在 bind 前 unlink 陈旧 inode (否则 EADDRINUSE), 但**只删
-//      自己创建的那个** —— 析构时 unlink 自己 bind 的路径, 不碰别人的文件。
+//   3. 文件系统路径 socket 只在**成功 bind 后**记录清理责任, 并记录创建时的 inode;
+//      析构/close 只在路径仍是本实例创建的那个 socket 时 unlink。bind 失败不删任何
+//      已有路径 —— 目标可能是别人的普通文件或活跃服务。需要清理陈旧 socket 时由
+//      调用方显式处理 (例如先自行 stat + unlink), 库不提供危险的隐式删除默认。
 // ============================================================================
 
 namespace coro {
@@ -117,9 +123,12 @@ namespace coro {
             bool valid() const noexcept { return fd_ >= 0; }
             int fd() const noexcept { return fd_; }
 
-            /// 关闭: 先 shutdown 打断挂起操作的阻塞语义, 再 close 释放 fd
+            /// 关闭: 先按 fd 取消挂起的 io_uring 操作 (它们持有文件引用,
+            /// 仅 close 不会完成), 再 shutdown 打断阻塞语义, 最后释放 fd
             void close() {
                 if (fd_ >= 0) {
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
@@ -157,8 +166,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = self->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_recv(sqe, self->fd_, buf, len, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -195,12 +205,8 @@ namespace coro {
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<write_awaiter*>(ptr);
-                    if (auto* u = detail::current_uring()) {
-                        if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -213,8 +219,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = self->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_send(sqe, self->fd_, buf, len, MSG_NOSIGNAL);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -239,18 +246,35 @@ namespace coro {
             /// path 必须按值进帧: 协程参数会被拷进帧, 而调用方的字符串可能在我们从
             /// connect() 挂起点恢复之前就析构。改成 const& 正好制造悬空引用 ——
             /// cppcheck 的 passedByValue 建议对普通函数成立, 对协程入口不成立。
+            ///
+            /// socket 以非阻塞模式创建: 对端监听队列已满时阻塞式 connect
+            /// 会卡死整个事件循环; EINPROGRESS 后挂起等 POLLOUT 再查
+            /// SO_ERROR 拿最终结果 (与 net.hpp 的 TCP connect 同语义)。
             // cppcheck-suppress passedByValue
             static Task<UnixStream> connect(std::string path) {
                 sockaddr_un addr = make_unix_address(path);
-                int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
                 if (fd < 0)
                     co_return UnixStream{};
                 const socklen_t alen = unix_address_length(addr);
                 if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0) {
-                    const int saved = errno;
-                    ::close(fd);
-                    errno = saved;
-                    co_return UnixStream{};
+                    if (errno != EINPROGRESS) {
+                        const int saved = errno;
+                        ::close(fd);
+                        errno = saved;
+                        co_return UnixStream{};
+                    }
+                    // 连接进行中: 挂起等待可写 (poll_awaiter 自带取消钩子)
+                    const uint32_t revents = co_await coro::io::poll(fd, POLLOUT);
+                    int so_error = 0;
+                    socklen_t optlen = sizeof(so_error);
+                    if (revents == 0 || ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &optlen) != 0 ||
+                        so_error != 0) {
+                        const int saved = so_error != 0 ? so_error : (revents == 0 ? errno : EIO);
+                        ::close(fd);
+                        errno = saved;
+                        co_return UnixStream{};
+                    }
                 }
                 co_return UnixStream{fd};
             }
@@ -268,7 +292,8 @@ namespace coro {
             UnixListener(const UnixListener&) = delete;
             UnixListener& operator=(const UnixListener&) = delete;
             UnixListener(UnixListener&& other) noexcept
-                : fd_(std::exchange(other.fd_, -1)), path_(std::move(other.path_)) {
+                : fd_(std::exchange(other.fd_, -1)), path_(std::move(other.path_)),
+                  path_dev_(std::exchange(other.path_dev_, 0)), path_ino_(std::exchange(other.path_ino_, 0)) {
                 other.path_.clear();
             }
             UnixListener& operator=(UnixListener&& other) noexcept {
@@ -276,6 +301,8 @@ namespace coro {
                     close();
                     fd_ = std::exchange(other.fd_, -1);
                     path_ = std::move(other.path_);
+                    path_dev_ = std::exchange(other.path_dev_, 0);
+                    path_ino_ = std::exchange(other.path_ino_, 0);
                     other.path_.clear();
                 }
                 return *this;
@@ -283,29 +310,53 @@ namespace coro {
 
             bool valid() const noexcept { return fd_ >= 0; }
 
-            /// 绑定文件系统路径 (自动 unlink 同名陈旧 inode) 并开始监听
+            /// 绑定文件系统路径并开始监听。
+            /// 已有同名路径直接失败 (EADDRINUSE), **不会隐式删除它**: 目标可能是普通文件
+            /// 或另一个正在运行的服务。清理陈旧 socket 必须由调用方显式完成。
             bool bind(const std::string& path, int backlog = SOMAXCONN) {
-                close(); // 幂等: 释放旧 fd 并 unlink 旧路径, 重复 bind 不泄漏
+                close(); // 幂等: 释放旧 fd, 并按 inode 校验清理本实例自己的旧路径
                 sockaddr_un addr = make_unix_address(path);
                 if (addr.sun_family != AF_UNIX)
                     return false; // 路径过长: errno 已由 make_unix_address 设好
                 const bool abstract = !path.empty() && path[0] == '@';
-                if (!abstract)
-                    ::unlink(path.c_str()); // 只清我们要占用的路径, 不碰别人的文件
                 int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
                 if (fd < 0)
                     return false;
                 const socklen_t alen = unix_address_length(addr);
-                if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0 || ::listen(fd, backlog) != 0) {
+                if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0) {
                     const int saved = errno;
                     ::close(fd);
                     errno = saved;
+                    return false; // 失败不代表拥有该路径: 绝不 unlink 别人的对象
+                }
+                if (::listen(fd, backlog) != 0) {
+                    // bind 已创建文件系统 socket 对象: listen 失败必须回收,
+                    // 否则留下僵尸路径, 之后 bind 永远 EADDRINUSE
+                    // (且清理责任已记录不到本实例名下)。
+                    const int saved = errno;
                     if (!abstract)
                         ::unlink(path.c_str());
+                    ::close(fd);
+                    errno = saved;
                     return false;
                 }
                 fd_ = fd;
-                path_ = abstract ? std::string{} : path; // 只有文件路径需要在析构时清理
+                if (abstract) {
+                    path_.clear(); // 抽象命名空间没有文件系统对象需要清理
+                    path_dev_ = 0;
+                    path_ino_ = 0;
+                } else {
+                    path_ = path;
+                    // 记录创建时的 inode: close 时路径若被替换, 不能删掉替代物
+                    struct stat sb {};
+                    if (::lstat(path_.c_str(), &sb) == 0) {
+                        path_dev_ = static_cast<std::uint64_t>(sb.st_dev);
+                        path_ino_ = static_cast<std::uint64_t>(sb.st_ino);
+                    } else {
+                        path_dev_ = 0;
+                        path_ino_ = 0;
+                    }
+                }
                 return true;
             }
 
@@ -315,16 +366,31 @@ namespace coro {
                 return bind(key, backlog);
             }
 
-            /// 关闭: 先 shutdown 唤醒挂起的 accept (只 close 会让事件循环永久等待)
+            /// 关闭: 先按 fd 取消挂起的 accept (io_uring 持有文件引用, 仅
+            /// close 会让事件循环永久等待), 再 shutdown 解除监听, 最后释放 fd
             void close() {
                 if (fd_ >= 0) {
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
                 }
                 if (!path_.empty()) {
-                    ::unlink(path_.c_str());
+                    // 只在路径仍是本实例创建的那个 socket inode 时才删除:
+                    // 路径可能已被其他进程替换成普通文件或另一个服务。
+                    struct stat sb {};
+                    const bool replaced = path_dev_ != 0 &&
+                                          (::lstat(path_.c_str(), &sb) != 0 ||
+                                           static_cast<std::uint64_t>(sb.st_dev) != path_dev_ ||
+                                           static_cast<std::uint64_t>(sb.st_ino) != path_ino_);
+                    if (!replaced) {
+                        if (::lstat(path_.c_str(), &sb) == 0 && S_ISSOCK(sb.st_mode))
+                            ::unlink(path_.c_str());
+                    }
                     path_.clear();
+                    path_dev_ = 0;
+                    path_ino_ = 0;
                 }
             }
 
@@ -347,12 +413,8 @@ namespace coro {
 
                 static void cancel_op(void* ptr) {
                     auto* aw = static_cast<accept_awaiter*>(ptr);
-                    if (auto* u = detail::current_uring()) {
-                        if (io_uring_sqe* sqe = io_uring_get_sqe(u->handle())) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -365,8 +427,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = self->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_accept(sqe, self->fd_, nullptr, nullptr, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -395,6 +458,8 @@ namespace coro {
           private:
             int fd_ = -1;
             std::string path_;
+            std::uint64_t path_dev_ = 0; ///< bind 成功时的设备号 (用于识别路径是否被替换)
+            std::uint64_t path_ino_ = 0; ///< bind 成功时的 inode
         };
 
         /// 一对互联的 Unix 流 (无监听、无路径): 同进程内两个协程或父子进程用

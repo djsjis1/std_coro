@@ -68,10 +68,15 @@ struct HttpTransport {
                 // A complete HTTP response may still be returned. The lease is
                 // discarded unconditionally, including on failed close_notify.
             }
+            co_return;
         }
 #else
         (void)timeout;
 #endif
+        // 纯 TCP 连接: shutdown 发 FIN 半关闭, 让对端尽早看到 EOF;
+        // 只等后续 closesocket 的话, Windows 在接收缓冲仍有未读数据时
+        // 会改发 RST, 对端把正常收尾误读为连接异常中断。
+        socket.shutdown();
         co_return;
     }
 };

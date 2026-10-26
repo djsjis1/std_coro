@@ -268,6 +268,11 @@ namespace coro {
 
             void close() {
                 if (valid()) {
+                    // 与 net/pipe 层同一合同: 挂起的重叠 IO (另一协程的
+                    // read_at/write_at) 先显式取消再关句柄 —— 仅 CloseHandle
+                    // 不承诺完成包投递, OVERLAPPED 生命周期依赖它。
+                    // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
+                    CancelIoEx(handle_, nullptr);
                     CloseHandle(handle_);
                     handle_ = INVALID_HANDLE_VALUE;
                 }
@@ -381,13 +386,8 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_at_awaiter*>(self);
-                    if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -395,16 +395,19 @@ namespace coro {
                     auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
+                        op.error = ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (!sqe) {
                         op.result = -ENOBUFS;
+                        op.error = ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     // IORING_OP_READ 自带偏移: 定位读, 不移动文件游标
+                    op.fd = file->fd_; // close 前可按 fd 批量取消
                     io_uring_prep_read(sqe, file->fd_, buf, (unsigned)len, (__s64)offset);
                     coro::detail::uring_submit(u, sqe, &op);
                     uring_ = u;
@@ -443,13 +446,8 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_at_awaiter*>(self);
-                    if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -457,15 +455,18 @@ namespace coro {
                     auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
+                        op.error = ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (!sqe) {
                         op.result = -ENOBUFS;
+                        op.error = ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
                     }
+                    op.fd = file->fd_; // close 前可按 fd 批量取消
                     io_uring_prep_write(sqe, file->fd_, buf, (unsigned)len, (__s64)offset);
                     coro::detail::uring_submit(u, sqe, &op);
                     uring_ = u;
@@ -501,13 +502,8 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<fsync_awaiter*>(self);
-                    if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -515,15 +511,18 @@ namespace coro {
                     auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
+                        op.error = ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (!sqe) {
                         op.result = -ENOBUFS;
+                        op.error = ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
                     }
+                    op.fd = file->fd_; // close 前可按 fd 批量取消
                     io_uring_prep_fsync(sqe, file->fd_, 0);
                     coro::detail::uring_submit(u, sqe, &op);
                     uring_ = u;
@@ -594,12 +593,14 @@ namespace coro {
                     auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
+                        op.error = ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (!sqe) {
                         op.result = -ENOBUFS;
+                        op.error = ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
                     }

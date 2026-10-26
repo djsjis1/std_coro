@@ -16,6 +16,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
+#include <vector>
 
 // ============================================================================
 // coro::net::UringEventSource — Linux io_uring 等待原语 (平台默认事件源)
@@ -55,7 +56,18 @@ namespace coro {
             std::coroutine_handle<> continuation{}; // 完成时要恢复的协程
             int result = 0;                         // 完成结果 (字节数, 负值=错误)
             int error = 0;                          // 错误码 (0=成功)
+            int fd = -1;                            // 操作目标描述符 (-1 = 无, 如 OPENAT 的 AT_FDCWD)
+                                                      // 供 close 前按 fd 批量取消 (cancel_fd_ops)
         };
+
+        /// 统一解读操作结果: 本地立即失败 (拿不到 SQE / 没有 io_uring 后端) 只写负
+        /// result 而不写 error, 旧代码只看 error 会把"未成功"当成成功。
+        /// 返回 0 表示成功, 否则为 errno 形态的正错误码。
+        inline int uring_op_error(const uring_op& op) noexcept {
+            if (op.error)
+                return op.error;
+            return op.result < 0 ? -op.result : 0;
+        }
 
 #endif
 
@@ -168,6 +180,38 @@ namespace coro {
             void untrack_op(detail::uring_op* op) {
                 std::lock_guard lock(tracked_mutex_);
                 tracked_ops_.erase(op);
+            }
+
+            /// 取消挂起在 fd 上的全部操作 —— close(fd) 前必须调用。
+            ///
+            /// io_uring 的操作持有 file 引用: 仅 ::close(fd) 既不取消也不完成
+            /// 它们 (管道/inotify/未连接 UDP 尤其如此), pending_ops_ 永不归零,
+            /// 事件循环会永久等待、进程不退出。此处按 op.fd 匹配 tracked_ops_
+            /// 逐个提交 ASYNC_CANCEL; 被取消的操作以 -ECANCELED 的 CQE 唤醒
+            /// 协程正常收尾。SQ 满时尽力而为 (与 submit_uring_cancel 同语义:
+            /// 该操作保持有效, 由内核自然完成)。
+            /// 仅应在事件循环线程调用 (close 通常满足)。
+            void cancel_fd_ops(int fd) {
+                if (fd < 0)
+                    return;
+                std::vector<detail::uring_op*> targets;
+                {
+                    std::lock_guard lock(tracked_mutex_);
+                    for (auto* op : tracked_ops_)
+                        if (op->fd == fd)
+                            targets.push_back(op);
+                }
+                bool any = false;
+                for (auto* op : targets) {
+                    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                    if (!sqe)
+                        break; // SQ 满: 剩余操作等内核自然完成
+                    io_uring_prep_cancel(sqe, op, 0);
+                    io_uring_sqe_set_data(sqe, nullptr); // 取消 CQE 不关联任何 op
+                    any = true;
+                }
+                if (any)
+                    (void)io_uring_submit(&ring_);
             }
 
             /// 是否还有挂起的 I/O 操作 (事件循环据此决定是否退出)

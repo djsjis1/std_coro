@@ -6,6 +6,7 @@
 #include <coro/task_registry.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -232,6 +233,18 @@ namespace coro {
 
         void report_error(const std::string& message) { state_->note_error(message); }
 
+        /// accept 错误是否可重试: 描述符耗尽/连接被重置/被信号打断这类错误
+        /// 不代表监听本身坏了, 继续监听才是对的。
+        static bool transient_accept_error(int native) noexcept {
+#ifdef _WIN32
+            return native == WSAEINTR || native == WSAECONNRESET || native == WSAECONNABORTED ||
+                   native == WSAEMFILE || native == WSAENOBUFS || native == WSAEWOULDBLOCK;
+#else
+            return native == EINTR || native == ECONNABORTED || native == EMFILE || native == ENFILE ||
+                   native == ENOBUFS || native == EAGAIN || native == EWOULDBLOCK;
+#endif
+        }
+
         /// accept 主循环 — 每有新连接就登记一个 handler 协程
         Task<> accept_loop(handler_t handler) {
             auto st = state_;
@@ -245,9 +258,18 @@ namespace coro {
             while (st->phase_value.load() == phase::running) {
                 auto conn = co_await listener_.accept();
                 if (!conn.valid()) {
-                    if (st->phase_value.load() == phase::running)
-                        report_error("accept failed");
-                    break;
+                    if (st->phase_value.load() != phase::running)
+                        break; // 停止请求导致的 accept 失败是预期行为
+                    const int native = io::last_error();
+                    if (transient_accept_error(native)) {
+                        // 临时错误 (fd 耗尽/连接被重置/信号打断): 不退出监听,
+                        // 短暂退避后重试; 否则一次抖动就永久停掉服务。
+                        report_error("transient accept error");
+                        co_await coro::sleep(std::chrono::milliseconds(5));
+                        continue;
+                    }
+                    report_error("accept failed");
+                    break; // 终止性错误 (句柄/监听已失效)
                 }
                 if (st->phase_value.load() != phase::running) {
                     conn.close();

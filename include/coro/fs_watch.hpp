@@ -109,7 +109,8 @@ namespace coro {
 
             DirectoryWatcher(DirectoryWatcher&& other) noexcept
                 : dir_(std::exchange(other.dir_, INVALID_HANDLE_VALUE)), recursive_(other.recursive_),
-                  pending_(std::move(other.pending_)), terminal_error_(std::exchange(other.terminal_error_, 0)) {}
+                  pending_(std::move(other.pending_)), pending_rename_old_(std::move(other.pending_rename_old_)),
+                  terminal_error_(std::exchange(other.terminal_error_, 0)) {}
 
             DirectoryWatcher& operator=(DirectoryWatcher&& other) noexcept {
                 if (this != &other) {
@@ -117,6 +118,7 @@ namespace coro {
                     dir_ = std::exchange(other.dir_, INVALID_HANDLE_VALUE);
                     recursive_ = other.recursive_;
                     pending_ = std::move(other.pending_);
+                    pending_rename_old_ = std::move(other.pending_rename_old_);
                     terminal_error_ = std::exchange(other.terminal_error_, 0);
                 }
                 return *this;
@@ -128,11 +130,13 @@ namespace coro {
             bool valid() const { return dir_ != INVALID_HANDLE_VALUE; }
             int error() const noexcept { return terminal_error_; }
 
-            /// 提交一次 ReadDirectoryChangesW 并挂起 (完成驱动)
+            /// 提交一次 ReadDirectoryChangesW 并挂起 (完成驱动)。
+            /// 事件缓冲挂在 watcher 上复用: 事件流消费是 `while (true) next()`
+            /// 热循环, 每次挂起都新分配 4KB 协程帧与库其余部分"热路径零分配"
+            /// 的水准不符。watcher 按设计是单消费者 (pending 队列非并发),
+            /// 复用无竞争。
             struct changes_awaiter {
                 DirectoryWatcher* w;
-                alignas(FILE_NOTIFY_INFORMATION) char buf
-                    [4096]; // 内核写入的事件缓冲 (awaiter 在协程帧里, 帧活着则缓冲活着)
                 detail::iocp_op op;
 
                 bool await_ready() const noexcept { return false; }
@@ -158,7 +162,8 @@ namespace coro {
                                    FILE_NOTIFY_CHANGE_LAST_WRITE | // 内容修改
                                    FILE_NOTIFY_CHANGE_SIZE |       // 大小变化
                                    FILE_NOTIFY_CHANGE_CREATION;    // 创建时间戳变化
-                    BOOL rc = ReadDirectoryChangesW(w->dir_, buf, sizeof(buf), w->recursive_, filter,
+                    BOOL rc = ReadDirectoryChangesW(w->dir_, w->event_buf_.data(),
+                                                    (DWORD)w->event_buf_.size(), w->recursive_, filter,
                                                     nullptr /*完成时字节数经完成包给*/, &op.ov, nullptr);
                     if (!rc && GetLastError() != ERROR_IO_PENDING) {
                         // 立即失败 (句柄无效/非目录): 无完成包, 手动恢复。
@@ -171,7 +176,9 @@ namespace coro {
                 }
 
                 /// 完成后: 解析缓冲里的全部事件进 watcher 的 pending 队列
-                void await_resume() { w->parse_records(buf, op.error, op.transferred); }
+                void await_resume() {
+                    w->parse_records(w->event_buf_.data(), op.error, op.transferred);
+                }
             };
 
             /// 取下一个事件: pending 有则直接弹, 否则提交一次目录读并解析
@@ -183,15 +190,19 @@ namespace coro {
                         io::set_error(terminal_error_ ? terminal_error_ : (int)ERROR_INVALID_HANDLE);
                         co_return watch_event{};
                     }
-                    changes_awaiter aw{this, {}, {}};
+                    changes_awaiter aw{this, {}};
                     co_await aw;
                     // 无事件时复用当前协程帧；终止错误已关闭 watcher。
                 }
             }
 
-            /// 停止监视并关闭句柄 (有挂起的 next() 时不可调用)
+            /// 停止监视并关闭句柄。挂起的 next() 会以 ERROR_OPERATION_ABORTED
+            /// 完成包唤醒并返回默认事件。
             void close() {
                 if (valid()) {
+                    // 与 net/pipe/fs 层同一合同: 先显式取消挂起的重叠读再关句柄
+                    // (仅 CloseHandle 不承诺完成包投递)。
+                    CancelIoEx(dir_, nullptr);
                     CloseHandle(dir_);
                     dir_ = INVALID_HANDLE_VALUE;
                 }
@@ -200,7 +211,11 @@ namespace coro {
           private:
             HANDLE dir_ = INVALID_HANDLE_VALUE;
             bool recursive_ = true;
+            /// ReadDirectoryChangesW 事件缓冲 (跨 next() 复用, 单消费者无竞争)
+            std::vector<char> event_buf_ = std::vector<char>(4096);
             std::deque<watch_event> pending_;
+            /// 跨完成批次的 RENAMED_OLD 待配对名 (内核可能把 OLD/NEW 拆成两个包)
+            std::string pending_rename_old_;
             int terminal_error_ = 0;
 
             void fail(int error) {
@@ -227,7 +242,6 @@ namespace coro {
                     fail(error ? error : (int)ERROR_INVALID_DATA);
                     return;
                 }
-                std::string rename_old; // 配对 RENAMED_OLD/NEW (同一批次内)
                 const char* p = buf;
                 const char* end = buf + bytes;
                 constexpr size_t header_size = offsetof(FILE_NOTIFY_INFORMATION, FileName);
@@ -246,6 +260,13 @@ namespace coro {
                     std::replace(name.begin(), name.end(), '\\', '/');
                     watch_event ev;
                     bool has_event = true;
+                    // OLD/NEW 可能被内核拆到两次完成里: 待配对的旧名存在成员上, 不再
+                    // 每批末尾当成 removed 上报 (旧实现会伪造一个误报的删除)。
+                    if (ni->Action != FILE_ACTION_RENAMED_NEW_NAME && !pending_rename_old_.empty()) {
+                        pending_.push_back(
+                            watch_event{watch_event_type::removed, std::move(pending_rename_old_), "", false});
+                        pending_rename_old_.clear();
+                    }
                     switch (ni->Action) {
                         case FILE_ACTION_ADDED:
                             ev.type = watch_event_type::created;
@@ -260,14 +281,26 @@ namespace coro {
                             ev.path = std::move(name);
                             break;
                         case FILE_ACTION_RENAMED_OLD_NAME:
-                            rename_old = std::move(name);
-                            has_event = false; // 等配对的新名, 暂不入队
+                            if (!pending_rename_old_.empty()) {
+                                // 连续两个 OLD: 前一个无法配对 → 明确降级为删除
+                                pending_.push_back(
+                                    watch_event{watch_event_type::removed, std::move(pending_rename_old_), "", false});
+                            }
+                            pending_rename_old_ = std::move(name);
+                            has_event = false; // 等配对的新名
                             break;
                         case FILE_ACTION_RENAMED_NEW_NAME:
-                            ev.type = watch_event_type::renamed;
-                            ev.old_path = std::move(rename_old);
-                            ev.path = std::move(name);
-                            rename_old.clear();
+                            if (pending_rename_old_.empty()) {
+                                // 没有旧名可配 (跨批次丢失或监视从中间开始):
+                                // 目标确实出现了, 按创建上报, 不伪造一个空 old_path 的 rename。
+                                ev.type = watch_event_type::created;
+                                ev.path = std::move(name);
+                            } else {
+                                ev.type = watch_event_type::renamed;
+                                ev.old_path = std::move(pending_rename_old_);
+                                ev.path = std::move(name);
+                                pending_rename_old_.clear();
+                            }
                             break;
                         default:
                             has_event = false; // 未知动作: 忽略
@@ -286,15 +319,22 @@ namespace coro {
                     }
                     p += ni->NextEntryOffset;
                 }
-                // 批次结束仍有未配对的旧名 → 按删除上报
-                if (!rename_old.empty())
-                    pending_.push_back(watch_event{watch_event_type::removed, std::move(rename_old), "", false});
             }
         };
 
         /// 打开目录监视 (同步打开目录句柄 — 元数据操作; 关联 IOCP)
         /// recursive: 递归监视子目录 (Windows 原生支持)
+        ///
+        /// 注意入口与实现的分离: watch() 是**普通函数**, 在调用时就把路径复制成
+        /// owning string; 而协程体要到首次恢复才执行 —— 若它自己读 string_view,
+        /// 调用点传的临时 string 早已销毁 (真实悬空读取)。
+        inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive = true);
+
         inline Task<DirectoryWatcher> watch(std::string_view path, bool recursive = true) {
+            return watch_owned(std::string(path), recursive);
+        }
+
+        inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive) {
             std::wstring w;
             {
                 int n = MultiByteToWideChar(CP_UTF8, 0, path.data(), (int)path.size(), nullptr, 0);
@@ -339,8 +379,11 @@ namespace coro {
 
             DirectoryWatcher(DirectoryWatcher&& other) noexcept
                 : fd_(std::exchange(other.fd_, -1)), recursive_(other.recursive_),
-                  root_path_(std::move(other.root_path_)), pending_(std::move(other.pending_)),
-                  wd_paths_(std::move(other.wd_paths_)), pending_moves_(std::move(other.pending_moves_)) {}
+                  root_path_(std::move(other.root_path_)), event_buf_(std::move(other.event_buf_)),
+                  pending_(std::move(other.pending_)), wd_paths_(std::move(other.wd_paths_)),
+                  pending_moves_(std::move(other.pending_moves_)),
+                  terminal_error_(std::exchange(other.terminal_error_, 0)),
+                  needs_rescan_(std::exchange(other.needs_rescan_, false)) {}
 
             DirectoryWatcher& operator=(DirectoryWatcher&& other) noexcept {
                 if (this != &other) {
@@ -348,9 +391,12 @@ namespace coro {
                     fd_ = std::exchange(other.fd_, -1);
                     recursive_ = other.recursive_;
                     root_path_ = std::move(other.root_path_);
+                    event_buf_ = std::move(other.event_buf_);
                     pending_ = std::move(other.pending_);
                     wd_paths_ = std::move(other.wd_paths_);
                     pending_moves_ = std::move(other.pending_moves_);
+                    terminal_error_ = std::exchange(other.terminal_error_, 0);
+                    needs_rescan_ = std::exchange(other.needs_rescan_, false);
                 }
                 return *this;
             }
@@ -360,9 +406,16 @@ namespace coro {
 
             bool valid() const { return fd_ >= 0; }
 
+            /// 终止性错误 (读失败/句柄失效); 0 = 无。与 Windows 层对齐:
+            /// 失效后 next() 返回默认事件, 但调用方可以凭这个值区分“真没事件”。
+            int error() const noexcept { return terminal_error_; }
+
+            /// overflow 之后 wd→路径映射可能已与真实目录树失配,
+            /// 调用方应重建 watcher (或自行重扫) 后再继续消费。
+            bool needs_rescan() const noexcept { return needs_rescan_; }
+
             struct read_awaiter {
                 DirectoryWatcher* w;
-                alignas(struct inotify_event) char buf[64 * 1024];
                 detail::uring_op op;
                 net::UringEventSource* uring_ = nullptr;
 
@@ -375,13 +428,8 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
-                    if (auto* u = detail::current_uring()) {
-                        io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
-                        if (sqe) {
-                            io_uring_prep_cancel(sqe, &aw->op, 0);
-                            io_uring_submit(u->handle());
-                        }
-                    }
+                    if (auto* u = detail::current_uring())
+                        detail::submit_uring_cancel(u, &aw->op);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -389,18 +437,21 @@ namespace coro {
                     auto* u = detail::current_uring();
                     if (!u) {
                         op.result = -ENOTSUP;
+                        op.error = ENOTSUP;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                     if (!sqe) {
                         op.result = -ENOBUFS;
+                        op.error = ENOBUFS;
                         EventLoop::get().schedule(h);
                         return;
                     }
                     // inotify fd 必须保持 O_NONBLOCK，而直接 IORING_OP_READ 在
                     // 部分内核上会立即返回 EAGAIN。先用 poll 等就绪，
                     // 完成时再在 loop 线程做一次不阻塞 read。
+                    op.fd = w->fd_; // close 前可按 fd 批量取消
                     io_uring_prep_poll_add(sqe, w->fd_, POLLIN);
                     detail::uring_submit(u, sqe, &op);
                     uring_ = u;
@@ -409,17 +460,17 @@ namespace coro {
 
                 void await_resume() {
                     if (op.result < 0) {
-                        w->parse_records(buf, op.result);
+                        w->parse_records(w->event_buf_.data(), op.result);
                         return;
                     }
 
                     ssize_t bytes;
                     do {
-                        bytes = ::read(w->fd_, buf, sizeof(buf));
+                        bytes = ::read(w->fd_, w->event_buf_.data(), w->event_buf_.size());
                     } while (bytes < 0 && errno == EINTR);
                     if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                         return; // 就绪到 read 之间被消费：重新等 poll
-                    w->parse_records(buf, bytes < 0 ? -errno : static_cast<int>(bytes));
+                    w->parse_records(w->event_buf_.data(), bytes < 0 ? -errno : static_cast<int>(bytes));
                 }
             };
 
@@ -428,7 +479,7 @@ namespace coro {
                     if (!pending_.empty())
                         co_return pop_pending();
                     if (!valid()) {
-                        io::set_error(EBADF);
+                        io::set_error(terminal_error_ ? terminal_error_ : EBADF);
                         co_return watch_event{};
                     }
 
@@ -446,8 +497,12 @@ namespace coro {
                 }
             }
 
+            /// 关闭监视。Linux 侧: 挂起的 POLL 持有 inotify fd 引用, 仅
+            /// ::close 不会让它完成 (事件循环永久等待 + 帧泄漏) —— 先按 fd 取消。
             void close() {
                 if (fd_ >= 0) {
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::close(fd_);
                     fd_ = -1;
                 }
@@ -464,9 +519,14 @@ namespace coro {
             int fd_ = -1;
             bool recursive_ = true;
             std::filesystem::path root_path_;
+            /// inotify 事件读取缓冲 (跨批次复用, 单消费者无竞争;
+            /// 避免每批次在协程帧里重新分配 64KB)
+            std::vector<char> event_buf_ = std::vector<char>(64 * 1024);
             std::deque<watch_event> pending_;
             std::unordered_map<int, std::string> wd_paths_;
             std::unordered_map<uint32_t, pending_move> pending_moves_;
+            int terminal_error_ = 0;  ///< 终止性读错误 (0 = 无)
+            bool needs_rescan_ = false; ///< overflow 后 wd 映射可能已失配
 
             static constexpr uint32_t watch_mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM |
                                                    IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF;
@@ -586,6 +646,7 @@ namespace coro {
             void parse_records(const char* buf, int bytes) {
                 if (bytes <= 0) {
                     if (bytes < 0) {
+                        terminal_error_ = -bytes;
                         io::set_error(-bytes);
                         close();
                     }
@@ -605,6 +666,8 @@ namespace coro {
 
                     if (ie->mask & IN_Q_OVERFLOW) {
                         pending_moves_.clear();
+                        // 内核丢了事件: wd 映射可能已经过时, 标记需要重建索引
+                        needs_rescan_ = true;
                         pending_.push_back(watch_event{watch_event_type::overflow, "", "", false});
                         continue;
                     }
@@ -677,13 +740,21 @@ namespace coro {
         };
 
         /// 打开目录监视: inotify_init1 + add_watch
+        ///
+        /// 入口与实现分离同 Windows 层: watch() 立即复制路径, 协程体只接收 owning string。
+        inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive = true);
+
         inline Task<DirectoryWatcher> watch(std::string_view path, bool recursive = true) {
+            return watch_owned(std::string(path), recursive);
+        }
+
+        inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive) {
             int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
             if (fd < 0) {
                 io::set_error(errno);
                 co_return DirectoryWatcher{};
             }
-            co_return DirectoryWatcher(fd, std::string(path), recursive);
+            co_return DirectoryWatcher(fd, std::move(path), recursive);
         }
 
 #endif

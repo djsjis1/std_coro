@@ -71,6 +71,11 @@ namespace coro {
 
         /// 发送侧等待节点。放堆上并用 shared_ptr 当身份: 容器在 push/erase 后
         /// 不保证元素地址不变, 拿容器内地址当"我是谁"会是隐藏错误。
+        // 前置声明: 端点句柄的 send/recv 直接返回 awaiter (不再包一层 Task),
+        // 省掉每次操作的协程帧分配与一次额外恢复
+        template <typename T> struct channel_send_awaiter;
+        template <typename T> struct channel_recv_awaiter;
+        
         template <typename T> struct channel_sender_waiter {
             T value;
             std::coroutine_handle<> handle{};
@@ -127,9 +132,13 @@ namespace coro {
             // 按队列顺序找第一个仍可成交的接收者。**被拒的节点绝不摘链** —— 它属于
             // 另一个尚未完成仲裁的 select, 只能由那个 select 自己撤销; 顺手摘掉会让
             // 对方永远等不到唤醒 (实测: select 挂死)。
-            for (auto& node : st.receivers) {
+            // 但成交后必须立即摘链: 普通 recv 的 gate 为空, 不会因一次成交而关闭,
+            // 留在候选队列里就会被后续 send 再次选中并覆盖消息, 新接收者则永远饥饿。
+            for (auto it = st.receivers.begin(); it != st.receivers.end(); ++it) {
+                const std::shared_ptr<channel_receiver_waiter<T>> node = *it;
                 if (!gate_open(node->gate, node->tag) || !gate_claim(node->gate, node->tag))
                     continue;
+                st.receivers.erase(it); // 成交即退役, 与 select 的 disarm 幂等兼容
                 node->value = std::move(value);
                 node->delivered = true;
                 channel_wake(st, node->handle);
@@ -276,8 +285,9 @@ namespace coro {
                 return false;
             }
 
-            /// 阻塞式发送 (协程): 满则挂起, 关闭则抛 ClosedChannelError
-            Task<void> send(T value) const;
+            /// 阻塞式发送 (协程): 满则挂起, 关闭则抛 ClosedChannelError。
+            /// 直接返回 awaiter: 快路径 (直接交接/进缓冲) 既不开协程帧也不建堆节点。
+            detail::channel_send_awaiter<T> send(T value) const;
 
             /// 主动关闭发送侧: 已挂起的发送者以 ClosedChannelError 退出,
             /// 缓冲里的存量仍可被接收方排空 (先排空再 EOF)。
@@ -394,8 +404,9 @@ namespace coro {
                 return true;
             }
 
-            /// 阻塞式接收 (协程): 空则挂起; 先排空存量再返回 nullopt 表示 EOF
-            Task<std::optional<T>> recv() const;
+            /// 阻塞式接收 (协程): 空则挂起; 先排空存量再返回 nullopt 表示 EOF。
+            /// 同样直接返回 awaiter, 快路径零堆分配。
+            detail::channel_recv_awaiter<T> recv() const;
 
             /// 默认构造的空句柄视为"已关闭且无数据": 等待方据此走 EOF 分支,
             /// 而不是解引用空的 state_ (那是未定义行为)。
@@ -496,22 +507,36 @@ namespace coro {
 
     namespace detail {
 
-        /// 发送侧 awaiter。持有 state 与自己的节点 (都是 shared_ptr), 因此等待期间
-        /// 端点句柄被销毁也不会悬空; 等待协程本身是自由协程, 同理不捕获句柄的 this。
+        /// 发送侧 awaiter。state 用 shared_ptr 持有 (端点先销毁也不会悬空);
+        /// **等待节点只在真正挂起时才分配** —— 快路径 (直接交接/进缓冲) 不碰堆。
         template <typename T> struct channel_send_awaiter {
             std::shared_ptr<channel_state<T>> st;
-            std::shared_ptr<channel_sender_waiter<T>> node;
+            T value;
+            std::shared_ptr<channel_sender_waiter<T>> node; // 仅挂起路径使用
+            bool taken = false;
+
+            channel_send_awaiter(std::shared_ptr<channel_state<T>> state, T v)
+                : st(std::move(state)), value(std::move(v)) {}
+            // 用户声明的析构会抑制隐式移动构造, 而 await_transform 按值传递 awaiter:
+            // 不显式声明移动就只能走拷贝 (move-only 元素直接编不过)。
+            // 移动后 node 为空, 源对象析构时不会重复摘链。
+            channel_send_awaiter(channel_send_awaiter&& other) noexcept
+                : st(std::move(other.st)), value(std::move(other.value)), node(std::move(other.node)),
+                  taken(other.taken) {}
+            channel_send_awaiter(const channel_send_awaiter&) = delete;
+            channel_send_awaiter& operator=(const channel_send_awaiter&) = delete;
+            channel_send_awaiter& operator=(channel_send_awaiter&&) = delete;
 
             bool await_ready() {
                 if (st->send_closed || st->all_receivers_gone)
                     return false; // 仍走挂起路径, 由 await_suspend 里的自检立刻醒回来
-                if (channel_deliver(*st, node->value)) {
-                    node->taken = true;
+                if (channel_deliver(*st, value)) {
+                    taken = true;
                     return true;
                 }
                 if (channel_has_room(*st)) {
-                    st->buffer.push_back(std::move(node->value));
-                    node->taken = true;
+                    st->buffer.push_back(std::move(value));
+                    taken = true;
                     return true;
                 }
                 return false;
@@ -519,6 +544,7 @@ namespace coro {
 
             void await_suspend(std::coroutine_handle<> h) {
                 auto& loop = EventLoop::get();
+                node = std::make_shared<channel_sender_waiter<T>>(std::move(value));
                 node->handle = h;
                 st->senders.push_back(node);
                 if (st->send_closed || st->all_receivers_gone) {
@@ -529,9 +555,10 @@ namespace coro {
             }
 
             void await_resume() {
-                if (node->taken)
+                if (node ? node->taken : taken)
                     return;
-                channel_drop_sender(*st, node); // 关闭路径: 值随节点析构释放
+                if (node)
+                    channel_drop_sender(*st, node); // 关闭路径: 值随节点析构释放
                 throw ClosedChannelError("send on closed channel");
             }
 
@@ -545,14 +572,22 @@ namespace coro {
             }
         };
 
-        /// 接收侧 awaiter。**所有值一律经堆节点传递**: awaiter 是 co_await 的临时量,
-        /// 会被 Task 的 await_transform 以右值引用持有甚至移动, 任何写它成员的做法
-        /// (包括 await_suspend 里自己写) 都可能落在另一份副本上看不见。
+        /// 接收侧 awaiter。快路径把值直接存在 awaiter 里 (零分配);
+        /// 只有真正挂起时才建堆节点, 由通道把值交付到节点上。
         template <typename T> struct channel_recv_awaiter {
             std::shared_ptr<channel_state<T>> st;
-            std::shared_ptr<channel_receiver_waiter<T>> node;
+            std::optional<T> inline_value;                    // 快路径结果
+            std::shared_ptr<channel_receiver_waiter<T>> node; // 仅挂起路径使用
 
-            /// 快速路径与挂起路径共用同一个出口: 落到堆节点上
+            explicit channel_recv_awaiter(std::shared_ptr<channel_state<T>> state) : st(std::move(state)) {}
+            // 同理: 显式移动构造, 移动后 node 为空 -> 源对象析构不会重复摘链
+            channel_recv_awaiter(channel_recv_awaiter&& other) noexcept
+                : st(std::move(other.st)), inline_value(std::move(other.inline_value)), node(std::move(other.node)) {}
+            channel_recv_awaiter(const channel_recv_awaiter&) = delete;
+            channel_recv_awaiter& operator=(const channel_recv_awaiter&) = delete;
+            channel_recv_awaiter& operator=(channel_recv_awaiter&&) = delete;
+
+            /// 挂起路径的交付出口: 值落到堆节点上
             void land(std::optional<T> value) {
                 node->value = std::move(value);
                 node->delivered = true;
@@ -560,27 +595,35 @@ namespace coro {
 
             bool await_ready() {
                 if (!st->buffer.empty()) {
-                    std::optional<T> got = std::move(st->buffer.front());
+                    inline_value = std::move(st->buffer.front());
                     st->buffer.pop_front();
-                    land(std::move(got));
                     channel_promote_senders(*st); // 腾出的位置按 FIFO 放行挂起的发送者
                     return true;
                 }
-                std::optional<T> got;
-                if (channel_take_pending_sender(*st, got)) { // 含 rendezvous 的关键路径
-                    land(std::move(got));
+                if (channel_take_pending_sender(*st, inline_value)) // 含 rendezvous 的关键路径
                     return true;
-                }
                 return st->send_closed; // 已关闭且无存量: 直接 EOF
             }
 
             void await_suspend(std::coroutine_handle<> h) {
                 auto& loop = EventLoop::get();
+                node = std::make_shared<channel_receiver_waiter<T>>();
                 node->handle = h;
                 st->receivers.push_back(node);
                 // 挂链后自检竞态: 期间被关闭, 或缓冲里刚好有了值
-                if ((st->send_closed && st->buffer.empty()) || (!st->buffer.empty() && st->capacity > 0)) {
+                if (st->send_closed && st->buffer.empty()) {
                     channel_drop_receiver(*st, node);
+                    loop.schedule(h);
+                    return;
+                }
+                if (!st->buffer.empty()) {
+                    // 挂链前缓冲里刚出现值: 必须在这里取走, 否则恢复后 await_resume
+                    // 看到 delivered=false 会报 EOF, 调用方以为通道结束 (假 EOF)。
+                    channel_drop_receiver(*st, node);
+                    std::optional<T> got = std::move(st->buffer.front());
+                    st->buffer.pop_front();
+                    land(std::move(got));
+                    channel_promote_senders(*st);
                     loop.schedule(h);
                     return;
                 }
@@ -594,9 +637,9 @@ namespace coro {
             }
 
             std::optional<T> await_resume() {
-                if (node->delivered)
-                    return std::move(node->value);
-                return std::nullopt; // 被关闭/无人接收唤醒: EOF
+                if (node)
+                    return node->delivered ? std::move(node->value) : std::nullopt;
+                return std::move(inline_value);
             }
 
             /// 与发送侧同理: 取消绕过 await_resume, 必须由析构摘链, 否则发送方
@@ -607,26 +650,16 @@ namespace coro {
             }
         };
 
-        template <typename T> inline Task<void> channel_send(std::shared_ptr<channel_state<T>> st, T value) {
-            co_await channel_send_awaiter<T>{std::move(st),
-                                             std::make_shared<channel_sender_waiter<T>>(std::move(value))};
-            co_return;
-        }
-
-        template <typename T> inline Task<std::optional<T>> channel_recv(std::shared_ptr<channel_state<T>> st) {
-            co_return co_await channel_recv_awaiter<T>{std::move(st), std::make_shared<channel_receiver_waiter<T>>()};
-        }
-
     } // namespace detail
 
-    template <typename T> Task<void> channel<T>::sender::send(T value) const {
+    template <typename T> detail::channel_send_awaiter<T> channel<T>::sender::send(T value) const {
         require_bound();
-        return detail::channel_send(state_, std::move(value));
+        return detail::channel_send_awaiter<T>{state_, std::move(value)};
     }
 
-    template <typename T> Task<std::optional<T>> channel<T>::receiver::recv() const {
+    template <typename T> detail::channel_recv_awaiter<T> channel<T>::receiver::recv() const {
         require_bound();
-        return detail::channel_recv(state_);
+        return detail::channel_recv_awaiter<T>{state_};
     }
 
 } // namespace coro

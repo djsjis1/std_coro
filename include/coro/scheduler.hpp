@@ -1,5 +1,7 @@
 #pragma once
 
+#include "exceptions.hpp"
+#include "sync.hpp"
 #include "task.hpp"
 
 #include <algorithm>
@@ -7,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -92,6 +95,7 @@ namespace coro {
 
         /// 停止并 join 所有 worker (先等待已分发任务完成)
         ~Scheduler() {
+            stop_accepting();
             // 1. 等待所有已投递任务完成 (带自适应退避, 同 wait_all)
             wait_all();
             // 2. 逐个 stop+join: 确保每个 worker 的 EventLoop 完全析构后
@@ -108,6 +112,28 @@ namespace coro {
         Scheduler(const Scheduler&) = delete;
         Scheduler& operator=(const Scheduler&) = delete;
 
+        /// 停止接收新任务 (已分发任务继续跑完)。可 await join() 等它们结束。
+        void stop_accepting() noexcept { control_->stopped.store(true, std::memory_order_release); }
+
+        bool accepting() const noexcept { return !control_->stopped.load(std::memory_order_acquire); }
+
+        /// 可 await 的完成通知: 所有已分发任务退出后返回。
+        /// 与 wait_all 的区别: 不阻塞线程, 由任务完成时的通知唤醒 (无轮询)。
+        /// 不能在 worker 线程上 await (那会等自己).
+        Task<void> join() {
+            for (const auto& worker : workers_) {
+                if (worker.thread.get_id() == std::this_thread::get_id())
+                    throw std::logic_error("Scheduler::join cannot run on a worker of the same scheduler");
+            }
+            auto ev = idle_event();
+            while (control_->running.load(std::memory_order_acquire) > 0) {
+                ev->clear();
+                if (control_->running.load(std::memory_order_acquire) == 0)
+                    break;
+                co_await ev->wait();
+            }
+        }
+
         /// 分发一个任务工厂到"活跃协程最少"的 worker:
         /// factory 在 worker 线程被调用 (协程帧在 worker 线程创建/销毁,
         /// 避免跨线程堆操作), 返回的 Task 立即启动并自持有运行到完成。
@@ -118,32 +144,29 @@ namespace coro {
         ///
         /// 注意: 不返回任务句柄 (结果通过参数/共享状态传递)。
         template <typename F> void spawn_any(F factory) {
+            if (!accepting())
+                throw OverloadError("Scheduler::spawn_any: scheduler has been stopped");
             // dispatch 的 std::function 需要可复制包装; 工厂本身允许仅可移动。
             auto holder = std::make_shared<F>(std::move(factory));
+            auto ctl = control_;
             ++pending_dispatches_;
+            ctl->running.fetch_add(1, std::memory_order_acq_rel);
             // 单次扫描直接拿索引 (旧实现 pick_least_loaded 返回指针后
             // 还要 index_of 再扫一遍, O(2N) → O(N))
             size_t best = pick_least_loaded_index();
             ++assigned_[best];
             try {
-                workers_[best].loop.load(std::memory_order_acquire)->dispatch([this, holder]() mutable {
-                    try {
-                        auto task = run_factory(std::move(*holder));
-                        task.start();
-                        task.detach();
-                    } catch (...) {
-                        // 包装任务创建失败也要可观测; 工厂运行时异常走 Task 的默认报告。
-                        try {
-                            detail::detached_exception_handler()(std::current_exception());
-                        } catch (...) {
-                            std::fprintf(stderr, "[coro] scheduler error handler threw\n");
-                        }
-                    }
-                    --pending_dispatches_;
+                workers_[best].loop.load(std::memory_order_acquire)->dispatch([this, ctl, holder]() mutable {
+                    // 业务协程由 runner 持有到完成: 它在完成时递减 running 并唤醒 join()
+                    auto task = run_factory(std::move(*holder), ctl);
+                    task.start();
+                    task.detach();
+                    --pending_dispatches_; // 已成功创建并启动
                 });
             } catch (...) {
                 --assigned_[best];
                 --pending_dispatches_;
+                ctl->running.fetch_sub(1, std::memory_order_acq_rel);
                 throw;
             }
         }
@@ -190,7 +213,49 @@ namespace coro {
         }
 
       private:
-        template <typename F> static Task<> run_factory(F factory) { co_await factory(); }
+        /// 跨任务共享的控制块: Scheduler 先析构也不会让 runner 访问悬空 this
+        struct control {
+            std::atomic<int> running{0};
+            std::atomic<bool> stopped{false};
+            std::mutex mtx;
+            std::shared_ptr<Event> idle;
+        };
+
+        std::shared_ptr<Event> idle_event() {
+            std::lock_guard lock(control_->mtx);
+            if (!control_->idle)
+                control_->idle = std::make_shared<Event>();
+            return control_->idle;
+        }
+
+        /// 包装工厂返回的任务: 无论成功/取消/异常都递减计数, 归零时通知 join()
+        template <typename F> static Task<> run_factory(F factory, std::shared_ptr<control> ctl) {
+            struct scope {
+                std::shared_ptr<control> ctl;
+                ~scope() {
+                    if (ctl->running.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::shared_ptr<Event> ev;
+                        {
+                            std::lock_guard lock(ctl->mtx);
+                            ev = ctl->idle;
+                        }
+                        if (ev)
+                            ev->set();
+                    }
+                }
+            } s{std::move(ctl)};
+            try {
+                co_await factory();
+            } catch (const CancelledError&) {
+                // 关停导致的正常退出
+            } catch (...) {
+                try {
+                    detail::detached_exception_handler()(std::current_exception());
+                } catch (...) {
+                    std::fprintf(stderr, "[coro] scheduler error handler threw\n");
+                }
+            }
+        }
 
         /// 选择「活跃协程最少」的 worker, 返回其索引。
         /// 两级选择:
@@ -239,6 +304,8 @@ namespace coro {
         std::vector<Worker> workers_;
         std::unique_ptr<std::atomic<size_t>[]> assigned_; // 每 worker 累计分发数 (均衡辅助)
         std::atomic<size_t> pending_dispatches_{0};       // 已投递但 worker 尚未执行的分发数
+        /// 任务完成计数与 join() 通知 (与 runner 共享所有权, 避开 this 悬空)
+        std::shared_ptr<control> control_ = std::make_shared<control>();
     };
 
 } // namespace coro

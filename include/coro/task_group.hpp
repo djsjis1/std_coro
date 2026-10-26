@@ -58,6 +58,7 @@ namespace coro {
             std::vector<std::exception_ptr> exceptions;        // 子任务失败集合 (事件循环线程)
             std::vector<std::shared_ptr<Task<void>>> monitors; // 用于组取消
             bool cancel_requested = false;                     // 已有失败, 正在取消其余
+            bool parent_cancelled = false;                     // 父任务在 wait() 期间被取消
 
             // 组生命周期状态机: open -> closing (已请求收尾) -> finished (子任务全结束)。
             // 与 mutex 同域读写: wait() 一旦进入 closing 就拒绝新任务与第二个 waiter,
@@ -94,6 +95,10 @@ namespace coro {
                 std::vector<std::shared_ptr<Task<void>>> to_cancel;
                 std::lock_guard lock(mutex);
                 exceptions.push_back(std::move(error));
+                // 首次失败即关闭准入: 之后的 spawn 必须被拒绝。
+                // 旧实现只设 cancel_requested 而不改 phase, 失败后仍可加新成员。
+                if (phase == open)
+                    phase = closing;
                 if (!cancel_requested) {
                     cancel_requested = true;
                     for (auto& m : monitors) {
@@ -158,11 +163,35 @@ namespace coro {
                 }
             }
 
+            /// 父任务在本等待上被取消: 不唤醒帧, 而是接管取消 ——
+            /// 先把取消传染给全部子任务, 等它们真正退出后, 由 complete()
+            /// 唤醒父帧, await_resume 再报 CancelledError。
+            /// 这就是“取消也要等清理”的屏障: 父作用域的资源在子任务借用的
+            /// 整个期间都保持存活。
+            bool on_cancel_requested() noexcept {
+                std::vector<std::shared_ptr<Task<void>>> to_cancel;
+                {
+                    std::lock_guard lock(st->mutex);
+                    st->parent_cancelled = true;
+                    if (st->phase == detail::task_group_state::open)
+                        st->phase = detail::task_group_state::closing;
+                    for (auto& m : st->monitors) {
+                        if (m && !m->is_ready())
+                            to_cancel.push_back(m);
+                    }
+                }
+                for (auto& m : to_cancel)
+                    m->cancel();
+                return true; // 已接管: 父帧保持挂起
+            }
+
             /// 等待者被取消/销毁 (框架的取消注入会绕过 await_resume):
             /// 1) 摘除 waiter —— 否则最后一个 monitor 完成时会 schedule 一个
             ///    已销毁 (或已 catch 取消继续跑) 的句柄, 前者是 UB, 后者是错误唤醒;
             /// 2) 取消传染给全部子任务 —— 对齐 Python TaskGroup:
             ///    `async with tg` 所在任务被取消时, 子任务一并被取消。
+            /// 注意: 正常取消走 on_cancel_requested (不销毁帧); 这里只在
+            /// 帧真的被强制销毁时兜底。
             void on_waiter_destroyed(std::coroutine_handle<> h) noexcept {
                 std::vector<std::shared_ptr<Task<void>>> to_cancel;
                 {
@@ -208,21 +237,21 @@ namespace coro {
         /// 添加并立即启动一个子任务 (对标 tg.create_task)
         /// 任意 Task<T> / Task<> 均可, 返回类型不要求一致
         template <typename T> void spawn(Task<T> task) {
-            {
-                std::lock_guard lock(state_->mutex);
-                if (state_->phase != detail::task_group_state::open)
-                    throw StructuredConcurrencyError("TaskGroup::spawn called after wait()/cancel()");
-            }
             // 原任务移入 shared_ptr (稳定地址, monitor 与它共享所有权)
             auto task_ptr = std::make_shared<Task<T>>(std::move(task));
             // monitor 协程: 包装原任务, 记录异常 / 响应组取消
             auto mon = std::make_shared<Task<void>>();
             *mon = detail::task_group_monitor(mon, task_ptr, state_);
             {
+                // 准入检查与登记必须在同一个锁域: 否则检查通过之后、push 之前
+                // 组可能已经因为失败/取消转入 closing, 新成员就漏掉了取消。
                 std::lock_guard lock(state_->mutex);
+                if (state_->phase != detail::task_group_state::open)
+                    throw StructuredConcurrencyError("TaskGroup::spawn called after wait()/cancel()/failure");
                 state_->monitors.push_back(mon);
                 ++state_->remaining;
             }
+            // 启动必须在锁外: monitor 可能同步执行到 complete(), 而它会取同一把锁。
             mon->start();
         }
 

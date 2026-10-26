@@ -133,12 +133,32 @@ namespace coro {
         void set_event_source(std::shared_ptr<EventSource> src) {
             if (!src)
                 throw std::invalid_argument("EventLoop::set_event_source: null source");
+            (void)swap_event_source(std::move(src));
+        }
+
+        /// 交换等待原语并返回旧的一个。
+        /// 供测试/故障注入临时安装 fake 事件源: 调用方负责把旧源换回去。
+        /// 前置条件同 set_event_source: 循环未运行且旧源无挂起操作。
+        std::shared_ptr<EventSource> swap_event_source(std::shared_ptr<EventSource> src) {
+            if (!src)
+                throw std::invalid_argument("EventLoop::swap_event_source: null source");
             if (running_.load(std::memory_order_acquire))
-                throw std::logic_error("EventLoop::set_event_source: loop is running");
+                throw std::logic_error("EventLoop::swap_event_source: loop is running");
             if (event_source_ && event_source_->has_pending())
-                throw std::logic_error("EventLoop::set_event_source: pending I/O");
+                throw std::logic_error("EventLoop::swap_event_source: pending I/O");
+            auto previous = std::move(event_source_);
             event_source_ = std::move(src);
+            // 使 io 层的 memo (current_iocp/current_uring) 失效:
+            // 旧源指针被释放后, 新源可能复用同一地址, 仅凭指针会命中过期缓存
+            event_source_epoch_.fetch_add(1, std::memory_order_acq_rel);
             install_event_source();
+            return previous;
+        }
+
+        /// 事件源替换计数: 每次 swap_event_source 递增。
+        /// io 层 memo 以 (源指针, epoch) 为键, 规避同地址复用造成的假命中。
+        uint64_t event_source_epoch() const noexcept {
+            return event_source_epoch_.load(std::memory_order_acquire);
         }
 
         /// 获取当前等待原语 (网络层需要它关联 socket 到 IOCP)
@@ -172,14 +192,41 @@ namespace coro {
         /// 等价于 Python 的 loop.call_soon_threadsafe()。
         void schedule(std::coroutine_handle<> h);
 
+        // ---- 等待身份 (wait epoch) ----
+        //
+        // schedule(h) 只校验帧地址存活与 generation, 无法区分「旧通知拿着同一
+        // 地址、而帧已经开始了一次新等待」。即使是同一个协程循环里的同一个
+        // awaiter 地址, 也会重复使用。因此每次挂起时向 loop 申请一个单调递增
+        // 的 epoch 并登记到帧上; 通知方携带注册时拿到的 epoch, 用
+        // schedule_if_current 投递 —— 帧当前 epoch 不一致即丢弃。
+        // 副作用: 取消后 catch 再等, 不会被上一条迟到通知提前唤醒。
+        uint64_t begin_wait(std::coroutine_handle<> h) noexcept;
+
+        /// 登记结束: 仅当帧当前 epoch 仍是 e 时清空 (避免抹掉新一轮等待的登记)。
+        void end_wait(std::coroutine_handle<> h, uint64_t e) noexcept;
+
+        /// 仅当帧当前 epoch 与通知携带的一致时才调度; 返回是否入队。线程安全。
+        bool schedule_if_current(std::coroutine_handle<> h, uint64_t epoch);
+
+        /// 查询帧当前等待身份是否仍为 epoch (不调度)。
+        /// 用途: 同步原语在"点名移交"前复核等待者未死 —— 死等待者的 epoch
+        /// 已被收尾路径注销, 对它移交会把锁/许可永久滞留在死帧名下。
+        /// 与 schedule_if_current 同锁判定。线程安全。
+        bool is_wait_current(std::coroutine_handle<> h, uint64_t epoch) noexcept;
+
         /// 将协程加入定时器堆, deadline 到达时自动移入就绪队列
         /// sleep 的底层实现就是调用这个方法。
         /// 注意: 仅供事件循环线程调用 (协程 await_suspend 内部),
         ///       不做线程安全保护。
         /// token: 可选的共享取消标志, 协程被 cancel 后由 await_resume 置 true,
         ///        到期的僵尸条目将被 process_timers 跳过。
+        /// outcome/expire_value: 可选的「先到终态」仲裁。条目真正到期并入队时
+        ///        由事件循环在入队线程上 CAS(outcome 0 -> expire_value); CAS 失败
+        ///        说明另一方已经定下终态, 本条目不再入队。这样“超时已提交、随后
+        ///        取消到达”不会把结果翻成取消。
         void schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
-                            std::shared_ptr<std::atomic<bool>> token = nullptr);
+                            std::shared_ptr<std::atomic<bool>> token = nullptr,
+                            std::shared_ptr<std::atomic<int>> outcome = nullptr, int expire_value = 0);
 
         // ---- 活跃协程计数与任务注册表 (由 Task 的启动/完成路径维护) ----
         //
@@ -312,12 +359,16 @@ namespace coro {
             explicit FrameState(uint64_t gen) : generation(gen) {}
             uint64_t generation;
             std::atomic<bool> scheduled{false};
+            /// 本帧当前等待的 epoch (0 = 没有登记)。
+            std::atomic<uint64_t> wait_epoch{0};
         };
 
         struct TimerEntry {
             std::chrono::steady_clock::time_point deadline;
             ReadyEntry entry;
             std::shared_ptr<std::atomic<bool>> token; // 已取消/已消费标记 (堆上共享)
+            std::shared_ptr<std::atomic<int>> outcome; // 可选: 先到终态仲裁
+            int expire_value = 0;                      // 到期时写入 outcome 的值
 
             bool operator<(const TimerEntry& other) const {
                 return deadline > other.deadline; // min-heap: 早的优先
@@ -362,6 +413,10 @@ namespace coro {
         // 同时承担幂等入队，取代早前的全局去重 set（省一次额外哈希查找）。
         std::unordered_map<const void*, FrameState> live_frames_;
         uint64_t next_generation_ = 0;
+        /// 等待 epoch 分配器 (单调递增, 跨线程取号无锁)
+        std::atomic<uint64_t> next_wait_epoch_{0};
+        /// 定时器堆压缩的轮次计数 (每 64 次 process_timers 检查一次)
+        uint32_t timer_compact_tick_ = 0;
 
         // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
         // 仅事件循环线程访问 (mark_abandoned 也在事件循环线程调用)。
@@ -388,10 +443,9 @@ namespace coro {
         std::unordered_set<void*> all_tasks_;
 #endif
 
-        // 事件循环线程标记: 用于区分"同线程调度"和"跨线程调度"。
-        // 同线程调度 (run() 内部) 不需要 wake (循环会自然处理就绪队列),
-        // 否则每个 schedule 都投递一个唤醒包, 堆积成"假唤醒风暴"。
-        std::thread::id loop_thread_id_;
+        // 同线程/跨线程调度的区分不缓存线程 ID (那是只写不读的状态):
+        // cross_thread_wake_if_asleep 直接比较 detail::t_current_loop ——
+        // 调用线程自己的 TLS, 零竞争且不受系统调用开销影响。
 
         // 入睡协议标志 (seq_cst): 循环醒着时为 true。
         // 跨线程 schedule/dispatch 用 exchange(true) 抢占 —— 抢到 false
@@ -404,6 +458,9 @@ namespace coro {
 
         // 等待原语抽象 (默认由构造函数按平台选择)
         std::shared_ptr<EventSource> event_source_;
+
+        // 事件源替换计数 (见 event_source_epoch())
+        std::atomic<uint64_t> event_source_epoch_{0};
 
         // 将到期的定时器从堆中移入就绪队列 (仅事件循环线程)。
         // 返回本次使用的时钟点 (run_impl 复用, 省一次 now() 调用)
@@ -428,14 +485,11 @@ namespace coro {
     /// 消灭旧实现「每个跨线程 schedule 一个 PostQueuedCompletionStatus,
     /// 循环忙碌时积压成假唤醒风暴」的问题。
     ///
-    /// 线程安全: loop_thread_id_ 用 thread_local 缓存, 避免跨线程直接读
-    /// (signal reader 线程调 schedule() → cross_thread_wake → 读主线程 TLS
-    /// 会被 TSan 报 data race)。thread_local 在首次调用时拷贝一次, 之后
-    /// 只访问本线程 TLS, 零竞争。
+    /// 线程安全: 用「调用线程的 TLS 是否指向本 loop」判断同/跨线程,
+    /// 不读取 loop 自身的线程标识 —— signal reader 线程调 schedule()
+    /// 时读主线程的 TLS 会被 TSan 报 data race; t_current_loop 属于
+    /// 调用线程自己, 零竞争。
     inline void EventLoop::cross_thread_wake_if_asleep() {
-        // schedule() 经常由另一个线程调用，不能把目标 loop 缓存在
-        // 调用线程的 TLS 中；那会把第一次跨线程投递误判成同线程，
-        // 之后目标 loop 睡眠时就永远收不到唤醒包。
         const bool same_loop = detail::t_current_loop == this;
         if (!same_loop && running_.load(std::memory_order_acquire) && !awake_.exchange(true))
             event_source_->wake();
@@ -459,13 +513,63 @@ namespace coro {
         }
     }
 
+    inline uint64_t EventLoop::begin_wait(std::coroutine_handle<> h) noexcept {
+        const uint64_t epoch = next_wait_epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!h)
+            return epoch;
+        std::lock_guard lock(queue_mutex_);
+        auto live = live_frames_.find(h.address());
+        if (live != live_frames_.end())
+            live->second.wait_epoch.store(epoch, std::memory_order_release);
+        return epoch;
+    }
+
+    inline void EventLoop::end_wait(std::coroutine_handle<> h, uint64_t epoch) noexcept {
+        if (!h || epoch == 0)
+            return;
+        std::lock_guard lock(queue_mutex_);
+        auto live = live_frames_.find(h.address());
+        if (live == live_frames_.end())
+            return;
+        uint64_t expected = epoch;
+        live->second.wait_epoch.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    }
+
+    inline bool EventLoop::schedule_if_current(std::coroutine_handle<> h, uint64_t epoch) {
+        if (!h)
+            return false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            auto live = live_frames_.find(h.address());
+            if (live == live_frames_.end())
+                return false; // 帧已销毁: 迟到通知丢弃
+            if (live->second.wait_epoch.load(std::memory_order_acquire) != epoch)
+                return false; // 帧已开始另一次等待: 旧通知不得唤醒新等待
+            if (live->second.scheduled.exchange(true, std::memory_order_acq_rel))
+                return false;
+            ready_queue_.push({h, live->second.generation});
+        }
+        cross_thread_wake_if_asleep();
+        return true;
+    }
+
+    inline bool EventLoop::is_wait_current(std::coroutine_handle<> h, uint64_t epoch) noexcept {
+        if (!h || epoch == 0)
+            return false;
+        std::lock_guard lock(queue_mutex_);
+        auto live = live_frames_.find(h.address());
+        return live != live_frames_.end() && live->second.wait_epoch.load(std::memory_order_acquire) == epoch;
+    }
+
     inline void EventLoop::schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
-                                          std::shared_ptr<std::atomic<bool>> token) {
+                                          std::shared_ptr<std::atomic<bool>> token,
+                                          std::shared_ptr<std::atomic<int>> outcome, int expire_value) {
         if (h) {
             std::lock_guard lock(queue_mutex_);
             auto live = live_frames_.find(h.address());
             if (live != live_frames_.end())
-                timer_heap_.push({deadline, {h, live->second.generation}, std::move(token)});
+                timer_heap_.push({deadline, {h, live->second.generation}, std::move(token), std::move(outcome),
+                                  expire_value});
         }
     }
 
@@ -474,6 +578,28 @@ namespace coro {
         //   协程帧销毁时 sleep_awaiter 析构会置位 token, 但条目仍留在堆里;
         //   若不及时清理, 事件循环会被这些"已失效的 deadline"拖着空等到期
         //   (has_work 认为还有定时器), 表现为 cancel 后程序迟迟不退出。
+        //   堆顶以下的失效条目只能在到期时被丢弃; 取消风暴后会长期占地, 因此
+        //   定期整堆压缩 (低频, 不放在热路径上)。
+        if (++timer_compact_tick_ >= 64 && timer_heap_.size() > 128) {
+            timer_compact_tick_ = 0;
+            auto copy = timer_heap_;
+            std::vector<TimerEntry> kept;
+            kept.reserve(copy.size());
+            std::size_t stale = 0;
+            while (!copy.empty()) {
+                auto entry = copy.top();
+                copy.pop();
+                if (entry.token && entry.token->load(std::memory_order_acquire))
+                    ++stale;
+                else
+                    kept.push_back(std::move(entry));
+            }
+            if (stale * 2 > timer_heap_.size()) {
+                timer_heap_ = std::priority_queue<TimerEntry>();
+                for (auto& entry : kept)
+                    timer_heap_.push(std::move(entry));
+            }
+        }
         while (!timer_heap_.empty()) {
             auto& top = timer_heap_.top();
             if (top.token && *top.token) {
@@ -496,8 +622,15 @@ namespace coro {
             while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
                 auto entry = timer_heap_.top();
                 timer_heap_.pop();
-                if (!entry.token || !entry.token->load())
-                    timer_expired_buf_.push_back(entry.entry);
+                if (entry.token && entry.token->load())
+                    continue; // 已被消费/取消: 丢弃僵尸条目
+                if (entry.outcome) {
+                    // 先到终态仲裁: 取消已经提交时就不再入队, 也不翻转原因
+                    int expected = 0;
+                    if (!entry.outcome->compare_exchange_strong(expected, entry.expire_value))
+                        continue;
+                }
+                timer_expired_buf_.push_back(entry.entry);
             }
             if (!timer_expired_buf_.empty()) {
                 std::lock_guard lock(queue_mutex_);
@@ -541,7 +674,6 @@ namespace coro {
         awake_.store(true, std::memory_order_seq_cst);
         bind(this); // 当前线程绑定本 loop:
         detail::t_current_task = nullptr;
-        loop_thread_id_ = std::this_thread::get_id(); // 事件源回调等内部路径路由正确
 
         // try-catch 保证: 即使 dispatch 回调或协程 resume 抛出异常,
         // running_ 被复位、线程上下文恢复到调用前, 允许后续再次 run()。
@@ -572,6 +704,23 @@ namespace coro {
 
                 // 第一步: 惰性清理僵尸定时器 + 将到期定时器移入就绪队列
                 auto now = process_timers();
+
+                // 第二步之前: 公平性轮询。
+                // 旧实现只在 ready/callback 队列全空时才进入 wait_for, 于是持续
+                // yield() (或任何不断自我重入队的协程) 会让队列永不为空 ——
+                // 内核已经完成的 I/O 永远得不到收割, 表现为 I/O 饥饿。
+                // CPython 在 ready 非空时仍会执行 select(0), 这里对齐。
+                // 只在「本轮确有就绪工作」且「确有挂起 I/O」时轮询: 队列本空时
+                // 下面的阻塞等待自然会收割完成包, 不必多一次系统调用。
+                {
+                    bool ready_pending;
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        ready_pending = !ready_queue_.empty() || !batch_.empty();
+                    }
+                    if (ready_pending && event_source_->has_pending())
+                        event_source_->wait_for(std::chrono::milliseconds(0));
+                }
 
                 // 第二步: 如果就绪队列 (和 fn 队列) 为空, 通过 EventSource 等待
                 // 等价于 Python 的 selector.select(timeout):

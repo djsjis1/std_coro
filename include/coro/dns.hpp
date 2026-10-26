@@ -75,55 +75,74 @@ namespace coro {
             std::string canonical_name; ///< 服务给的规范名 (可能为空)
         };
 
+        /// 阻塞的解析本体 (在 executor 的工作线程上运行)。
+        /// 与调度无关, 便于注入不同执行器 / 测试替换。
+        inline std::vector<resolved_endpoint> resolve_blocking(const std::string& host, const std::string& service) {
+#ifdef _WIN32
+            ensure_winsock(); // resolve() can be the first network operation in the process.
+#endif
+            // 结果按值带回循环线程: sockaddr 是 POD, 但 vector 跨线程搬运才安全
+            std::vector<resolved_endpoint> out;
+            addrinfo hints{};
+            hints.ai_family = AF_INET; // v1 只取 v4 (见文件头范围说明)
+            // service 为空时**必须**把 ai_socktype 留 0: MSDN 明确规定 pServiceName
+            // 为 NULL 时 ai_socktype 与 ai_protocol 必须为 0, Windows 的 getaddrinfo
+            // 会直接判失败; Linux 的 glibc 则容忍这个组合 —— 所以这个 bug 只在
+            // Windows CI 上暴露 (数值主机也救不了, 是 API 用法错误)。
+            if (!service.empty())
+                hints.ai_socktype = SOCK_STREAM;
+            addrinfo* raw = nullptr;
+            const int rc = ::getaddrinfo(host.c_str(), service.empty() ? nullptr : service.c_str(), &hints, &raw);
+            if (rc != 0) {
+                // 在 worker 线程里构造异常对象没问题: executor 会把它作为结果传回并
+                // 由 await_resume 在循环线程重新抛出。
+#ifdef _WIN32
+                throw DnsResolutionError(host, rc, gai_strerrorA(rc));
+#else
+                throw DnsResolutionError(host, rc, gai_strerror(rc));
+#endif
+            }
+            // 容器分配或字符串构造抛异常时也要释放解析结果。
+            const auto free_results = [](addrinfo* addresses) { ::freeaddrinfo(addresses); };
+            std::unique_ptr<addrinfo, decltype(free_results)> results(raw, free_results);
+            char peer[INET_ADDRSTRLEN] = {0};
+            for (addrinfo* it = raw; it != nullptr; it = it->ai_next) {
+                if (it->ai_family != AF_INET || !it->ai_addr || it->ai_addrlen < sizeof(sockaddr_in))
+                    continue;
+                sockaddr_in sa{};
+                std::memcpy(&sa, it->ai_addr, sizeof(sa));
+                resolved_endpoint ep;
+                if (::inet_ntop(AF_INET, &sa.sin_addr, peer, sizeof(peer)) == nullptr)
+                    continue;
+                ep.address = peer;
+                ep.port = static_cast<uint16_t>(ntohs(sa.sin_port));
+                if (it->ai_canonname != nullptr)
+                    ep.canonical_name = it->ai_canonname;
+                out.push_back(std::move(ep));
+            }
+            return out;
+        }
+
+        /// 用调用方提供的执行器解析: executor 接受一个无参可调用对象并返回可等待的
+        /// 结果 (例如 `to_thread_lazy`、自定义有界线程池、测试用的同步执行器)。
+        /// 参数合法性在提交前检查, 避免把调用方错误变成工作线程上的异常。
+        template <typename Executor>
+        Task<std::vector<resolved_endpoint>> resolve_with(Executor executor, std::string host, std::string service = "") {
+            if (host.find('\0') != std::string::npos || service.find('\0') != std::string::npos)
+                throw std::invalid_argument("DNS host/service must not contain embedded NUL");
+            co_return co_await executor([host = std::move(host), service = std::move(service)] {
+                return resolve_blocking(host, service);
+            });
+        }
+
         /// 解析主机名/服务名为可连接的 IPv4 端点列表。不阻塞事件循环。
         /// 系统解析失败抛 DnsResolutionError; 成功但没有兼容地址时返回空 vector。
+        /// 惰性提交: 只创建 Task 而不 await → 不会发起任何系统调用。
         inline Task<std::vector<resolved_endpoint>> resolve(std::string host, std::string service = "") {
             if (host.find('\0') != std::string::npos || service.find('\0') != std::string::npos)
                 throw std::invalid_argument("DNS host/service must not contain embedded NUL");
-            co_return co_await to_thread([host, service]() {
-#ifdef _WIN32
-                ensure_winsock(); // resolve() can be the first network operation in the process.
-#endif
-                // 结果按值带回循环线程: sockaddr 是 POD, 但 vector 跨线程搬运才安全
-                std::vector<resolved_endpoint> out;
-                addrinfo hints{};
-                hints.ai_family = AF_INET; // v1 只取 v4 (见文件头范围说明)
-                // service 为空时**必须**把 ai_socktype 留 0: MSDN 明确规定 pServiceName
-                // 为 NULL 时 ai_socktype 与 ai_protocol 必须为 0, Windows 的 getaddrinfo
-                // 会直接判失败; Linux 的 glibc 则容忍这个组合 —— 所以这个 bug 只在
-                // Windows CI 上暴露 (数值主机也救不了, 是 API 用法错误)。
-                if (!service.empty())
-                    hints.ai_socktype = SOCK_STREAM;
-                addrinfo* raw = nullptr;
-                const int rc = ::getaddrinfo(host.c_str(), service.empty() ? nullptr : service.c_str(), &hints, &raw);
-                if (rc != 0) {
-                    // 在 worker 线程里构造异常对象没问题: to_thread 会把它作为结果传回并
-                    // 由 await_resume 在循环线程重新抛出。
-#ifdef _WIN32
-                    throw DnsResolutionError(host, rc, gai_strerrorA(rc));
-#else
-                    throw DnsResolutionError(host, rc, gai_strerror(rc));
-#endif
-                }
-                // 容器分配或字符串构造抛异常时也要释放解析结果。
-                const auto free_results = [](addrinfo* addresses) { ::freeaddrinfo(addresses); };
-                std::unique_ptr<addrinfo, decltype(free_results)> results(raw, free_results);
-                char peer[INET_ADDRSTRLEN] = {0};
-                for (addrinfo* it = raw; it != nullptr; it = it->ai_next) {
-                    if (it->ai_family != AF_INET || !it->ai_addr || it->ai_addrlen < sizeof(sockaddr_in))
-                        continue;
-                    sockaddr_in sa{};
-                    std::memcpy(&sa, it->ai_addr, sizeof(sa));
-                    resolved_endpoint ep;
-                    if (::inet_ntop(AF_INET, &sa.sin_addr, peer, sizeof(peer)) == nullptr)
-                        continue;
-                    ep.address = peer;
-                    ep.port = static_cast<uint16_t>(ntohs(sa.sin_port));
-                    if (it->ai_canonname != nullptr)
-                        ep.canonical_name = it->ai_canonname;
-                    out.push_back(std::move(ep));
-                }
-                return out;
+            co_return co_await to_thread_lazy([host = std::move(host), service = std::move(service)] {
+                return resolve_blocking(host, service);
             });
         }
 

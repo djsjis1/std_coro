@@ -37,9 +37,30 @@ option(CORO_ENABLE_TLS "启用 TLS API (依赖仓库内 OpenSSL 源码)" OFF)
 option(CORO_REQUIRE_TLS "配置时要求 thirdparty/openssl 源码可用, 禁止静默降级" OFF)
 # 并发工具扩展 (Timer/Context/Channel/select/...): 只依赖纯核心, 零第三方
 option(CORO_ENABLE_CONCURRENCY_EXT "启用新增并发工具头与对应测试" OFF)
+# 开发目标 (测试/自检/压测/示例) 的高警告等级见 coro_dev_warnings();
+# ON 时进一步升级为错误 (CI 可选启用, 本地默认只警告)
+option(CORO_WERROR "把开发目标的编译警告升级为错误" OFF)
 if(CORO_REQUIRE_URING AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CORO_ENABLE_URING OR NOT CORO_ENABLE_NATIVE_IO))
     message(FATAL_ERROR "CORO_REQUIRE_URING requires Linux, CORO_ENABLE_NATIVE_IO=ON and CORO_ENABLE_URING=ON")
 endif()
+
+# 开发目标的高警告等级: 核心库是 header-only, 它的"自构建"就是测试/自检/
+# 压测这些消费者 —— 警告必须挂在消费者上才能覆盖全部公共头。
+# 不用 INTERFACE: 安装包不得把警告等级强加给下游消费者。
+function(coro_dev_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+    endif()
+    if(CORO_WERROR)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /WX)
+        else()
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
 
 # 单配置生成器 (Ninja/Makefile) 默认 Release; 多配置 (VS) 由 --config 决定
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -94,10 +115,11 @@ if(CORO_GCC13_COROUTINE_WORKAROUND)
         "$<$<AND:$<COMPILE_LANG_AND_ID:CXX,GNU>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,13>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,14>>:-fno-tree-slp-vectorize>")
 endif()
 
-# 平台链接库: ws2_32 仅网络模块需要, 挂在 io 组件上
+# 平台链接库: ws2_32 仅网络模块需要, 挂在 io 组件上;
+# winmm 供 IOCP 事件源抬高系统时钟分辨率 (timeBeginPeriod), 否则定时器精度只有 15.6ms
 set(CORO_HAS_URING OFF)
 if(WIN32)
-    target_link_libraries(coro_io INTERFACE ws2_32)
+    target_link_libraries(coro_io INTERFACE ws2_32 winmm)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_URING)
     # io_uring 后端统一使用仓库内源码 (thirdparty/liburing), 不查找系统预装库:
@@ -145,6 +167,7 @@ if(CORO_ENABLE_TLS)
         add_subdirectory(thirdparty/openssl)
         set(CORO_HAS_TLS ON)
         add_library(coro_tls STATIC src/tls.cpp)
+        coro_dev_warnings(coro_tls)
         add_library(coro::tls ALIAS coro_tls)
         set_target_properties(coro_tls PROPERTIES EXPORT_NAME tls POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(coro_tls PUBLIC coro_io PRIVATE
@@ -218,6 +241,7 @@ if(CORO_ENABLE_HTTP_CLIENT)
         message(FATAL_ERROR "CORO_ENABLE_HTTP_CLIENT requires native network I/O")
     endif()
     add_library(coro_http_client STATIC src/http_client.cpp)
+    coro_dev_warnings(coro_http_client)
     add_library(coro::http_client ALIAS coro_http_client)
     set_target_properties(coro_http_client PROPERTIES
         EXPORT_NAME http_client POSITION_INDEPENDENT_CODE ON)
@@ -314,13 +338,7 @@ if(CORO_BUILD_EXAMPLES)
         coro_add_example(example_dns examples/dns_demo.cpp)
     endif()
 
-    if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL)
-        add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
-        target_link_libraries(web_shutdown_check PRIVATE coro::web)
-        if(MSVC)
-            target_compile_options(web_shutdown_check PRIVATE /utf-8)
-        endif()
-    endif()
+    # 关停回归不再由示例开关控制 (见下方 CORO_BUILD_TESTS 块)
 
     # 协程练习场 (playground/ 用于练习写协程代码, 不参与安装)
     # 练习场当前使用 tcp_udp 组件, 因此与网络能力一同注册: 否则 core-only + EXAMPLES=ON
@@ -335,6 +353,22 @@ endif() # CORO_BUILD_EXAMPLES
 if(CORO_BUILD_BENCHMARKS OR CORO_BUILD_EXAMPLES)
     add_executable(coro_stress tests/stress.cpp)
     target_link_libraries(coro_stress PRIVATE coro::coro)
+    coro_dev_warnings(coro_stress)
+    # HTTP 客户端压测组只在组件已启用时编入 (stress.cpp 里有同名能力宏门控)
+    if(TARGET coro_http_client)
+        target_link_libraries(coro_stress PRIVATE coro::http_client)
+    endif()
+endif()
+
+# 性能基线 (F03): 只由 CORO_BUILD_BENCHMARKS 控制, 不属于测试/示例。
+# 输出调度吞吐、定时器延迟分位、取消延迟与分配次数; 不做硬性阀值判定。
+if(CORO_BUILD_BENCHMARKS)
+    add_executable(coro_bench benchmarks/bench_runtime.cpp)
+    target_link_libraries(coro_bench PRIVATE coro::coro)
+    coro_dev_warnings(coro_bench)
+    if(MSVC)
+        target_compile_options(coro_bench PRIVATE /utf-8)
+    endif()
 endif()
 
 # ============================================================================
@@ -366,10 +400,32 @@ if(CORO_BUILD_TESTS)
     add_subdirectory(thirdparty/googletest-main EXCLUDE_FROM_ALL)
 
     file(GLOB CORO_TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.cpp)
+    if(NOT CORO_ENABLE_NATIVE_IO)
+        # CORO_ENABLE_NATIVE_IO=OFF 时 net / pipe / fs / fs_watch / signal / process / unix
+        # 等模块根本不存在。这些测试文件没有逐文件的能力宏门控, 之前 core-only + TESTS
+        # 这个组合从没被构建过, 会直接编译失败; 在这里排除后该组合才能被 CI 真正覆盖。
+        list(REMOVE_ITEM CORO_TEST_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dns.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fs.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fs_watch.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http_client.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_race.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lifecycle.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_net.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_net_advanced.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pipe.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_process.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_server_lifecycle.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_signal.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tls.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_unix.cpp)
+    endif()
     # Web 测试依赖文件和网络 I/O, 在能力可用时单独加入, 与示例开关无关。
     list(REMOVE_ITEM CORO_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_web_layer.cpp")
     add_executable(coro_tests ${CORO_TEST_SOURCES})
     target_link_libraries(coro_tests PRIVATE coro::coro router::router GTest::gtest_main)
+    coro_dev_warnings(coro_tests)
     # HTTP 客户端是可选组件: 只有开启时才把实现链接进测试, 关闭时不引入任何依赖。
     if(TARGET coro_http_client)
         target_link_libraries(coro_tests PRIVATE coro::http_client)
@@ -386,7 +442,7 @@ if(CORO_BUILD_TESTS)
         endif()
     endif()
     add_test(NAME coro_tests COMMAND coro_tests)
-    set_tests_properties(coro_tests PROPERTIES TIMEOUT 120)
+    set_tests_properties(coro_tests PROPERTIES TIMEOUT 120 LABELS unit)
 
     # ---- 公共头独立包含自检 ----
     # 每个头文件单独成一个 TU, 抽出“靠 include 顺序碰巧能过”的隐式依赖。
@@ -404,6 +460,10 @@ if(CORO_BUILD_TESTS)
     endforeach()
     add_library(coro_header_check OBJECT ${CORO_HEADER_CHECK_SOURCES})
     target_link_libraries(coro_header_check PRIVATE coro::coro)
+    coro_dev_warnings(coro_header_check)
+    # 代表性实例化检查: 只 include 头文件不足以证明模板真的可实例化,
+    # 这里用 static_assert 钉住关键签名 (含 gather/wait_tasks 的返回类型契约)。
+    target_sources(coro_header_check PRIVATE tests/header_usage_check.cpp)
     # 同理: http_client.hpp 的内容由 CORO_HAS_HTTP_CLIENT 门控, 自检也要拿到同一能力宏。
     if(TARGET coro_http_client)
         target_link_libraries(coro_header_check PRIVATE coro::http_client)
@@ -433,6 +493,19 @@ if(CORO_BUILD_TESTS)
         endforeach()
     endif()
     if(TARGET web_shutdown_check)
+        add_test(NAME web_shutdown_check COMMAND web_shutdown_check)
+        set_tests_properties(web_shutdown_check PROPERTIES TIMEOUT 30 LABELS integration)
+    endif()
+
+    # ---- 关停回归 (不依赖示例开关) ----
+    # 之前只在 CORO_BUILD_EXAMPLES 内创建, 于是 TESTS=ON/EXAMPLES=OFF 的作业
+    # 根本执行不到关停路径。
+    if(CORO_ENABLE_WEB AND CORO_HAS_SIGNAL AND NOT TARGET web_shutdown_check)
+        add_executable(web_shutdown_check tests/web_shutdown_check.cpp)
+        target_link_libraries(web_shutdown_check PRIVATE coro::web)
+        if(MSVC)
+            target_compile_options(web_shutdown_check PRIVATE /utf-8)
+        endif()
         add_test(NAME web_shutdown_check COMMAND web_shutdown_check)
         set_tests_properties(web_shutdown_check PROPERTIES TIMEOUT 30 LABELS integration)
     endif()

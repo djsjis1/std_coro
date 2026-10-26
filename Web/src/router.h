@@ -158,6 +158,11 @@ class router {
     /// 静态文件服务: 把 URL 前缀 mount 映射到磁盘目录 dir.
     /// 例: static_dir("/static", "/var/www")
     ///     请求 GET /static/css/style.css → 读取 /var/www/css/style.css 返回
+    ///
+    /// 挂载根的规范化路径在注册时缓存: 请求期只对候选文件做一次
+    /// weakly_canonical (它必须查真实文件系统), 不再每个请求重算挂载根 ——
+    /// 该调用在 Windows 上是 GetFinalPathNameByHandle 级别的阻塞系统调用,
+    /// 网络/冷缓存磁盘慢时会卡住整个 worker 事件循环。
     void static_dir(const std::string& mount, const std::string& dir) {
         check_frozen();
         std::string normalized = mount.empty() ? "/" : mount;
@@ -165,7 +170,13 @@ class router {
             normalized.pop_back();
         if (normalized.front() != '/')
             normalized.insert(normalized.begin(), '/');
-        static_dirs_.emplace_back(std::move(normalized), dir); // 存入 vector, 支持多个挂载点
+        static_mount entry{std::move(normalized), dir, {}};
+        try {
+            entry.base = std::filesystem::weakly_canonical(std::filesystem::path(dir));
+        } catch (const std::filesystem::filesystem_error&) {
+            // 目录当前不可达: base 保持空, 请求期 candidate 规范化同样会失败 → 404
+        }
+        static_dirs_.emplace_back(std::move(entry));
     }
 
     /// 路由分发入口。无全局中间件时走快路径: 直接进入 route_core,
@@ -214,6 +225,21 @@ class router {
                 co_return co_await run_route_middlewares(*entry, req);
             }
         }
+        // HEAD 复用 GET 资源语义 (RFC 7231): 显式 HEAD 路由优先,
+        // 未注册时回落到 GET 树; 响应体由写出层按 HEAD 规则跳过。
+        if (req.method == "HEAD") {
+            if (auto it = trees_.find("GET"); it != trees_.end()) {
+                radix_router<route_entry>::params_view caps;
+                if (const route_entry* entry = it->second.lookup(path, &caps)) {
+                    req.params.reserve(caps.size());
+                    for (const auto& [k, v] : caps)
+                        req.params.emplace_back(std::string(k), std::string(v));
+                    if (entry->middlewares.empty())
+                        co_return co_await entry->handler(req);
+                    co_return co_await run_route_middlewares(*entry, req);
+                }
+            }
+        }
 
         // ---- 第二步: 405 / OPTIONS —— 路径存在但方法不对 ----
         // 生产路由器内建能力 (httprouter/gin 同款): 扫描其他方法的树,
@@ -237,28 +263,30 @@ class router {
             co_return resp;
         }
 
-        // ---- 第三步: 尝试静态文件目录 (仅 GET) ----
-        for (const auto& [mount, dir] : static_dirs_) {
-            // rfind(mount, 0): 检查 path 是否以 mount 开头 (类似 Python 的 startswith)
+        // ---- 第三步: 尝试静态文件目录 (GET 与 HEAD) ----
+        for (const auto& mount : static_dirs_) {
+            const auto& mpath = mount.mount;
+            // rfind(mpath, 0): 检查 path 是否以挂载点开头 (类似 Python 的 startswith)
             // 返回 0 表示从位置 0 开始匹配成功
             // 必须按完整路径段匹配; 否则 mount="/static" 会错误匹配
             // "/static-secret" 并把它映射到静态目录根。
             const bool mount_match =
-                path == mount || (path.size() > mount.size() && path.rfind(mount, 0) == 0 && path[mount.size()] == '/');
+                path == mpath || (path.size() > mpath.size() && path.rfind(mpath, 0) == 0 && path[mpath.size()] == '/');
             if (!mount_match)
                 continue; // 不匹配这个挂载点, 试下一个
 
-            // 静态文件只支持 GET; 其他方法返回 405/OPTIONS 应答 (而非默默读文件)
-            if (req.method != "GET") {
+            // 静态文件只支持 GET/HEAD (HEAD 复用 GET 语义, 体由写出层省略);
+            // 其他方法返回 405/OPTIONS 应答 (而非默默读文件)
+            if (req.method != "GET" && req.method != "HEAD") {
                 http_response resp = (req.method == "OPTIONS") ? http_response::text("")
                                                                : http_response::error(405, "method not allowed");
-                resp.header("Allow", "GET, OPTIONS");
+                resp.header("Allow", "GET, HEAD, OPTIONS");
                 co_return resp;
             }
 
             // 提取相对路径: 去掉 mount 前缀
             // 例: mount="/static", path="/static/a.txt" → rel="/a.txt"
-            std::string rel(path.substr(mount.size()));
+            std::string rel(path.substr(mpath.size()));
             if (rel.empty())
                 rel = "/"; // 请求的是挂载点根目录, 当作 "/" 处理
 
@@ -274,13 +302,14 @@ class router {
             // 旧实现是 to_thread(同步 ifstream) —— 线程池兜底, 占用槽位
             // 且有跨线程开销; 现在直接挂在 worker 的事件循环上, 读大文件
             // 期间 worker 可以继续处理其他连接。
-            std::string full_path = dir + "/" + rel_trim;
+            std::string full_path = mount.dir + "/" + rel_trim;
             // 规范化后再次确认 real path 仍位于挂载根目录内, 防止 symlink
             // 把一个看似安全的相对路径带出静态目录。
+            // 挂载根用注册时缓存的规范路径 (见 static_dir), 请求期只做
+            // 一次文件系统查询 (candidate)。
             try {
-                const auto base = std::filesystem::weakly_canonical(std::filesystem::path(dir));
                 const auto candidate = std::filesystem::weakly_canonical(std::filesystem::path(full_path));
-                auto rel_to_base = std::filesystem::relative(candidate, base);
+                auto rel_to_base = std::filesystem::relative(candidate, mount.base);
                 if (rel_to_base.empty() || rel_to_base == ".") {
                     // 目录根本身不作为文件返回, 避免把目录读成 404 以外的异常。
                     co_return http_response::error(404, "not found");
@@ -368,9 +397,14 @@ class router {
     //   GET 树 / POST 树 / ... 互不干扰, 同名路径不同方法各走各的.
     // unordered_map 的键是方法名 (GET/POST/...), 只有几个, 哈希开销可忽略.
     std::unordered_map<std::string, radix_router<route_entry>> trees_;
-    // 静态文件目录: pair<URL 前缀, 磁盘目录>
-    // 例: {"/static", "/var/www"} 表示 /static/* 映射到 /var/www/*
-    std::vector<std::pair<std::string, std::string>> static_dirs_;
+
+    /// 静态文件挂载点: URL 前缀 + 磁盘目录 + 注册时缓存的规范根路径
+    struct static_mount {
+        std::string mount;
+        std::string dir;
+        std::filesystem::path base; // weakly_canonical(dir), 注册期缓存
+    };
+    std::vector<static_mount> static_dirs_;
     // 全局中间件 (外层链): 包住 route_core 的全部输出 (含 404/静态)
     std::vector<middleware_fn> middlewares_;
     // 冻结标志: freeze() 后注册入口抛错; 之后多 worker 只读并发安全

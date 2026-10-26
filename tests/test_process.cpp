@@ -152,4 +152,65 @@ TEST(ProcessTest, ConcurrentProcesses) {
     test_util::run_task([&] { return concurrent_case(&all_match); });
     EXPECT_TRUE(all_match);
 }
+
+namespace {
+
+    /// communicate: 写 stdin, 同时收 stdout/stderr
+    struct talk_probe {
+        int exit_code = -1;
+        std::string out;
+        std::string err;
+        bool input_closed = false;
+    };
+
+    coro::Task<> talk_case(talk_probe* out) {
+#ifdef _WIN32
+        auto p = co_await coro::process::spawn({"cmd", "/c", "echo out-line & echo err-line 1>&2"},
+                                             {.capture_stdout = true, .capture_stderr = true});
+#else
+        auto p = co_await coro::process::spawn({"sh", "-c", "echo out-line; echo err-line 1>&2"},
+                                             {.capture_stdout = true, .capture_stderr = true});
+#endif
+        if (!p.valid()) {
+            out->exit_code = -99;
+            co_return;
+        }
+        auto result = co_await coro::process::communicate(p);
+        out->exit_code = result.exit_code;
+        out->out = std::move(result.out);
+        out->err = std::move(result.err);
+        out->input_closed = result.input_closed;
+    }
+
+    /// communicate: stdin 喂数据 (more 会把输入回显到 stdout)
+    coro::Task<> feed_case(std::string* echoed) {
+#ifdef _WIN32
+        auto p = co_await coro::process::spawn({"cmd", "/c", "more"},
+                                             {.capture_stdin = true, .capture_stdout = true});
+#else
+        auto p = co_await coro::process::spawn({"cat"}, {.capture_stdin = true, .capture_stdout = true});
+#endif
+        if (!p.valid()) {
+            co_return;
+        }
+        auto result = co_await coro::process::communicate(p, "fed-through-stdin\n");
+        *echoed = std::move(result.out);
+    }
+
+} // namespace
+
+TEST(ProcessTest, CommunicateCapturesBothStreams) {
+    talk_probe probe;
+    test_util::run_task([&] { return talk_case(&probe); });
+    EXPECT_EQ(probe.exit_code, 0);
+    EXPECT_NE(probe.out.find("out-line"), std::string::npos) << probe.out;
+    EXPECT_NE(probe.err.find("err-line"), std::string::npos) << probe.err;
+    EXPECT_TRUE(probe.input_closed);
+}
+
+TEST(ProcessTest, CommunicateFeedsStdin) {
+    std::string echoed;
+    test_util::run_task([&] { return feed_case(&echoed); });
+    EXPECT_NE(echoed.find("fed-through-stdin"), std::string::npos) << echoed;
+}
 #endif // _WIN32 || CORO_URING_ENABLED

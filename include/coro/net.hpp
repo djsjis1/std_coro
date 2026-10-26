@@ -69,13 +69,18 @@ namespace coro {
         // ==================================================================
         // Winsock 初始化 (幂等, 自动 WSAStartup)
         // ==================================================================
-        inline void ensure_winsock() {
-            static bool done = []() {
+        inline bool ensure_winsock() {
+            // WSAStartup 可能因资源不足/受限令牌而失败; 忽略返回值会让后续
+            // socket() 失败并报出与根因无关的错误码。
+            static const int rc = []() {
                 WSADATA data;
-                WSAStartup(MAKEWORD(2, 2), &data);
-                return true;
+                return WSAStartup(MAKEWORD(2, 2), &data);
             }();
-            (void)done;
+            if (rc != 0) {
+                io::set_error((int)WSAEINVAL);
+                return false;
+            }
+            return true;
         }
 
         /// 获取当前事件循环的 IOCP 事件源: 类型化访问已收口到 io 层
@@ -280,18 +285,33 @@ namespace coro {
                         return TcpStream{};      // 连接失败, valid()==false
                     }
                     // ConnectEx 完成后必须设置 SO_UPDATE_CONNECT_CONTEXT
-                    // 否则后续某些 socket 操作可能失败
-                    setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
-                    // connect() 创建时已经关联当前 IOCP；不要重复关联同一句柄。
+                    // 否则后续某些 socket 操作可能失败; 该 setsockopt 本身失败
+                    // 意味着连接不可用, 不能把半成品当成功返回。
+                    if (setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) == SOCKET_ERROR) {
+                        const int error = WSAGetLastError();
+                        closesocket(sock);
+                        sock = INVALID_SOCKET;
+                        io::set_error(error);
+                        return TcpStream{};
+                    }
+                    // connect() 创建时已经关联当前 IOCP; 不要重复关联同一句柄。
+                    // Nagle: 请求-响应型协议里“小包等到 ACK 才发”会直接把往返拉长一个
+                    // 数量级, 因此建立连接时默认关闭 (应用如需批量小包可自行开启)。
+                    BOOL nodelay = TRUE;
+                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay),
+                               sizeof(nodelay));
                     return TcpStream(std::exchange(sock, INVALID_SOCKET), false);
                 }
             };
 
             /// 创建 socket 并异步连接到 ip:port (零配置: 自动关联 IOCP)
             static connect_awaiter connect(const char* ip, unsigned short port) {
-                ensure_winsock(); // 必须先初始化 Winsock
-
                 connect_awaiter aw;
+                if (!ensure_winsock()) { // 必须先初始化 Winsock
+                    aw.op.error = (int)WSAEINVAL;
+                    return aw;
+                }
+
                 aw.sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 aw.addr.sin_family = AF_INET;
                 aw.addr.sin_port = htons(port);
@@ -428,13 +448,15 @@ namespace coro {
                     closesocket(sock_);
             }
 
-            TcpListener(TcpListener&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
+            TcpListener(TcpListener&& other) noexcept
+                : sock_(std::exchange(other.sock_, INVALID_SOCKET)),
+                  accept_ex_(std::exchange(other.accept_ex_, nullptr)) {}
 
             TcpListener& operator=(TcpListener&& other) noexcept {
                 if (this != &other) {
-                    if (sock_ != INVALID_SOCKET)
-                        closesocket(sock_);
+                    close(); // CancelIoEx + closesocket: 与析构同一合同
                     sock_ = std::exchange(other.sock_, INVALID_SOCKET);
+                    accept_ex_ = std::exchange(other.accept_ex_, nullptr);
                 }
                 return *this;
             }
@@ -447,7 +469,8 @@ namespace coro {
             unsigned short local_port() const { return local_port_of(sock_); }
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
-                ensure_winsock(); // 必须先初始化 Winsock
+                if (!ensure_winsock()) // 必须先初始化 Winsock
+                    return false;
                 close();
                 accept_ex_ = nullptr;
 
@@ -572,13 +595,25 @@ namespace coro {
                         if (accepted != INVALID_SOCKET)
                             closesocket(accepted);
                         accepted = INVALID_SOCKET;
+                        // 保留底层错误快照, 不把失败伪装成"对端立刻关闭"
+                        io::set_error(op.error ? op.error : (int)WSAEINVAL);
                         return TcpStream{}; // 无效流, valid()==false
                     }
                     // AcceptEx 完成后必须设置 SO_UPDATE_ACCEPT_CONTEXT
-                    // 否则新 socket 无法正常进行 I/O 操作
-                    setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&listener->sock_,
-                               sizeof(listener->sock_));
+                    // 否则新 socket 无法正常进行 I/O 操作; 设置失败说明连接不可用
+                    if (setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&listener->sock_,
+                                   sizeof(listener->sock_)) == SOCKET_ERROR) {
+                        const int error = WSAGetLastError();
+                        closesocket(accepted);
+                        accepted = INVALID_SOCKET;
+                        io::set_error(error);
+                        return TcpStream{};
+                    }
                     // accept 出的 socket 按 attach 标志决定是否关联 IOCP
+                    // 与 connect 侧一致: 服务端同样默认关 Nagle, 避免回写的小响应被拖延
+                    BOOL nodelay = TRUE;
+                    setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay),
+                               sizeof(nodelay));
                     return TcpStream(std::exchange(accepted, INVALID_SOCKET), attach);
                 }
             };
@@ -646,7 +681,8 @@ namespace coro {
             unsigned short local_port() const { return local_port_of(sock_); }
 
             bool bind_listen(const char* ip, unsigned short port) {
-                ensure_winsock();
+                if (!ensure_winsock())
+                    return false;
                 close();
                 sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (sock_ == INVALID_SOCKET)
@@ -776,12 +812,27 @@ namespace coro {
             }
 
             void close() {
-                if (sock_ != INVALID_SOCKET) {
-                    // 与 TcpListener::close 同理: 挂起的 recvfrom 先显式取消再关句柄,
-                    // 保证完成包一定投递 (仅 closesocket 不承诺)。
+                if (valid()) {
+                    // 与 TcpListener::close / TcpStream 同一合同: 挂起的重叠
+                    // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
+                    // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
+                    // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
                     CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
                     closesocket(sock_);
                     sock_ = INVALID_SOCKET;
+                }
+            }
+
+            /// 中止收发但保留句柄所有权。可由其他线程调用, 用于唤醒挂起的
+            /// recvfrom/sendto; 真正 closesocket 仍由拥有 UdpSocket 的线程执行。
+            /// (与 Linux 侧 UdpSocket::shutdown 及 TcpStream::shutdown 对齐)
+            void shutdown() noexcept {
+                if (sock_ != INVALID_SOCKET) {
+                    // ::shutdown 本身不保证唤醒已提交的重叠 WSARecvFrom/WSASendTo;
+                    // CancelIoEx(nullptr) 让该句柄的全部挂起操作经 IOCP 以
+                    // ERROR_OPERATION_ABORTED 完成, 等待者才能安全收尾。
+                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
+                    ::shutdown(sock_, SD_BOTH);
                 }
             }
 
@@ -806,7 +857,7 @@ namespace coro {
         //
         // 需要 liburing: sudo apt install liburing-dev
         // 事件源获取与 SQE 提交统一走 io 层 (detail::current_uring /
-        // detail::uring_submit_op), 与 fs/pipe/unix 共用同一套设施。
+        // detail::uring_submit), 与 fs/pipe/unix 共用同一套设施。
         // ==================================================================
 
         /// getsockname + ntohs: 回查 fd 实际绑定的端口 (bind 到 0 时系统分配)。
@@ -880,8 +931,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = stream->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_recv(sqe, stream->fd_, buf, len, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -892,8 +944,8 @@ namespace coro {
                 }
 
                 int await_resume() {
-                    if (op.error) {
-                        io::set_error(op.error);
+                    if (const int err = detail::uring_op_error(op)) {
+                        io::set_error(err);
                         return -1;
                     }
                     return op.result;
@@ -935,8 +987,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = stream->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_send(sqe, stream->fd_, buf, len, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -946,8 +999,8 @@ namespace coro {
                 }
 
                 int await_resume() {
-                    if (op.error) {
-                        io::set_error(op.error);
+                    if (const int err = detail::uring_op_error(op)) {
+                        io::set_error(err);
                         return -1;
                     }
                     return op.result;
@@ -998,8 +1051,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
+                        op.fd = fd; // close 前可按 fd 批量取消
                         io_uring_prep_connect(sqe, fd, (sockaddr*)&addr, sizeof(addr));
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1009,10 +1063,10 @@ namespace coro {
                 }
 
                 TcpStream await_resume() {
-                    if (op.error) {
+                    if (const int err = detail::uring_op_error(op)) {
                         ::close(fd);
                         fd = -1;
-                        io::set_error(op.error);
+                        io::set_error(err);
                         return TcpStream{}; // 连接失败, valid()==false
                     }
                     return TcpStream(std::exchange(fd, -1));
@@ -1022,7 +1076,7 @@ namespace coro {
             /// 创建 socket 并异步连接到 ip:port (零配置)
             static connect_awaiter connect(const char* ip, unsigned short port) {
                 connect_awaiter aw;
-                aw.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+                aw.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 aw.addr.sin_family = AF_INET;
                 aw.addr.sin_port = htons(port);
                 aw.addr.sin_addr.s_addr = inet_addr(ip);
@@ -1031,15 +1085,18 @@ namespace coro {
 
             // ---- 同步关闭 ----
 
-            /// io_uring 无 socket 关联概念 (每次操作直接提交 SQE),
-            /// 跨线程传递 fd 即可使用, 无需迁移。
-            void reattach() {}
+            /// io_uring 无 socket 关联概念 (每次操作直接提交 SQE), 跨线程传递
+            /// fd 即可使用。返回 bool 与 Windows 版签名对齐 (恒成功),
+            /// 多线程服务器可按平台无差异地 `if (!s.reattach()) ...`。
+            bool reattach() { return true; }
 
             void close() {
                 if (fd_ >= 0) {
                     // 与 TcpListener/UdpSocket 同一合同: 挂起的 recv/send SQE
                     // 持有文件引用, 仅 close 不会让它们完成 (事件循环会永久等待);
-                    // 先 shutdown 解除收发, 再释放描述符。
+                    // 先按 fd 提交取消, 再 shutdown 解除收发, 最后释放描述符。
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
@@ -1086,7 +1143,7 @@ namespace coro {
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
-                fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+                fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (fd_ < 0)
                     return false;
 
@@ -1154,8 +1211,11 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
-                        io_uring_prep_accept(sqe, listener->fd_, nullptr, nullptr, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        // accept 出的 fd 也要原子设 CLOEXEC: 事后 fcntl 会留下
+                        // “fork 已发生、CLOEXEC 未设”的窗口, 子进程会继承不该有的 socket。
+                        op.fd = listener->fd_; // close 前可按 fd 批量取消
+                        io_uring_prep_accept(sqe, listener->fd_, nullptr, nullptr, SOCK_CLOEXEC);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1165,8 +1225,8 @@ namespace coro {
                 }
 
                 TcpStream await_resume() {
-                    if (op.error) {
-                        io::set_error(op.error);
+                    if (const int err = detail::uring_op_error(op)) {
+                        io::set_error(err);
                         return TcpStream{}; // 无效流, valid()==false
                     }
                     return TcpStream(std::exchange(op.result, -1)); // cqe->res 即新连接的 fd
@@ -1183,7 +1243,9 @@ namespace coro {
             void close() {
                 if (fd_ >= 0) {
                     // io_uring 的 accept 持有文件引用，仅 close 不会使其完成。
-                    // 先 shutdown 解除监听，再释放描述符，避免服务停止时永久挂起。
+                    // 先按 fd 提交取消，再 shutdown 解除监听，避免服务停止时永久挂起。
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;
@@ -1223,7 +1285,7 @@ namespace coro {
 
             bool bind_listen(const char* ip, unsigned short port) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
-                fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (fd_ < 0)
                     return false;
 
@@ -1291,8 +1353,9 @@ namespace coro {
                         msg_.msg_namelen = from_len;
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
+                        op.fd = socket->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_recvmsg(sqe, socket->fd_, &msg_, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1302,8 +1365,8 @@ namespace coro {
                 }
 
                 int await_resume() {
-                    if (op.error) {
-                        io::set_error(op.error);
+                    if (const int err = detail::uring_op_error(op)) {
+                        io::set_error(err);
                         return -1;
                     }
                     if (sender)
@@ -1359,8 +1422,9 @@ namespace coro {
                         msg_.msg_namelen = sizeof(dest);
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
+                        op.fd = socket->fd_; // close 前可按 fd 批量取消
                         io_uring_prep_sendmsg(sqe, socket->fd_, &msg_, 0);
-                        detail::uring_submit_op(u, u->handle(), &op, sqe);
+                        detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
                     } else {
@@ -1370,8 +1434,8 @@ namespace coro {
                 }
 
                 int await_resume() {
-                    if (op.error) {
-                        io::set_error(op.error);
+                    if (const int err = detail::uring_op_error(op)) {
+                        io::set_error(err);
                         return -1;
                     }
                     return op.result;
@@ -1385,7 +1449,10 @@ namespace coro {
             void close() {
                 if (fd_ >= 0) {
                     // io_uring 上挂起的 recvmsg/sendmsg 持有文件引用, 仅 close 不会让它们
-                    // 完成: 服务端关停时事件循环会永久等待。先 shutdown 解除收发, 再关描述符。
+                    // 完成: 服务端关停时事件循环会永久等待。未连接 UDP socket 的
+                    // shutdown 会失败 (ENOTCONN), 必须按 fd 提交取消才能唤醒挂起的收发。
+                    if (auto* u = detail::current_uring())
+                        u->cancel_fd_ops(fd_);
                     ::shutdown(fd_, SHUT_RDWR);
                     ::close(fd_);
                     fd_ = -1;

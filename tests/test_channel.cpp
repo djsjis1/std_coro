@@ -186,6 +186,32 @@ namespace {
         co_return;
     }
 
+    // 成交后接收者必须从候选队列退役: 第二次 send 不能被同一个节点接收
+    coro::Task<> recv_one_value(coro::channel<int>::receiver* rx, int* out) {
+        auto v = co_await rx->recv();
+        *out = v.has_value() ? *v : -1;
+        co_return;
+    }
+
+    coro::Task<> receiver_retires_after_delivery(int* first, int* second, int* second_send_ok) {
+        auto ch = coro::channel<int>::bounded(2);
+        auto tx = ch.make_sender();
+        auto rx = ch.make_receiver();
+
+        auto waiter = coro::spawn(recv_one_value(&rx, first));
+        co_await coro::yield(); // 让接收者挂起在候选队列里
+
+        // 第一次发送直接交给已挂起的接收者 (成交)
+        EXPECT_TRUE(tx.try_send(1));
+        // 第二次发送必须找不到同一个旧节点: 它已退役, 值进缓冲区而不是覆盖消息
+        *second_send_ok = tx.try_send(2) ? 1 : 0;
+
+        co_await std::move(waiter);
+        int v = -1;
+        *second = rx.try_recv(v) ? v : -1;
+        co_return;
+    }
+
 } // namespace
 
 TEST(ChannelTest, BoundedKeepsFifo) {
@@ -244,6 +270,14 @@ TEST(ChannelTest, CancelledSenderLeavesNoValueOrSlot) {
     int next_value = 0;
     test_util::run_task([&] { return cancelled_sender_leaves_nothing(&next_value); });
     EXPECT_EQ(next_value, 9) << "被取消的发送者残留了值或占着名额";
+}
+
+TEST(ChannelTest, ReceiverRetiresAfterDelivery) {
+    int first = -1, second = -1, second_send_ok = -1;
+    test_util::run_task([&] { return receiver_retires_after_delivery(&first, &second, &second_send_ok); });
+    EXPECT_EQ(first, 1) << "第一次交付的值被后续发送覆盖了 (接收节点未退役)";
+    EXPECT_EQ(second_send_ok, 1) << "第二次发送不该再命中已完成交付的接收节点";
+    EXPECT_EQ(second, 2) << "第二次发送的值丢失或错位";
 }
 
 #endif // CORO_HAS_CONCURRENCY_EXT

@@ -40,6 +40,8 @@
 namespace coro {
     namespace detail {
 
+        struct timer_state;
+
         /// 等待终态: 除 pending 外互斥, 先到先得且不可翻转
         enum class timer_outcome : int { pending = 0, expired = 1, cancelled = 2 };
 
@@ -77,8 +79,49 @@ namespace coro {
             }
         };
 
+        /// wait() 在调用时就占住的唯一等待者名额。用 RAII 持有:
+        /// 协程帧分配失败、返回的 Task 未启动就被丢弃、等待任务被取消、正常完成
+        /// 都会归还名额, 否则第二次 wait() 会永远被拒。
+        struct timer_reservation {
+            std::shared_ptr<timer_state> st;
+            bool owns = false;
+
+            timer_reservation() = default;
+            explicit timer_reservation(std::shared_ptr<timer_state> s) : st(std::move(s)), owns(true) {}
+            timer_reservation(const timer_reservation&) = delete;
+            timer_reservation& operator=(const timer_reservation&) = delete;
+            timer_reservation(timer_reservation&& other) noexcept
+                : st(std::move(other.st)), owns(std::exchange(other.owns, false)) {}
+            timer_reservation& operator=(timer_reservation&& other) noexcept {
+                if (this != &other) {
+                    release();
+                    st = std::move(other.st);
+                    owns = std::exchange(other.owns, false);
+                }
+                return *this;
+            }
+            ~timer_reservation() { release(); }
+
+            void release() noexcept {
+                if (owns && st)
+                    st->wait_taken.store(false);
+                owns = false;
+            }
+        };
+
         struct timer_wait_awaiter {
             std::shared_ptr<timer_state> st;
+            timer_reservation reservation;
+
+            timer_wait_awaiter() = default;
+            timer_wait_awaiter(std::shared_ptr<timer_state> s, timer_reservation r)
+                : st(std::move(s)), reservation(std::move(r)) {}
+            // 用户声明的析构不会隐式生成移动构造, 而成员 reservation 不可拷贝:
+            // 必须显式声明移动, 否则 await_transform 按值传递时会编译失败。
+            timer_wait_awaiter(timer_wait_awaiter&&) noexcept = default;
+            timer_wait_awaiter& operator=(timer_wait_awaiter&&) noexcept = default;
+            timer_wait_awaiter(const timer_wait_awaiter&) = delete;
+            timer_wait_awaiter& operator=(const timer_wait_awaiter&) = delete;
 
             /// 已有终态时不挂起 (例如 cancel 发生在 wait 之前)
             bool await_ready() const noexcept { return st->result.load() != static_cast<int>(timer_outcome::pending); }
@@ -101,17 +144,31 @@ namespace coro {
 
             bool await_resume() noexcept {
                 st->waiting.store(false);
-                st->wait_taken.store(false); // 允许后续再 wait (一次性语义由 result 约束)
                 if (st->token)
                     *st->token = true; // 本次注册已消费, 堆里的条目作废
+                reservation.release(); // 允许后续再 wait (一次性语义由 result 约束)
                 if (st->claim(timer_outcome::expired))
                     return true;
                 return static_cast<timer_outcome>(st->result.load()) == timer_outcome::expired;
             }
+
+            /// 取消路径会绕过 await_resume, 必须由析构完成退役:
+            /// 归还等待名额、作废定时器条目、清掉可能已销毁帧的句柄/owner。
+            ~timer_wait_awaiter() {
+                if (!reservation.owns)
+                    return; // 已正常结束
+                if (st->token) {
+                    *st->token = true;
+                    st->token.reset();
+                }
+                st->waiting.store(false);
+                st->handle = {};
+                st->owner = nullptr;
+            }
         };
 
-        inline Task<bool> timer_wait(std::shared_ptr<timer_state> st) {
-            co_return co_await timer_wait_awaiter{std::move(st)};
+        inline Task<bool> timer_wait(std::shared_ptr<timer_state> st, timer_reservation res) {
+            co_return co_await timer_wait_awaiter{std::move(st), std::move(res)};
         }
 
     } // namespace detail
@@ -129,8 +186,22 @@ namespace coro {
 
         Timer(const Timer&) = delete;
         Timer& operator=(const Timer&) = delete;
-        Timer(Timer&&) noexcept = default;
-        Timer& operator=(Timer&&) noexcept = default;
+
+        /// 移出对象回到“无状态”状态 (state_ == nullptr), 其他成员函数均做空检查,
+        /// 不再在 noexcept 移动里分配内存。
+        Timer(Timer&& other) noexcept : state_(std::move(other.state_)) { other.state_.reset(); }
+
+        /// 移动赋值必须先终止旧状态, 否则旧等待者会永久挂着: 丢掉 Timer 端的
+        /// shared_ptr 并不等于调用 cancel(), 内核定时器条目也还留在堆里。
+        Timer& operator=(Timer&& other) noexcept {
+            if (this != &other) {
+                if (state_)
+                    do_cancel(); // 唤醒旧等待者 (cancelled 结果), 不退化为无主等待
+                state_ = std::move(other.state_);
+                other.state_.reset();
+            }
+            return *this;
+        }
 
         /// 析构: 若还有等待者, 以"取消"方式唤醒它 (绝不留永久挂起的协程)
         ~Timer() {
@@ -142,10 +213,13 @@ namespace coro {
         /// 只允许一个等待者: 第二个等待者不被静默丢唤醒, 而是在调用时就拒绝。
         /// 本函数不是协程 —— 挂起点在自由协程里, 帧不捕获 this (见文件头约束 1)。
         Task<bool> wait() {
+            if (!state_)
+                throw StructuredConcurrencyError("Timer::wait on a moved-from Timer");
             bool expected = false;
             if (!state_->wait_taken.compare_exchange_strong(expected, true))
                 throw StructuredConcurrencyError("Timer::wait already has a waiter");
-            return detail::timer_wait(state_);
+            // 占位由 RAII 移交到协程帧: 未启动就丢弃、取消、正常完成都会归还
+            return detail::timer_wait(state_, detail::timer_reservation{state_});
         }
 
         /// 把等待迁移到 now + d。
@@ -161,6 +235,8 @@ namespace coro {
         ///   - 无等待者 (上一轮已结束): 重新开局, 让下一次 wait() 真的再等一次。
         ///     否则到期后的终态会让 wait() 立刻返回, 用户拿到的是一个空转循环。
         template <typename Rep, typename Period> void reset(std::chrono::duration<Rep, Period> d) {
+            if (!state_)
+                state_ = std::make_shared<detail::timer_state>();
             auto st = state_;
             st->deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::milliseconds>(d);
             if (st->waiting.load()) {
@@ -182,14 +258,18 @@ namespace coro {
         void cancel() { do_cancel(); }
 
         /// 是否已进入终态 (到期或被取消)
-        bool done() const noexcept { return state_->result.load() != static_cast<int>(outcome::pending); }
+        bool done() const noexcept {
+            return !state_ || state_->result.load() != static_cast<int>(outcome::pending);
+        }
 
         /// 当前是否有等待者
-        bool has_waiter() const noexcept { return state_->waiting.load(); }
+        bool has_waiter() const noexcept { return state_ && state_->waiting.load(); }
 
       private:
         void do_cancel() {
             auto st = state_;
+            if (!st)
+                return;
             const bool was_waiting = st->waiting.exchange(false);
             if (!st->claim(outcome::cancelled))
                 return; // 已有终态 (通常是同时到期), 不重复唤醒

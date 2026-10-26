@@ -98,6 +98,41 @@ namespace {
         *returned = true;
     }
 
+    // ── gather: 调用方被取消 → 子任务收到 CancelledError (级联取消) ──
+    // 旧实现把子任务随临时 awaiter 硬销毁, await 点之后的清理代码不会执行。
+    coro::Task<int> cancel_cleanup_child(int* cleaned) {
+        try {
+            co_await coro::sleep(10s);
+        } catch (const coro::CancelledError&) {
+            ++*cleaned; // 子任务 await 点之后的清理逻辑必须执行
+            throw;
+        }
+        co_return 0;
+    }
+
+    coro::Task<int> gather_cancels_children_impl(int* cleaned, bool* awaiting_cancelled) {
+        try {
+            auto results = co_await coro::gather(cancel_cleanup_child(cleaned), cancel_cleanup_child(cleaned));
+            co_return std::get<0>(results) + std::get<1>(results);
+        } catch (const coro::CancelledError&) {
+            *awaiting_cancelled = true;
+            throw;
+        }
+    }
+
+    coro::Task<> gather_cancel_driver(int* cleaned, bool* awaiting_cancelled) {
+        auto awaiting = coro::spawn(gather_cancels_children_impl(cleaned, awaiting_cancelled));
+        co_await coro::sleep(20ms);
+        awaiting.cancel();
+        try {
+            (void)co_await std::move(awaiting);
+        } catch (const coro::CancelledError&) {
+            // 预期: 等待 gather 的协程本身被取消
+        }
+        // 留出时间让子任务的取消注入与 monitor 收尾跑完
+        co_await coro::sleep(20ms);
+    }
+
     coro::Task<int> slow_count() {
         co_await coro::sleep(200ms);
         co_return 1;
@@ -162,6 +197,36 @@ TEST(ConcurrencyTest, GatherStaticMixedTypes) {
     test_util::run_task([&] { return gather_two(&name, &count); });
     EXPECT_EQ(name, "alice");
     EXPECT_EQ(count, 42);
+}
+
+// gather 级联取消: 调用方被取消时子任务必须收到 CancelledError 并执行清理
+TEST(ConcurrencyTest, GatherCancelsChildrenOnCallerCancel) {
+    int cleaned = 0; // 单 loop 线程访问, 无需原子
+    bool awaiting_cancelled = false;
+    test_util::run_task([&] { return gather_cancel_driver(&cleaned, &awaiting_cancelled); });
+    EXPECT_TRUE(awaiting_cancelled);
+    EXPECT_EQ(cleaned, 2);
+}
+
+// coro::run: 事件循环被 stop() 提前终止而主任务未完成时必须显式报错
+// (旧实现静默返回, 把未完成伪装成成功)
+TEST(RunStopTest, RunStoppedBeforeMainCompletesThrows) {
+    bool threw = false;
+    try {
+        coro::run([]() -> coro::Task<> {
+            auto stopper = coro::spawn([]() -> coro::Task<> {
+                co_await coro::sleep(10ms);
+                coro::EventLoop::get().stop();
+                co_return;
+            }());
+            (void)stopper; // 保活: stopper 必须活到完成
+            co_await coro::sleep(10s);
+            co_return;
+        }());
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
 }
 
 TEST(ConcurrencyTest, GatherAllDynamic) {

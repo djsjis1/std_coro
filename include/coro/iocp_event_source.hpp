@@ -7,6 +7,8 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
+// timeBeginPeriod / timeEndPeriod: 把系统时钟分辨率抬到 1ms (需 winmm)
+#include <timeapi.h>
 #endif
 
 #include <atomic>
@@ -43,6 +45,22 @@ namespace coro {
             DWORD transferred = 0;                  // 实际传输字节数
         };
 
+        /// GQCSEx 对失败完成只给 OVERLAPPED.Internal (NTSTATUS), 而各 I/O 模块
+        /// 消费的是 Win32/WSA 错误码。RtlNtStatusToDosError 正是 GQCS 内部使
+        /// 用的那个转换函数; 动态取指针, 不为它增加链接依赖。
+        inline int ntstatus_to_win32(long status) noexcept {
+            using fn_t = ULONG(WINAPI*)(LONG);
+            static fn_t fn = []() -> fn_t {
+                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                if (ntdll == nullptr)
+                    return nullptr;
+                return reinterpret_cast<fn_t>(reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlNtStatusToDosError")));
+            }();
+            if (fn == nullptr)
+                return static_cast<int>(ERROR_OPERATION_ABORTED);
+            return static_cast<int>(fn(static_cast<LONG>(status)));
+        }
+
 #endif
 
     } // namespace detail
@@ -55,12 +73,24 @@ namespace coro {
           public:
             static constexpr ULONG_PTR WAKE_KEY = 1; // 特殊完成键: 外部唤醒
 
-            /// wait_for 单次等待后追加排空的每批最大完成包数
-            static constexpr DWORD DRAIN_BATCH = 64;
+            /// 单次 wait_for 最多取出的完成包数。批次越大, 相同负载下需要的
+            /// 系统调用越少 (实测饱和 echo 场景每包由 1 次 GQCS 降为 1/128 次)。
+            static constexpr ULONG DRAIN_BATCH = 128;
 
-            IocpEventSource() : iocp_(CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0)) {}
+            IocpEventSource() : iocp_(CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0)) {
+                // GetQueuedCompletionStatus 的超时粒度跟随系统时钟 (缺省 15.6ms): 不抬高分辨率时
+                // sleep(1ms) 实测平均 ~10ms、抖动最差 ~16ms, 整个定时器体系凭空慢一个数量级。
+                // 与 libuv 在 Windows 上的做法一致: 事件源存活期间持住 1ms 分辨率。
+                if (iocp_) {
+                    timeBeginPeriod(1);
+                    high_resolution_ = true;
+                }
+            }
 
             ~IocpEventSource() override {
+                // 与构造配对: 只有真正抬高过分辨率才归还, 避免多 loop 时提前降回 15.6ms
+                if (high_resolution_)
+                    timeEndPeriod(1);
                 if (iocp_)
                     CloseHandle(iocp_);
             }
@@ -69,6 +99,10 @@ namespace coro {
             /// process token. EventLoop uses this to fall back to CVEventSource
             /// instead of later passing a null handle to GQCS.
             bool valid() const noexcept { return iocp_ != nullptr; }
+
+            /// 原生完成端口句柄 (诊断与回归测试用: 可注入完成包验证收割逻辑)。
+            /// 生产代码不需要它 —— 关联/提交均由各 I/O 模块封装。
+            HANDLE native_handle() const noexcept { return iocp_; }
 
             /// 将 socket 关联到完成端口 (之后其异步操作都投递到此端口)
             bool associate(SOCKET s) {
@@ -93,21 +127,14 @@ namespace coro {
                 // GetQueuedCompletionStatus 的 timeout 是 DWORD 毫秒
                 DWORD ms =
                     (timeout.count() > (long long)(INFINITE - 1)) ? INFINITE - 1 : static_cast<DWORD>(timeout.count());
-                BOOL ok = GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, ms);
 
-                if (ov) {
-                    // 一个 I/O 操作完成了: 反查操作状态, 恢复协程。
-                    // 随后用 0 超时继续排空已就绪的完成包 (批量收割):
-                    // 一次 loop 迭代处理 N 个完成, 摊薄每迭代的锁开销。
-                    // 不用 GetQueuedCompletionStatusEx: 它对失败完成只给
-                    // OVERLAPPED.Internal 的 NTSTATUS, 需自行转换错误码,
-                    // 而 GQCS 的 FALSE+GetLastError 语义已是正确的 WSA 码。
-                    int completed = 0;
-                    do {
-                        complete_one(ov, ok, bytes);
-                        ++completed;
-                        ok = GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, 0);
-                    } while (ov && completed < (int)DRAIN_BATCH);
+                // 混合策略: 阻塞等待用 GQCS 取第一个包 (小批次时比 GQCSEx 开销低,
+                // 且失败时直接给 WSA/Win32 错误码), 随后的排空用一次 GQCSEx 批量取 ——
+                // 旧实现是"一包一次 GQCS", 饱和时每个完成都多一次系统调用。
+                const BOOL ok = GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, ms);
+                if (ov != nullptr) {
+                    deliver(reinterpret_cast<detail::iocp_op*>(ov), ok ? 0 : static_cast<int>(GetLastError()), bytes);
+                    drain_ready();
                     return 1;
                 }
                 if (ok && key == WAKE_KEY)
@@ -118,17 +145,36 @@ namespace coro {
             void wake() override { PostQueuedCompletionStatus(iocp_, 0, WAKE_KEY, nullptr); }
 
           private:
-            /// 消费一个完成包: 填充 op 状态并交还事件循环
-            void complete_one(OVERLAPPED* ov, BOOL ok, DWORD bytes) {
-                auto* op = reinterpret_cast<detail::iocp_op*>(ov);
+            /// 交付一个已完成的 I/O 操作 (错误码已在调用点快照)
+            void deliver(detail::iocp_op* op, int error, DWORD bytes) noexcept {
                 --pending_ops_; // 挂起计数 -1
-                op->error = ok ? 0 : GetLastError();
+                op->error = error;
                 op->transferred = bytes;
                 if (op->continuation)
                     on_complete(op->continuation); // 交还给事件循环
             }
 
+            /// 非阻塞排空已就绪的完成包: 一次系统调用最多取 DRAIN_BATCH 个。
+            /// 剩余留到下一轮, 避免持续完成流饿死定时器与跨线程回调。
+            void drain_ready() {
+                OVERLAPPED_ENTRY entries[DRAIN_BATCH];
+                ULONG count = 0;
+                if (!GetQueuedCompletionStatusEx(iocp_, entries, DRAIN_BATCH, &count, 0, FALSE))
+                    return;
+                for (ULONG i = 0; i < count; ++i) {
+                    const auto& entry = entries[i];
+                    if (entry.lpOverlapped == nullptr) // 唤醒包: 本批已非空, 无需额外处理
+                        continue;
+                    // GQCSEx 失败时只给 NTSTATUS, 用与 GQCS 内部相同的转换还原错误码
+                    const int error =
+                        entry.Internal == 0 ? 0 : detail::ntstatus_to_win32(static_cast<long>(entry.Internal));
+                    deliver(reinterpret_cast<detail::iocp_op*>(entry.lpOverlapped), error,
+                            entry.dwNumberOfBytesTransferred);
+                }
+            }
+
             HANDLE iocp_;
+            bool high_resolution_ = false; // 构造期间是否成功抬高过时钟分辨率
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数
         };
 

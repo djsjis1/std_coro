@@ -74,8 +74,17 @@ namespace {
 
 } // namespace
 
-// ── 核心验证: 两个线程各跑一个 60ms 任务, 总时间 ≈ 60ms (并行) 而非 120ms ──
+// ── 核心验证: 两个线程各跑一个 60ms 任务, 总时间接近单个任务而非两倍 ──
+// 用同一进程内的单线程基线做对比, 而不是猜一个绝对毫秒阈值 ——
+// 共享 CI 机器上固定墙钟阈值会随负载变得不稳定。
 TEST(MultiThreadTest, TwoLoopsRunInParallel) {
+    std::atomic<int> base{0};
+    auto b0 = std::chrono::steady_clock::now();
+    thread_sleep_and_run(60, &base);
+    const auto single =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - b0).count();
+    ASSERT_EQ(base.load(), 1);
+
     std::atomic<int> a{0}, b{0};
     auto t0 = std::chrono::steady_clock::now();
     std::thread t1(thread_sleep_and_run, 60, &a);
@@ -85,7 +94,8 @@ TEST(MultiThreadTest, TwoLoopsRunInParallel) {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     EXPECT_EQ(a.load(), 1);
     EXPECT_EQ(b.load(), 1);
-    EXPECT_LT(elapsed, 110); // 并行: 两个 60ms 合计 < 110ms (串行会 ≥ 120ms)
+    // 真并行应接近单个任务的耗时; 串行会接近两倍。留 1.5x 余量吸收调度抖动。
+    EXPECT_LT(elapsed, single * 3 / 2) << "single=" << single << "ms parallel=" << elapsed << "ms";
 }
 
 // ── 每线程独立 loop: 各自跑大量协程互不干扰 ──

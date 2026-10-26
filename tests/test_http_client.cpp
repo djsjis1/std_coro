@@ -17,6 +17,7 @@
 #include "test_util.h"
 
 #include <chrono>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -245,6 +246,212 @@ namespace {
                 out.push_back(value);
         }
         return out;
+    }
+
+    // ── aclose / 背压 / 发送侧限额 (C03 回归) ──
+
+    coro::Task<call_result> in_flight_request(coro::HttpClient* client, std::string url) {
+        co_return co_await fetch(*client, std::move(url));
+    }
+
+    struct aclose_probe {
+        bool request_done = false;
+        bool request_ok = false;
+        bool aclose_saw_request_done = false;
+        std::string aclose_error;
+    };
+
+    coro::Task<> aclose_scenario(peer* p, aclose_probe* out) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_stall(p, 40ms, k_ok_response));
+        auto req = coro::spawn(in_flight_request(&client, p->url()));
+        // 确定性屏障: 对端已 accept 说明请求确实在途 (不能只 yield 一次)
+        for (int i = 0; i < 2000 && p->accepts == 0; ++i)
+            co_await coro::sleep(std::chrono::milliseconds(1));
+        try {
+            co_await client.aclose(); // 屏障: 必须等在途请求退出
+            out->aclose_saw_request_done = true;
+        } catch (const std::exception& e) {
+            out->aclose_error = e.what();
+        }
+        try {
+            auto result = co_await std::move(req);
+            out->request_ok = result.ok() && result.status == 200;
+            if (!result.ok())
+                out->aclose_error = result.error;
+        } catch (...) {
+            out->request_ok = false;
+        }
+        out->request_done = true;
+        co_await join_peer(server);
+        co_return;
+    }
+
+    struct overload_probe {
+        bool first_ok = false;
+        bool second_rejected = false;
+    };
+
+    coro::Task<> overload_scenario(peer* p, overload_probe* out) {
+        coro::HttpClient::Options options;
+        options.max_total_requests = 1; // 只允许一个在途请求
+        coro::HttpClient client(options);
+        auto server = coro::spawn(script_stall(p, 40ms, k_ok_response));
+        auto first = coro::spawn(in_flight_request(&client, p->url()));
+        for (int i = 0; i < 2000 && p->accepts == 0; ++i)
+            co_await coro::sleep(std::chrono::milliseconds(1));
+        try {
+            (void)co_await client.get(p->url());
+        } catch (const coro::OverloadError&) {
+            out->second_rejected = true;
+        }
+        try {
+            auto result = co_await std::move(first);
+            out->first_ok = result.ok() && result.status == 200;
+        } catch (...) {
+            out->first_ok = false;
+        }
+        co_await join_peer(server);
+        co_return;
+    }
+
+    struct wire_limit_probe {
+        bool rejected = false;
+        std::string error;
+    };
+
+    coro::Task<> wire_limit_scenario(peer* p, wire_limit_probe* out) {
+        coro::HttpClient::Options options;
+        options.max_request_wire_bytes = 32; // 请求行 + 头就超了
+        coro::HttpClient client(options);
+        try {
+            (void)co_await client.get(p->url());
+        } catch (const coro::HttpError& e) {
+            out->rejected = true;
+            out->error = e.what();
+        }
+        co_return;
+    }
+
+    // 发一个固定响应, 收起对端脚本 (避免测试进程残留挂起的 accept)
+    coro::Task<> fetch_scripted(peer* p, const char* response, call_result* out) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_once(p, response));
+        *out = co_await fetch(client, p->url());
+        co_await join_peer(server);
+        co_return;
+    }
+
+    // ── 流式响应 (E05) ──
+    struct stream_probe {
+        int status = 0;
+        int chunks = 0;
+        std::string body;
+        bool eof = false;
+        std::string error;
+    };
+
+    coro::Task<> drain_stream(coro::HttpResponseStream* s, stream_probe* out) {
+        try {
+            out->status = s->status();
+            for (;;) {
+                auto chunk = co_await s->read_chunk();
+                if (!chunk) {
+                    out->eof = true;
+                    break;
+                }
+                ++out->chunks;
+                out->body += *chunk;
+            }
+            co_await s->aclose(); // 已读完后重复调用必须幂等
+        } catch (const std::exception& e) {
+            out->error = e.what();
+        }
+    }
+
+    coro::Task<> stream_scenario(peer* p, std::vector<std::string> pieces, stream_probe* out) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_fragmented(p, std::move(pieces)));
+        try {
+            coro::HttpRequest request;
+            request.url = p->url();
+            auto stream = co_await client.stream(std::move(request));
+            co_await drain_stream(&stream, out);
+        } catch (const std::exception& e) {
+            out->error = e.what();
+        }
+        co_await join_peer(server);
+    }
+
+    coro::Task<> stream_read_all(coro::HttpClient* client, std::string url, std::string* into) {
+        coro::HttpRequest request;
+        request.url = std::move(url);
+        auto stream = co_await client->stream(std::move(request));
+        *into += "<h";
+        for (;;) {
+            auto chunk = co_await stream.read_chunk();
+            if (!chunk)
+                break;
+            *into += *chunk;
+        }
+        *into += ">";
+        co_await stream.aclose();
+    }
+
+    coro::Task<> stream_keep_alive_scenario(peer* p, int* accepts, std::string* bodies, std::string* error) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_keep_alive(p, k_ok_response, 2));
+        for (int i = 0; i < 2; ++i) {
+            try {
+                co_await coro::wait_for(stream_read_all(&client, p->url(), bodies), 2000ms);
+            } catch (const std::exception& e) {
+                *error = e.what();
+                break;
+            }
+        }
+        *accepts = p->accepts;
+        co_await join_peer(server);
+    }
+
+    // ── 随机脏数据输入 (C05 fuzz-lite): 只要求“不挂死、不崩溃、可观察失败”──
+    coro::Task<> script_garbage(peer* p, unsigned seed) {
+        auto conn = co_await p->listener.accept();
+        if (!conn.valid())
+            co_return;
+        ++p->accepts;
+        p->last_request = co_await read_request(conn);
+        std::mt19937 rng(seed);
+        std::uniform_int_distribution<int> len_dist(0, 64);
+        std::uniform_int_distribution<int> byte_dist(0, 255);
+        for (int chunk = 0; chunk < 3; ++chunk) {
+            const int n = len_dist(rng);
+            std::string bytes;
+            bytes.reserve(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i)
+                bytes.push_back(static_cast<char>(byte_dist(rng)));
+            if (!bytes.empty() && !co_await send_all(conn, bytes))
+                co_return;
+            co_await coro::sleep(1ms);
+        }
+    }
+
+    struct fuzz_probe {
+        int iterations = 0;
+        bool hung = false;
+        bool crashed = false;
+    };
+
+    coro::Task<> garbage_case(peer* p, unsigned seed, fuzz_probe* out) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_garbage(p, seed));
+        try {
+            (void)co_await coro::wait_for(fetch(client, p->url()), 2000ms);
+        } catch (const coro::TimeoutError&) {
+            out->hung = true; // 真正的缺陷: 脏数据把客户端挂死
+        } catch (...) {
+            // 解析/连接错误: 可观察失败即可
+        }
+        co_await join_peer(server);
     }
 
 } // namespace
@@ -705,6 +912,97 @@ TEST(HttpClientTest, HttpsWithoutTlsIsRejected) {
     EXPECT_NE(result.error.find("TLS"), std::string::npos) << result.error;
 }
 #endif
+
+TEST(HttpClientTest, AcloseWaitsForInflightRequest) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    aclose_probe probe;
+    test_util::run_task([&]() -> coro::Task<> { co_await aclose_scenario(&p, &probe); });
+    EXPECT_TRUE(probe.aclose_error.empty()) << probe.aclose_error;
+    EXPECT_TRUE(probe.aclose_saw_request_done) << "aclose 返回时在途请求必须已经结束";
+    EXPECT_TRUE(probe.request_ok) << "在途请求不应因为 aclose 而失败";
+}
+
+TEST(HttpClientTest, OverloadIsRejectedNotQueued) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    overload_probe probe;
+    test_util::run_task([&]() -> coro::Task<> { co_await overload_scenario(&p, &probe); });
+    EXPECT_TRUE(probe.second_rejected) << "超过在途上限必须报 OverloadError, 不能静默排队";
+    EXPECT_TRUE(probe.first_ok) << "已接受的在途请求不应被背压影响";
+}
+
+TEST(HttpClientTest, OversizedRequestWireIsRejected) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    wire_limit_probe probe;
+    test_util::run_task([&]() -> coro::Task<> { co_await wire_limit_scenario(&p, &probe); });
+    EXPECT_TRUE(probe.rejected) << "发送侧 wire 超限必须报错";
+}
+
+TEST(HttpClientTest, StreamReadsChunkedBodyInPieces) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    stream_probe probe;
+    // 头部与每个分块分开到达, 验证“头部完成即可开始消费”
+    std::vector<std::string> pieces{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                                    "5\r\nhello\r\n",
+                                    "6\r\n world\r\n",
+                                    "0\r\n\r\n"};
+    test_util::run_task([&]() -> coro::Task<> { co_await stream_scenario(&p, std::move(pieces), &probe); });
+    EXPECT_TRUE(probe.error.empty()) << probe.error;
+    EXPECT_EQ(probe.status, 200);
+    EXPECT_EQ(probe.body, "hello world");
+    EXPECT_TRUE(probe.eof) << "读到底应返回 nullopt";
+}
+
+TEST(HttpClientTest, GarbageResponseNeverHangsOrCrashes) {
+    // C05 fuzz-lite: 固定种子的随机字节流, 只断言“不挂死”。
+    // 真正的 libFuzzer 套件需单独构建; 这里是每个 PR 都能跑的确定性版本。
+    fuzz_probe probe;
+    for (unsigned seed = 1; seed <= 24 && !probe.hung; ++seed) {
+        peer p;
+        ASSERT_TRUE(p.start());
+        test_util::run_task([&]() -> coro::Task<> { co_await garbage_case(&p, seed, &probe); });
+        ++probe.iterations;
+    }
+    EXPECT_EQ(probe.iterations, 24);
+    EXPECT_FALSE(probe.hung) << "随机脏数据让 HTTP 客户端挂死";
+}
+
+TEST(HttpClientTest, StreamReturnsConnectionToPool) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    int accepts = -1;
+    std::string bodies, error;
+    test_util::run_task([&]() -> coro::Task<> { co_await stream_keep_alive_scenario(&p, &accepts, &bodies, &error); });
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_NE(bodies.find("<hok>"), std::string::npos) << bodies;
+    EXPECT_EQ(accepts, 1) << "读完的流必须把连接交还池中复用";
+}
+
+TEST(HttpClientTest, ConflictingContentLengthIsRejected) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    call_result result;
+    test_util::run_task([&]() -> coro::Task<> {
+        co_await fetch_scripted(
+            &p, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc", &result);
+    });
+    EXPECT_FALSE(result.ok()) << "冲突的 Content-Length 必须拒绝, 不能默默选一个";
+}
+
+TEST(HttpClientTest, TransferEncodingWithContentLengthIsRejected) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    call_result result;
+    test_util::run_task([&]() -> coro::Task<> {
+        co_await fetch_scripted(
+            &p, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            &result);
+    });
+    EXPECT_FALSE(result.ok()) << "Transfer-Encoding 与 Content-Length 共存必须拒绝 (请求走私面)";
+}
 
 #endif // _WIN32 || __linux__ (io_uring)
 #endif // CORO_HAS_HTTP_CLIENT

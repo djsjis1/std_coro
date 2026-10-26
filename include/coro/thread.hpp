@@ -1,13 +1,16 @@
 #pragma once
 
+#include "exceptions.hpp"
 #include "future.hpp"
 #include "task.hpp"
 
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -44,9 +47,12 @@ namespace coro {
         // ==================================================================
         //
         // 仅用于 to_thread 的阻塞任务卸载。任务按提交顺序 FIFO 执行。
+        // 队列容量可限 (0 = 无界); 满了由 submit/try_submit 明确拒绝,
+        // 不会像旧实现那样无上限地吃内存。
         class ThreadPool {
           public:
-            explicit ThreadPool(size_t n = std::thread::hardware_concurrency()) {
+            explicit ThreadPool(size_t n = std::thread::hardware_concurrency(), size_t max_pending = 0)
+                : max_pending_(max_pending) {
                 if (n == 0)
                     n = 1;
                 try {
@@ -64,16 +70,41 @@ namespace coro {
             ThreadPool(const ThreadPool&) = delete;
             ThreadPool& operator=(const ThreadPool&) = delete;
 
-            /// 提交一个任务 (线程安全)
+            /// 提交一个任务 (线程安全)。已停止或队列满 → 抛 OverloadError。
             void submit(std::function<void()> task) {
+                if (!try_submit(std::move(task)))
+                    throw OverloadError("ThreadPool::submit: stopped or queue is full");
+            }
+
+            /// 尝试提交: 被拒绝时返回 false, 不抛异常 (供背压路径使用)
+            bool try_submit(std::function<void()> task) {
                 {
                     std::lock_guard lk(mtx_);
+                    if (stopping_)
+                        return false;
+                    if (max_pending_ != 0 && tasks_.size() >= max_pending_)
+                        return false;
                     tasks_.push(std::move(task));
                 }
                 cv_.notify_one();
+                return true;
             }
 
+            /// 停止接收新任务; 已排队的任务仍会执行完 (析构时同一路径)
+            void shutdown() { stop_and_join(); }
+
             size_t worker_count() const noexcept { return workers_.size(); }
+
+            /// 当前排队中的任务数 (观测用)
+            size_t pending() const noexcept {
+                std::lock_guard lk(mtx_);
+                return tasks_.size();
+            }
+
+            bool stopped() const noexcept {
+                std::lock_guard lk(mtx_);
+                return stopping_;
+            }
 
           private:
             void stop_and_join() {
@@ -104,9 +135,10 @@ namespace coro {
 
             std::vector<std::thread> workers_;
             std::queue<std::function<void()>> tasks_;
-            std::mutex mtx_;
+            mutable std::mutex mtx_;
             std::condition_variable cv_;
             bool stopping_ = false;
+            size_t max_pending_ = 0; // 0 = 无界
         };
 
         /// 全局默认线程池 (进程退出时析构, 等待任务完成)
@@ -123,6 +155,27 @@ namespace coro {
             co_return co_await promise->get_future();
         }
 
+        /// 把“执行 callable → 完成 promise”包装成线程池任务
+        template <typename F, typename R>
+        void submit_to_pool(const std::shared_ptr<Promise<R>>& promise, const std::shared_ptr<F>& callable) {
+            auto task = [promise, callable] {
+                try {
+                    if constexpr (std::is_void_v<R>) {
+                        std::invoke(*callable);
+                        promise->set_value();
+                    } else {
+                        promise->set_value(std::invoke(*callable));
+                    }
+                } catch (...) {
+                    promise->set_exception(std::current_exception());
+                }
+            };
+            // 拒绝 (已停止/队列满) 必须让等待者看到明确失败, 而不是挂死。
+            if (!default_thread_pool().try_submit(std::move(task)))
+                promise->set_exception(std::make_exception_ptr(
+                    OverloadError("to_thread: executor stopped or its queue is full")));
+        }
+
     } // namespace detail
 
     // ============================================================================
@@ -133,7 +186,11 @@ namespace coro {
     //   int v = co_await coro::to_thread([] { return blocking_read(); });
     //   co_await coro::to_thread([] { heavy_cpu_work(); });   // void 版本
     //
-    // 异常: func 抛出的异常在工作线程被捕获, 在 co_await 处重新抛出。
+    // 语义 (显式选择, 不隐藏差异):
+    //   - to_thread: **调用时立即提交** —— 即使返回的 Task 没被 co_await,
+    //     工作也可能已经开始。需要“开始执行时才提交”请用 to_thread_lazy。
+    //   - 异常: func 抛出的异常在工作线程被捕获, 在 co_await 处重新抛出。
+    //   - 执行器已停止/队列满: co_await 处得到 OverloadError (不会静默丢任务)。
     // ============================================================================
     template <typename F> Task<std::invoke_result_t<F&>> to_thread(F func) {
         using R = std::invoke_result_t<F&>;
@@ -141,22 +198,18 @@ namespace coro {
         auto promise = std::make_shared<Promise<R>>();
         auto callable = std::make_shared<F>(std::move(func));
         auto result = detail::to_thread_impl<R>(promise);
-
-        // 工作线程任务 (普通 lambda, 非协程): 执行 func → 完成 Promise
-        detail::default_thread_pool().submit([promise, callable] {
-            try {
-                if constexpr (std::is_void_v<R>) {
-                    std::invoke(*callable);
-                    promise->set_value();
-                } else {
-                    promise->set_value(std::invoke(*callable));
-                }
-            } catch (...) {
-                promise->set_exception(std::current_exception());
-            }
-        });
-
+        detail::submit_to_pool<F, R>(promise, callable);
         return result;
+    }
+
+    /// 惰性卸载 (对标 asyncio.to_thread): 协程真正启动时才提交到线程池。
+    /// 只创建 Task 而不 await/start → 工作函数一次都不会执行。
+    template <typename F> Task<std::invoke_result_t<F&>> to_thread_lazy(F func) {
+        using R = std::invoke_result_t<F&>;
+        auto promise = std::make_shared<Promise<R>>();
+        auto callable = std::make_shared<F>(std::move(func));
+        detail::submit_to_pool<F, R>(promise, callable);
+        co_return co_await promise->get_future();
     }
 
 } // namespace coro
