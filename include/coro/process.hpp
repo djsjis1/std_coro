@@ -625,7 +625,7 @@ namespace coro {
 
             /// 读到底 (EOF); 超过上限只标记, 不再缓存 —— 防止子进程无界输出吃内存
             inline coro::Task<bool> drain_output(pipe::PipeEnd* rd, std::string* into, std::size_t max_bytes,
-                                                bool* truncated) {
+                                                 bool* truncated) {
                 if (!rd)
                     co_return true;
                 char buf[4096];

@@ -134,7 +134,9 @@ namespace {
     }
 
     /// 挂起等待一个元素 (immediate shutdown 时以 QueueShutDown 结束)
-    coro::Task<> queue_get_one(coro::Queue<int>* q) { (void)co_await q->get(); }
+    coro::Task<> queue_get_one(coro::Queue<int>* q) {
+        (void)co_await q->get();
+    }
 
     coro::Task<> queue_immediate_shutdown(int* unfinished_after_drop, bool* got_shutdown) {
         // 1) 丢弃存量: unfinished 只扣仍在队列里的项

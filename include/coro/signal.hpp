@@ -450,7 +450,7 @@ namespace coro {
                 /// 重复安装同一 handler 无副作用, 无需去重集合。
                 void ensure_installed(int sig) {
                     ensure_initialized();
-                    struct sigaction sa {};
+                    struct sigaction sa{};
                     sa.sa_handler = &global_signal_state::signal_handler;
                     // SA_RESTART: 处理器是进程级的 —— 没有 RESTART 时, 任何
                     // 线程收到允许的信号都会让该线程当前的阻塞系统调用以
@@ -464,7 +464,7 @@ namespace coro {
 
                 /// 恢复默认处置 (disallow 且无等待者时)
                 void restore_default(int sig) {
-                    struct sigaction sa {};
+                    struct sigaction sa{};
                     sa.sa_handler = SIG_DFL;
                     sigemptyset(&sa.sa_mask);
                     sigaction(sig, &sa, nullptr);
@@ -499,8 +499,7 @@ namespace coro {
                     std::vector<std::shared_ptr<manager_core>> snapshot;
                     {
                         std::lock_guard lock(managers_mtx);
-                        std::erase_if(managers,
-                                      [](const std::weak_ptr<manager_core>& w) { return w.expired(); });
+                        std::erase_if(managers, [](const std::weak_ptr<manager_core>& w) { return w.expired(); });
                         snapshot.reserve(managers.size());
                         for (auto& w : managers) {
                             if (auto core = w.lock())
@@ -711,10 +710,10 @@ namespace coro {
             struct handle_state {
                 int sig = 0;
                 std::function<Task<>()> factory;
-                Event wake;               ///< 收集端→执行端的唤醒事件
+                Event wake;                  ///< 收集端→执行端的唤醒事件
                 std::atomic<int> pending{0}; ///< 待执行次数 (合并计数)
-                Task<> collector;         ///< 持续等待信号的收集协程
-                Task<> self;              ///< 串行执行 factory 的循环协程
+                Task<> collector;            ///< 持续等待信号的收集协程
+                Task<> self;                 ///< 串行执行 factory 的循环协程
             };
 
             /// 收集端: 始终处于“等待下一个信号”的状态, 因此业务执行期间的

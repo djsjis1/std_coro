@@ -166,10 +166,10 @@ namespace {
     coro::Task<> talk_case(talk_probe* out) {
 #ifdef _WIN32
         auto p = co_await coro::process::spawn({"cmd", "/c", "echo out-line & echo err-line 1>&2"},
-                                             {.capture_stdout = true, .capture_stderr = true});
+                                               {.capture_stdout = true, .capture_stderr = true});
 #else
         auto p = co_await coro::process::spawn({"sh", "-c", "echo out-line; echo err-line 1>&2"},
-                                             {.capture_stdout = true, .capture_stderr = true});
+                                               {.capture_stdout = true, .capture_stderr = true});
 #endif
         if (!p.valid()) {
             out->exit_code = -99;
@@ -185,8 +185,7 @@ namespace {
     /// communicate: stdin 喂数据 (more 会把输入回显到 stdout)
     coro::Task<> feed_case(std::string* echoed) {
 #ifdef _WIN32
-        auto p = co_await coro::process::spawn({"cmd", "/c", "more"},
-                                             {.capture_stdin = true, .capture_stdout = true});
+        auto p = co_await coro::process::spawn({"cmd", "/c", "more"}, {.capture_stdin = true, .capture_stdout = true});
 #else
         auto p = co_await coro::process::spawn({"cat"}, {.capture_stdin = true, .capture_stdout = true});
 #endif

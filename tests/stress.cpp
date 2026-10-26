@@ -55,7 +55,8 @@ namespace {
     std::atomic<long long> g_running_since_ms{0};
 
     long long now_ms() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
             .count();
     }
 
@@ -98,9 +99,7 @@ namespace {
 
         void reserve(std::size_t n) { us.reserve(n); }
 
-        void add(clock_t_::duration d) {
-            us.push_back(std::chrono::duration<double, std::micro>(d).count());
-        }
+        void add(clock_t_::duration d) { us.push_back(std::chrono::duration<double, std::micro>(d).count()); }
 
         double pct(double p) const {
             if (us.empty())
@@ -115,8 +114,8 @@ namespace {
             if (us.empty())
                 return "无样本";
             char buf[160];
-            std::snprintf(buf, sizeof(buf), "延迟 us: p50=%.0f p95=%.0f p99=%.0f max=%.0f (n=%zu)", pct(0.50), pct(0.95),
-                          pct(0.99), pct(1.0), us.size());
+            std::snprintf(buf, sizeof(buf), "延迟 us: p50=%.0f p95=%.0f p99=%.0f max=%.0f (n=%zu)", pct(0.50),
+                          pct(0.95), pct(0.99), pct(1.0), us.size());
             return buf;
         }
     };
@@ -258,7 +257,9 @@ namespace {
 
     // ── 资源池 / 有界队列: 配额与背压 ──
 
-    coro::Task<int> pool_make(int v) { co_return v; }
+    coro::Task<int> pool_make(int v) {
+        co_return v;
+    }
 
     coro::Task<> pool_worker(coro::Pool<int>* pool, int iters, std::atomic<int>* in_flight, std::atomic<int>* peak,
                              std::atomic<int>* bad) {
@@ -586,7 +587,8 @@ namespace {
         int empty_streak = 0;
         // 两个通道各发 rounds 个值, 必须全部收到 (只收 rounds 个会漏掉一半, 发送方随后撞上关闭通道)
         while (ca + cb < rounds * 2) {
-            auto r = co_await coro::select(coro::recv_of(a), coro::recv_of(b), coro::after(std::chrono::milliseconds(50)));
+            auto r =
+                co_await coro::select(coro::recv_of(a), coro::recv_of(b), coro::after(std::chrono::milliseconds(50)));
             if (r.timed_out)
                 break;
             if (r.value)
@@ -1068,8 +1070,8 @@ namespace {
 
 #ifdef CORO_STRESS_HAVE_NET
     // 把 echo 场景包一层计数器: 线程里拿不到 vec, 只汇总往返次数与字节
-    coro::Task<> echo_counted(int clients, int rounds, int payload, std::atomic<int>* errs,
-                              std::atomic<int64_t>* bytes, std::atomic<int64_t>* rtts) {
+    coro::Task<> echo_counted(int clients, int rounds, int payload, std::atomic<int>* errs, std::atomic<int64_t>* bytes,
+                              std::atomic<int64_t>* rtts) {
         std::vector<double> lat;
         lat.reserve(static_cast<std::size_t>(clients) * static_cast<std::size_t>(rounds));
         co_await scene_tcp_echo(clients, rounds, payload, errs, bytes, &lat);
@@ -1132,8 +1134,7 @@ namespace {
         }
     }
 
-    coro::Task<> connect_silent(unsigned short port, std::atomic<int>* errs,
-                                std::vector<coro::net::TcpStream>* keep) {
+    coro::Task<> connect_silent(unsigned short port, std::atomic<int>* errs, std::vector<coro::net::TcpStream>* keep) {
         auto conn = co_await coro::net::TcpStream::connect("127.0.0.1", port);
         if (!conn.valid()) {
             ++*errs;
@@ -1286,7 +1287,8 @@ namespace {
             s.ops = conns;
             const long leak = static_cast<long>(h1.load()) - static_cast<long>(h0.load());
             s.note = "句柄 " + fmt_num(static_cast<long long>(h0.load())) + " → " +
-                     fmt_num(static_cast<long long>(h1.load())) + " (" + fmt_num(leak) + "), 异常: " + fmt_num(errs.load());
+                     fmt_num(static_cast<long long>(h1.load())) + " (" + fmt_num(leak) +
+                     "), 异常: " + fmt_num(errs.load());
             // 连接句柄必须随取消/关闭全部归还; 留 16 个余量吸收运行时缓存
             if (leak > 16)
                 s.fail("取消后套接字句柄未回收: " + fmt_num(leak));
@@ -1410,8 +1412,8 @@ namespace {
             const long long grow = static_cast<long long>(rss1) - static_cast<long long>(rss0);
             s.expected = n;
             s.actual = cancelled.load();
-            s.note = "组内残留: " + fmt_num(static_cast<long long>(pending)) + ", 常驻内存 " +
-                     fmt_mb(rss0) + " → " + fmt_mb(rss1);
+            s.note = "组内残留: " + fmt_num(static_cast<long long>(pending)) + ", 常驻内存 " + fmt_mb(rss0) + " → " +
+                     fmt_mb(rss1);
             if (pending != 0)
                 s.fail("取消后组内仍有未收尾的子任务: " + fmt_num(static_cast<long long>(pending)));
             // 定时器堆里被取消的条目必须随帧销毁回收; 20 万个框全泄也只几 MB,
@@ -1824,7 +1826,7 @@ namespace {
     }
 
     coro::Task<> http_accept_all(coro::net::TcpListener* listener, int conns, std::atomic<int>* errs,
-                                std::atomic<int64_t>* served) {
+                                 std::atomic<int64_t>* served) {
         coro::TaskGroup sessions;
         for (int i = 0; i < conns; ++i) {
             auto conn = co_await listener->accept();
@@ -1902,8 +1904,9 @@ namespace {
             s.expected = 0;
             s.actual = bad.load();
             s.ops = lat.us.size();
-            s.note = "成功: " + fmt_num(static_cast<long long>(lat.us.size())) + ", 服务端响应: " + fmt_num(served.load()) +
-                     ", 错误: " + fmt_num(errs.load()) + ", " + lat.report();
+            s.note = "成功: " + fmt_num(static_cast<long long>(lat.us.size())) +
+                     ", 服务端响应: " + fmt_num(served.load()) + ", 错误: " + fmt_num(errs.load()) + ", " +
+                     lat.report();
             if (errs.load() != 0)
                 s.fail("HTTP 服务端/客户端出现错误: " + fmt_num(errs.load()));
             s.finish();
@@ -1917,7 +1920,7 @@ namespace {
     };
 
     const Group k_groups[] = {
-        {"core", run_core},       {"sync", run_sync},     {"channel", run_channel}, {"io", run_fsio},
+        {"core", run_core},       {"sync", run_sync},       {"channel", run_channel}, {"io", run_fsio},
 #ifdef CORO_STRESS_HAVE_NET
         {"net", run_net},
 #endif

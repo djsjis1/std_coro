@@ -66,11 +66,11 @@ namespace coro {
 
         // 服务端配置
         struct Config {
-            std::string bind_addr = "0.0.0.0";  // 绑定地址
-            unsigned short port = 0;            // 绑定端口 (0 = 系统分配, 启动后 port() 回查)
-            size_t max_datagram_size = 65535;   // 单个数据报缓冲上限, 同时决定接收缓冲大小
-            size_t max_concurrent_handlers = 0; // 在途 handler 上限 (0 = 不限制)
-            size_t max_pending_bytes = 0;       // 在途缓冲总量上限 (0 = 不限制)
+            std::string bind_addr = "0.0.0.0";              // 绑定地址
+            unsigned short port = 0;                        // 绑定端口 (0 = 系统分配, 启动后 port() 回查)
+            size_t max_datagram_size = 65535;               // 单个数据报缓冲上限, 同时决定接收缓冲大小
+            size_t max_concurrent_handlers = 0;             // 在途 handler 上限 (0 = 不限制)
+            size_t max_pending_bytes = 0;                   // 在途缓冲总量上限 (0 = 不限制)
             std::chrono::milliseconds shutdown_grace{1000}; // 排空在途 handler 的宽限期
             std::chrono::milliseconds cancel_grace{500};    // 请求取消后再等待的上限
         };
@@ -173,8 +173,7 @@ namespace coro {
         }
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
-                                      std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace, std::chrono::milliseconds cancel_grace) {
             if (grace.count() < 0 || cancel_grace.count() < 0)
                 throw std::invalid_argument("shutdown grace periods must be non-negative");
             if (state_->phase_value.load() == phase::idle) {
@@ -195,9 +194,7 @@ namespace coro {
             co_return last_report_;
         }
 
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
-            return shutdown(grace, config_.cancel_grace);
-        }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) { return shutdown(grace, config_.cancel_grace); }
 
         Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
@@ -273,8 +270,7 @@ namespace coro {
             std::shared_ptr<state> st;
             size_t bytes;
             byte_reservation(std::shared_ptr<state> owner, size_t n) : st(std::move(owner)), bytes(n) {}
-            byte_reservation(byte_reservation&& other) noexcept
-                : st(std::move(other.st)), bytes(other.bytes) {}
+            byte_reservation(byte_reservation&& other) noexcept : st(std::move(other.st)), bytes(other.bytes) {}
             byte_reservation(const byte_reservation&) = delete;
             ~byte_reservation() {
                 if (st)

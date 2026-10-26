@@ -108,11 +108,11 @@ namespace coro {
             std::tuple<Task<Ts>...> tasks;        // 子任务所有权 (monitor 按左值等待, 保留句柄供取消)
             std::tuple<storage_t<Ts>...> results; // 全部结果 (void → monostate)
             mutable std::mutex mutex;
-            size_t remaining = sizeof...(Ts);     // 未完成的 monitor 数
-            std::coroutine_handle<> caller{};     // 调用方句柄 (空 = 未挂起或已销毁)
-            EventLoop* caller_loop = nullptr;     // 唤醒路由回调用方的 loop
-            std::exception_ptr first_exception;   // 第一个异常 (全部完成后重抛)
-            bool cont_dead = false;               // 等待者已销毁: 迟到的完成不得调度它
+            size_t remaining = sizeof...(Ts);   // 未完成的 monitor 数
+            std::coroutine_handle<> caller{};   // 调用方句柄 (空 = 未挂起或已销毁)
+            EventLoop* caller_loop = nullptr;   // 唤醒路由回调用方的 loop
+            std::exception_ptr first_exception; // 第一个异常 (全部完成后重抛)
+            bool cont_dead = false;             // 等待者已销毁: 迟到的完成不得调度它
 
             /// 登记等待者; 全部任务恰好已完成 (或等待者已死) 时直接调度返回
             bool install(std::coroutine_handle<> h, EventLoop* loop) {

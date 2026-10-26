@@ -153,20 +153,19 @@ namespace coro {
                 if (deadline.has_value()) {
                     timer_token = std::make_shared<std::atomic<bool>>(false);
                     // expire_value=2(timeout): 到期入队时与取消竞争唯一终态
-                    loop.schedule_timer(h, *deadline, timer_token, outcome,
-                                        static_cast<int>(cancel_outcome::timeout));
+                    loop.schedule_timer(h, *deadline, timer_token, outcome, static_cast<int>(cancel_outcome::timeout));
                 }
             }
 
             void await_resume() {
                 retire(); // 先摘链并作废定时器条目, 再判定原因
                 switch (static_cast<cancel_outcome>(outcome->load())) {
-                case cancel_outcome::cancelled:
-                    throw CancelledError();
-                case cancel_outcome::timeout:
-                    throw TimeoutError();
-                case cancel_outcome::pending:
-                    break;
+                    case cancel_outcome::cancelled:
+                        throw CancelledError();
+                    case cancel_outcome::timeout:
+                        throw TimeoutError();
+                    case cancel_outcome::pending:
+                        break;
                 }
                 // 没经过仲裁单元就恢复了 (例如已被其它机制唤醒): 按共享状态兜底判定
                 if (st->cancelled.load())
@@ -263,8 +262,8 @@ namespace coro {
                     // 先到终态: 已由超时定下结果的等待者不再被“取消”覆盖。
                     // 同时避免对同一帧重复入队 (它可能已经在 ready 队列里)。
                     int expected = static_cast<int>(detail::cancel_outcome::pending);
-                    if (!waiter.outcome->compare_exchange_strong(
-                            expected, static_cast<int>(detail::cancel_outcome::cancelled)))
+                    if (!waiter.outcome->compare_exchange_strong(expected,
+                                                                 static_cast<int>(detail::cancel_outcome::cancelled)))
                         continue;
                 }
                 waiter.loop->schedule(waiter.handle);
@@ -317,8 +316,7 @@ namespace coro {
 
         /// 派生一个额外带期限的视图 (父不受影响)
         template <typename Rep, typename Period> Context with_deadline(std::chrono::duration<Rep, Period> d) const {
-            const auto next =
-                std::chrono::steady_clock::now() + std::chrono::ceil<std::chrono::milliseconds>(d);
+            const auto next = std::chrono::steady_clock::now() + std::chrono::ceil<std::chrono::milliseconds>(d);
             return Context{state_, earlier(deadline_, next)};
         }
 
@@ -388,8 +386,8 @@ namespace coro {
                     continue;
                 if (waiter.outcome) {
                     int expected = static_cast<int>(detail::cancel_outcome::pending);
-                    if (!waiter.outcome->compare_exchange_strong(
-                            expected, static_cast<int>(detail::cancel_outcome::cancelled)))
+                    if (!waiter.outcome->compare_exchange_strong(expected,
+                                                                 static_cast<int>(detail::cancel_outcome::cancelled)))
                         continue;
                 }
                 waiter.loop->schedule(waiter.handle);

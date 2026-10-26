@@ -292,12 +292,12 @@ namespace coro {
         }
 
         Source* src_;
-        std::vector<char> buf_; ///< size() 恒为**容量** (不是有效长度)
-        std::size_t used_ = 0;  ///< 已填入的字节数 ([0, used_) 有效)
-        std::size_t head_ = 0;  ///< 下一个待消费字节的位置
+        std::vector<char> buf_;             ///< size() 恒为**容量** (不是有效长度)
+        std::size_t used_ = 0;              ///< 已填入的字节数 ([0, used_) 有效)
+        std::size_t head_ = 0;              ///< 下一个待消费字节的位置
         mutable std::size_t scan_mark_ = 0; ///< delimiter 扫描游标 (相对 head_)
         mutable std::size_t byte_mark_ = 0; ///< 单字节扫描游标 (相对 head_)
-        std::size_t max_;       ///< 缓冲硬上限: fill 到此即报错, 不再无节制增长
+        std::size_t max_;                   ///< 缓冲硬上限: fill 到此即报错, 不再无节制增长
         bool eof_ = false;
     };
 

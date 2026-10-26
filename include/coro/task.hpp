@@ -313,50 +313,50 @@ namespace coro {
                         return static_cast<inner_t*>(self)->on_cancel_requested();
                     };
                 }
-            using inner_result_t = decltype(inner.await_suspend(h));
-            try {
-                if constexpr (std::is_void_v<inner_result_t>) {
-                    inner.await_suspend(h);
-                    // void: 总是挂起 (无需传播)
-                } else if constexpr (std::is_same_v<inner_result_t, bool>) {
-                    bool result = inner.await_suspend(h);
-                    if (!result) {
-                        // 内层决定不挂起: 清除挂起标记并传播
-                        my_handle = nullptr;
-                        promise->suspended_ = false;
-                        if constexpr (has_cancel_op<inner_t>::value) {
-                            promise->pending_io_ = false;
+                using inner_result_t = decltype(inner.await_suspend(h));
+                try {
+                    if constexpr (std::is_void_v<inner_result_t>) {
+                        inner.await_suspend(h);
+                        // void: 总是挂起 (无需传播)
+                    } else if constexpr (std::is_same_v<inner_result_t, bool>) {
+                        bool result = inner.await_suspend(h);
+                        if (!result) {
+                            // 内层决定不挂起: 清除挂起标记并传播
+                            my_handle = nullptr;
+                            promise->suspended_ = false;
+                            if constexpr (has_cancel_op<inner_t>::value) {
+                                promise->pending_io_ = false;
+                            }
                         }
-                    }
-                    return result;
-                } else {
-                    // coroutine_handle: 对称转移
-                    auto transfer_to = inner.await_suspend(h);
-                    if (!transfer_to) {
-                        // 返回了空句柄: 不转移, 清除标记
-                        my_handle = nullptr;
-                        promise->suspended_ = false;
-                        if constexpr (has_cancel_op<inner_t>::value) {
-                            promise->pending_io_ = false;
+                        return result;
+                    } else {
+                        // coroutine_handle: 对称转移
+                        auto transfer_to = inner.await_suspend(h);
+                        if (!transfer_to) {
+                            // 返回了空句柄: 不转移, 清除标记
+                            my_handle = nullptr;
+                            promise->suspended_ = false;
+                            if constexpr (has_cancel_op<inner_t>::value) {
+                                promise->pending_io_ = false;
+                            }
                         }
+                        return transfer_to;
                     }
-                    return transfer_to;
+                } catch (...) {
+                    // 内层 await_suspend 抛出 (如等待队列 push 失败 / Task 误用防护):
+                    // 挂起未成立, 本包装对象与 inner 都将随全表达式销毁。
+                    // 必须复位本帧的挂起/IO 状态与钩子 —— 它们指向的 inner 即将失效,
+                    // 留着会让后续 Task::cancel()/析构 调用悬空函数指针 (UB)。
+                    // my_handle 保持非空: 析构时 notify_waiter_destroyed 照常执行,
+                    // inner 若已把自己登记进等待队列, 借此摘除僵尸句柄。
+                    promise->suspended_ = false;
+                    promise->pending_io_ = false;
+                    promise->defer_cancel_self_ = nullptr;
+                    promise->defer_cancel_hook_ = nullptr;
+                    promise->cancel_hook_ = nullptr;
+                    promise->cancel_hook_self_ = nullptr;
+                    throw;
                 }
-            } catch (...) {
-                // 内层 await_suspend 抛出 (如等待队列 push 失败 / Task 误用防护):
-                // 挂起未成立, 本包装对象与 inner 都将随全表达式销毁。
-                // 必须复位本帧的挂起/IO 状态与钩子 —— 它们指向的 inner 即将失效,
-                // 留着会让后续 Task::cancel()/析构 调用悬空函数指针 (UB)。
-                // my_handle 保持非空: 析构时 notify_waiter_destroyed 照常执行,
-                // inner 若已把自己登记进等待队列, 借此摘除僵尸句柄。
-                promise->suspended_ = false;
-                promise->pending_io_ = false;
-                promise->defer_cancel_self_ = nullptr;
-                promise->defer_cancel_hook_ = nullptr;
-                promise->cancel_hook_ = nullptr;
-                promise->cancel_hook_self_ = nullptr;
-                throw;
-            }
             }
 
             decltype(auto) await_resume() {
@@ -897,7 +897,7 @@ namespace coro {
             // 可延后取消的等待 (同 Task<T>): 非空表示当前 wait 接管了取消请求
             bool (*defer_cancel_hook_)(void*) = nullptr;
             void* defer_cancel_self_ = nullptr;
-            EventLoop* target_loop_ = nullptr;    // 目标事件循环 (同 Task<T>)
+            EventLoop* target_loop_ = nullptr; // 目标事件循环 (同 Task<T>)
 
             // 取消钩子: 同 Task<T>::promise_type
             void (*cancel_hook_)(void*) = nullptr;

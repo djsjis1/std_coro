@@ -731,7 +731,7 @@ namespace coro {
                 }
                 if (!cond->lock_->has_waiter(handle_))
                     cond->lock_->hand_off({handle_, loop_, epoch_});
-                // hand_off 会直接移交并调度, 或排在持有者之后由 release() 移交; 
+                // hand_off 会直接移交并调度, 或排在持有者之后由 release() 移交;
                 // 两种路径都在锁到手之后才会恢复本帧。
                 return true;
             }

@@ -258,9 +258,7 @@ namespace coro {
         void cancel() { do_cancel(); }
 
         /// 是否已进入终态 (到期或被取消)
-        bool done() const noexcept {
-            return !state_ || state_->result.load() != static_cast<int>(outcome::pending);
-        }
+        bool done() const noexcept { return !state_ || state_->result.load() != static_cast<int>(outcome::pending); }
 
         /// 当前是否有等待者
         bool has_waiter() const noexcept { return state_ && state_->waiting.load(); }

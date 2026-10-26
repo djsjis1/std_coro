@@ -116,9 +116,12 @@ if(CORO_GCC13_COROUTINE_WORKAROUND)
 endif()
 
 # 平台链接库: ws2_32 仅网络模块需要, 挂在 io 组件上;
-# winmm 供 IOCP 事件源抬高系统时钟分辨率 (timeBeginPeriod), 否则定时器精度只有 15.6ms
+# winmm 供 IOCP 事件源抬高系统时钟分辨率 (timeBeginPeriod), 否则定时器精度只有 15.6ms。
+# 注意 winmm 必须挂在 core 上: event_loop.hpp 在 Windows 上默认构造 IOCP 事件源,
+# 只链接 coro::core 的消费者也会实例化 timeBeginPeriod (core-smoke 曾因此 LNK2019)。
 set(CORO_HAS_URING OFF)
 if(WIN32)
+    target_link_libraries(coro_core INTERFACE winmm)
     target_link_libraries(coro_io INTERFACE ws2_32 winmm)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CORO_ENABLE_NATIVE_IO AND CORO_ENABLE_URING)

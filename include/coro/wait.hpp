@@ -138,7 +138,10 @@ namespace coro {
 
     // 前向声明: 已弃用的 wait_any 现在只是 wait_tasks 的薄适配,
     // 不再维护第二套 state/monitor 状态机。
-    template <typename T> Task<std::vector<T>> wait_tasks(std::vector<Task<T>> tasks, WaitMode mode);
+    // 默认参数只能放在这里: GCC/Clang 不允许协程函数模板的后续 (重) 声明
+    // 再出现默认参数 (MSVC 宽松, 三家编译器都接受本写法)。
+    template <typename T>
+    Task<std::vector<T>> wait_tasks(std::vector<Task<T>> tasks, WaitMode mode = WaitMode::AllCompleted);
 
     // ============================================================================
     // wait_any — FIRST_COMPLETED (两路竞速)
@@ -372,8 +375,8 @@ namespace coro {
     } // namespace detail
 
     /// N 路 wait (同类型任务), 对标 asyncio.wait(tasks, return_when=...)
-    template <typename T>
-    Task<std::vector<T>> wait_tasks(std::vector<Task<T>> tasks, WaitMode mode = WaitMode::AllCompleted) {
+    /// (默认参数在前向声明处, 见文件中部说明)
+    template <typename T> Task<std::vector<T>> wait_tasks(std::vector<Task<T>> tasks, WaitMode mode) {
         auto state = std::make_shared<detail::wait_tasks_state<T>>();
         return detail::wait_tasks_impl<T>(std::move(tasks), mode, state);
     }

@@ -163,7 +163,9 @@ TEST(SelectTest, ClosedChannelBranchReportsEof) {
     coro::run([](bool* out) -> coro::Task<> {
         auto chA = coro::channel<int>::bounded(1);
         auto rx = chA.make_receiver();
-        { auto tx = chA.make_sender(); } // 最后一个 sender 释放 → 关闭发送侧
+        {
+            auto tx = chA.make_sender();
+        } // 最后一个 sender 释放 → 关闭发送侧
         auto chB = coro::channel<int>::bounded(1);
         *out = co_await closed_branch_reports_eof(rx, chB.make_receiver());
     }(&eof));

@@ -162,9 +162,9 @@ namespace coro {
                                    FILE_NOTIFY_CHANGE_LAST_WRITE | // 内容修改
                                    FILE_NOTIFY_CHANGE_SIZE |       // 大小变化
                                    FILE_NOTIFY_CHANGE_CREATION;    // 创建时间戳变化
-                    BOOL rc = ReadDirectoryChangesW(w->dir_, w->event_buf_.data(),
-                                                    (DWORD)w->event_buf_.size(), w->recursive_, filter,
-                                                    nullptr /*完成时字节数经完成包给*/, &op.ov, nullptr);
+                    BOOL rc =
+                        ReadDirectoryChangesW(w->dir_, w->event_buf_.data(), (DWORD)w->event_buf_.size(), w->recursive_,
+                                              filter, nullptr /*完成时字节数经完成包给*/, &op.ov, nullptr);
                     if (!rc && GetLastError() != ERROR_IO_PENDING) {
                         // 立即失败 (句柄无效/非目录): 无完成包, 手动恢复。
                         // 缓冲溢出 (ERROR_NOTIFY_ENUM_DIR) 也走完成包, 不在这里。
@@ -176,9 +176,7 @@ namespace coro {
                 }
 
                 /// 完成后: 解析缓冲里的全部事件进 watcher 的 pending 队列
-                void await_resume() {
-                    w->parse_records(w->event_buf_.data(), op.error, op.transferred);
-                }
+                void await_resume() { w->parse_records(w->event_buf_.data(), op.error, op.transferred); }
             };
 
             /// 取下一个事件: pending 有则直接弹, 否则提交一次目录读并解析
@@ -525,7 +523,7 @@ namespace coro {
             std::deque<watch_event> pending_;
             std::unordered_map<int, std::string> wd_paths_;
             std::unordered_map<uint32_t, pending_move> pending_moves_;
-            int terminal_error_ = 0;  ///< 终止性读错误 (0 = 无)
+            int terminal_error_ = 0;    ///< 终止性读错误 (0 = 无)
             bool needs_rescan_ = false; ///< overflow 后 wd 映射可能已失配
 
             static constexpr uint32_t watch_mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM |

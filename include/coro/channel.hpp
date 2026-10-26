@@ -75,7 +75,7 @@ namespace coro {
         // 省掉每次操作的协程帧分配与一次额外恢复
         template <typename T> struct channel_send_awaiter;
         template <typename T> struct channel_recv_awaiter;
-        
+
         template <typename T> struct channel_sender_waiter {
             T value;
             std::coroutine_handle<> handle{};

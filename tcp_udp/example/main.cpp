@@ -42,11 +42,8 @@ coro::Task<> tcp_echo_handler(coro::net::TcpStream conn) {
 // ============================================================================
 // UDP echo 处理协程: 收到的数据报原样发回
 // ============================================================================
-coro::Task<> udp_echo_handler(const char* data, size_t len,
-                              const sockaddr_in& sender,
-                              coro::net::UdpSocket* sock) {
-    std::cout << "  [udp] recv " << len << " bytes from "
-              << inet_ntoa(sender.sin_addr) << ":" << ntohs(sender.sin_port)
+coro::Task<> udp_echo_handler(const char* data, size_t len, const sockaddr_in& sender, coro::net::UdpSocket* sock) {
+    std::cout << "  [udp] recv " << len << " bytes from " << inet_ntoa(sender.sin_addr) << ":" << ntohs(sender.sin_port)
               << std::endl;
     int sent = co_await sock->sendto(data, len, sender);
     if (sent < 0)
@@ -74,8 +71,7 @@ coro::Task<> tcp_test_client() {
     int n = co_await conn.read(buf, sizeof(buf));
     if (n > 0) {
         std::string echo(buf, (size_t)n);
-        std::cout << "[tcp-client] echo: \"" << echo << "\""
-                  << (echo == msg ? " OK" : " MISMATCH") << std::endl;
+        std::cout << "[tcp-client] echo: \"" << echo << "\"" << (echo == msg ? " OK" : " MISMATCH") << std::endl;
     }
     conn.close();
 }
@@ -100,8 +96,7 @@ coro::Task<> udp_test_client(coro::net::UdpSocket* sock) {
     int n = co_await sock->recvfrom(buf, sizeof(buf), &from);
     if (n > 0) {
         std::string echo(buf, (size_t)n);
-        std::cout << "[udp-client] echo: \"" << echo << "\""
-                  << (echo == msg ? " OK" : " MISMATCH") << std::endl;
+        std::cout << "[udp-client] echo: \"" << echo << "\"" << (echo == msg ? " OK" : " MISMATCH") << std::endl;
     }
 }
 
@@ -114,9 +109,8 @@ coro::Task<> main_task() {
     // ---- TCP echo 服务端 ----
     coro::TcpServer tcp_server;
     tcp_server.set_handler(tcp_echo_handler);
-    tcp_server.set_error_handler([](const std::string& err) {
-        std::cout << "[tcp-server] error: " << err << std::endl;
-    });
+    tcp_server.set_error_handler(
+        [](const std::string& err) { std::cout << "[tcp-server] error: " << err << std::endl; });
     if (!tcp_server.start("127.0.0.1", 8800)) {
         std::cout << "TCP start FAILED" << std::endl;
         co_return;
@@ -126,11 +120,9 @@ coro::Task<> main_task() {
     // ---- UDP echo 服务端 ----
     coro::UdpServer udp_server;
     coro::net::UdpSocket* udp_sock_ptr = &udp_server.socket();
-    udp_server.set_handler(
-        [udp_sock_ptr](const char* data, size_t len,
-                       const sockaddr_in& sender) -> coro::Task<> {
-            co_await udp_echo_handler(data, len, sender, udp_sock_ptr);
-        });
+    udp_server.set_handler([udp_sock_ptr](const char* data, size_t len, const sockaddr_in& sender) -> coro::Task<> {
+        co_await udp_echo_handler(data, len, sender, udp_sock_ptr);
+    });
     if (!udp_server.start("127.0.0.1", 8801)) {
         std::cout << "UDP start FAILED" << std::endl;
         co_return;

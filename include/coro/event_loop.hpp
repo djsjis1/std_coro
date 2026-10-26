@@ -157,9 +157,7 @@ namespace coro {
 
         /// 事件源替换计数: 每次 swap_event_source 递增。
         /// io 层 memo 以 (源指针, epoch) 为键, 规避同地址复用造成的假命中。
-        uint64_t event_source_epoch() const noexcept {
-            return event_source_epoch_.load(std::memory_order_acquire);
-        }
+        uint64_t event_source_epoch() const noexcept { return event_source_epoch_.load(std::memory_order_acquire); }
 
         /// 获取当前等待原语 (网络层需要它关联 socket 到 IOCP)
         EventSource* event_source_ptr() const { return event_source_.get(); }
@@ -366,7 +364,7 @@ namespace coro {
         struct TimerEntry {
             std::chrono::steady_clock::time_point deadline;
             ReadyEntry entry;
-            std::shared_ptr<std::atomic<bool>> token; // 已取消/已消费标记 (堆上共享)
+            std::shared_ptr<std::atomic<bool>> token;  // 已取消/已消费标记 (堆上共享)
             std::shared_ptr<std::atomic<int>> outcome; // 可选: 先到终态仲裁
             int expire_value = 0;                      // 到期时写入 outcome 的值
 
@@ -568,8 +566,8 @@ namespace coro {
             std::lock_guard lock(queue_mutex_);
             auto live = live_frames_.find(h.address());
             if (live != live_frames_.end())
-                timer_heap_.push({deadline, {h, live->second.generation}, std::move(token), std::move(outcome),
-                                  expire_value});
+                timer_heap_.push(
+                    {deadline, {h, live->second.generation}, std::move(token), std::move(outcome), expire_value});
         }
     }
 

@@ -945,10 +945,8 @@ TEST(HttpClientTest, StreamReadsChunkedBodyInPieces) {
     ASSERT_TRUE(p.start());
     stream_probe probe;
     // 头部与每个分块分开到达, 验证“头部完成即可开始消费”
-    std::vector<std::string> pieces{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-                                    "5\r\nhello\r\n",
-                                    "6\r\n world\r\n",
-                                    "0\r\n\r\n"};
+    std::vector<std::string> pieces{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n",
+                                    "6\r\n world\r\n", "0\r\n\r\n"};
     test_util::run_task([&]() -> coro::Task<> { co_await stream_scenario(&p, std::move(pieces), &probe); });
     EXPECT_TRUE(probe.error.empty()) << probe.error;
     EXPECT_EQ(probe.status, 200);
@@ -986,8 +984,7 @@ TEST(HttpClientTest, ConflictingContentLengthIsRejected) {
     ASSERT_TRUE(p.start());
     call_result result;
     test_util::run_task([&]() -> coro::Task<> {
-        co_await fetch_scripted(
-            &p, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc", &result);
+        co_await fetch_scripted(&p, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc", &result);
     });
     EXPECT_FALSE(result.ok()) << "冲突的 Content-Length 必须拒绝, 不能默默选一个";
 }

@@ -172,8 +172,8 @@ namespace coro {
             };
             // 拒绝 (已停止/队列满) 必须让等待者看到明确失败, 而不是挂死。
             if (!default_thread_pool().try_submit(std::move(task)))
-                promise->set_exception(std::make_exception_ptr(
-                    OverloadError("to_thread: executor stopped or its queue is full")));
+                promise->set_exception(
+                    std::make_exception_ptr(OverloadError("to_thread: executor stopped or its queue is full")));
         }
 
     } // namespace detail

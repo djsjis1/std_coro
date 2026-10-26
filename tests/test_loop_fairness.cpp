@@ -63,8 +63,7 @@ TEST(LoopFairnessTest, PollsIOWhileReadyQueueIsNonEmpty) {
     loop.run();
     task.take_result();
 
-    EXPECT_GT(observed.load(), 0)
-        << "ready 队列持续非空时完全没有轮询事件源: I/O 完成包会被无限期跳过";
+    EXPECT_GT(observed.load(), 0) << "ready 队列持续非空时完全没有轮询事件源: I/O 完成包会被无限期跳过";
 
     fake->pending.store(false, std::memory_order_relaxed);
     loop.swap_event_source(previous);

@@ -52,14 +52,14 @@ namespace header_usage {
     // void 位置在 tuple 中是 std::monostate。
     static_assert(std::is_same_v<decltype(coro::gather(std::declval<int_task>(), std::declval<int_task>())),
                                  coro::detail::gather_awaiter<int, int>>);
-    static_assert(std::is_same_v<decltype(coro::gather(std::declval<int_task>(), std::declval<int_task>())
-                                           .await_resume()),
-                                 std::tuple<int, int>>);
+    static_assert(
+        std::is_same_v<decltype(coro::gather(std::declval<int_task>(), std::declval<int_task>()).await_resume()),
+                       std::tuple<int, int>>);
     static_assert(std::is_same_v<decltype(coro::wait_tasks(std::declval<std::vector<int_task>>())),
                                  coro::Task<std::vector<int>>>);
-    static_assert(std::is_same_v<decltype(coro::wait_for(std::declval<coro::Task<void>>(),
-                                                         std::chrono::milliseconds(1))),
-                                 coro::Task<void>>);
+    static_assert(
+        std::is_same_v<decltype(coro::wait_for(std::declval<coro::Task<void>>(), std::chrono::milliseconds(1))),
+                       coro::Task<void>>);
     static_assert(std::is_same_v<decltype(coro::wait_until(std::declval<int_task>(),
                                                            std::declval<std::chrono::steady_clock::time_point>())),
                                  coro::Task<int>>);
@@ -67,22 +67,20 @@ namespace header_usage {
     // ---- move-only / void 路径 ----
     static_assert(std::is_same_v<decltype(coro::gather(std::declval<coro::Task<std::unique_ptr<int>>>())),
                                  coro::detail::gather_awaiter<std::unique_ptr<int>>>);
-    static_assert(std::is_same_v<decltype(coro::gather(std::declval<coro::Task<std::unique_ptr<int>>>())
-                                           .await_resume()),
-                                 std::tuple<std::unique_ptr<int>>>);
-    static_assert(std::is_same_v<decltype(coro::gather(std::declval<void_task>()).await_resume()),
-                                 std::tuple<std::monostate>>);
+    static_assert(
+        std::is_same_v<decltype(coro::gather(std::declval<coro::Task<std::unique_ptr<int>>>()).await_resume()),
+                       std::tuple<std::unique_ptr<int>>>);
+    static_assert(
+        std::is_same_v<decltype(coro::gather(std::declval<void_task>()).await_resume()), std::tuple<std::monostate>>);
     // wait_tasks 的 vector 版本只对非 void T 可实例化 (内部结果容器是
     // vector<optional<T>>, optional<void> 非法); void 任务集应使用 gather
     // (tuple 中以 monostate 占位) —— 此约束由实现保证, 无需在此断言。
 
     // ---- 同步原语与线程/执行器 ----
-    static_assert(std::is_same_v<decltype(std::declval<coro::Lock&>().acquire()),
-                                 coro::Lock::acquire_awaiter>);
-    static_assert(std::is_same_v<decltype(std::declval<coro::Semaphore&>().acquire()),
-                                 coro::Semaphore::acquire_awaiter>);
-    static_assert(std::is_same_v<decltype(std::declval<coro::Queue<int>&>().get()),
-                                 coro::Queue<int>::get_awaiter>);
+    static_assert(std::is_same_v<decltype(std::declval<coro::Lock&>().acquire()), coro::Lock::acquire_awaiter>);
+    static_assert(
+        std::is_same_v<decltype(std::declval<coro::Semaphore&>().acquire()), coro::Semaphore::acquire_awaiter>);
+    static_assert(std::is_same_v<decltype(std::declval<coro::Queue<int>&>().get()), coro::Queue<int>::get_awaiter>);
     static_assert(std::is_same_v<decltype(coro::to_thread_lazy([] { return 1; })), coro::Task<int>>);
     static_assert(std::is_same_v<decltype(coro::to_thread([] { return 1; })), coro::Task<int>>);
 

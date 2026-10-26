@@ -127,12 +127,12 @@ namespace coro {
         /// 结果 (例如 `to_thread_lazy`、自定义有界线程池、测试用的同步执行器)。
         /// 参数合法性在提交前检查, 避免把调用方错误变成工作线程上的异常。
         template <typename Executor>
-        Task<std::vector<resolved_endpoint>> resolve_with(Executor executor, std::string host, std::string service = "") {
+        Task<std::vector<resolved_endpoint>> resolve_with(Executor executor, std::string host,
+                                                          std::string service = "") {
             if (host.find('\0') != std::string::npos || service.find('\0') != std::string::npos)
                 throw std::invalid_argument("DNS host/service must not contain embedded NUL");
-            co_return co_await executor([host = std::move(host), service = std::move(service)] {
-                return resolve_blocking(host, service);
-            });
+            co_return co_await executor(
+                [host = std::move(host), service = std::move(service)] { return resolve_blocking(host, service); });
         }
 
         /// 解析主机名/服务名为可连接的 IPv4 端点列表。不阻塞事件循环。
@@ -141,9 +141,8 @@ namespace coro {
         inline Task<std::vector<resolved_endpoint>> resolve(std::string host, std::string service = "") {
             if (host.find('\0') != std::string::npos || service.find('\0') != std::string::npos)
                 throw std::invalid_argument("DNS host/service must not contain embedded NUL");
-            co_return co_await to_thread_lazy([host = std::move(host), service = std::move(service)] {
-                return resolve_blocking(host, service);
-            });
+            co_return co_await to_thread_lazy(
+                [host = std::move(host), service = std::move(service)] { return resolve_blocking(host, service); });
         }
 
         /// 按解析结果建立连接: 把 endpoint 适配回 net.hpp 的 (ip, port) 接口, 调用方不必

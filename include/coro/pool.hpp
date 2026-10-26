@@ -273,6 +273,7 @@ namespace coro {
             if (this != &other) {
                 close();
                 st_ = std::move(other.st_);
+                owner_ = other.owner_; // 漏赋值会让 moved-to 池持有陈旧 loop 指针
             }
             return *this;
         }

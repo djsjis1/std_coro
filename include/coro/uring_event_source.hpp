@@ -57,7 +57,7 @@ namespace coro {
             int result = 0;                         // 完成结果 (字节数, 负值=错误)
             int error = 0;                          // 错误码 (0=成功)
             int fd = -1;                            // 操作目标描述符 (-1 = 无, 如 OPENAT 的 AT_FDCWD)
-                                                      // 供 close 前按 fd 批量取消 (cancel_fd_ops)
+                                                    // 供 close 前按 fd 批量取消 (cancel_fd_ops)
         };
 
         /// 统一解读操作结果: 本地立即失败 (拿不到 SQE / 没有 io_uring 后端) 只写负
@@ -238,7 +238,7 @@ namespace coro {
                     return 1;
 
                 // 没有就绪的 CQE, 带超时等待 (定时器到点 / 新 CQE / 被唤醒)
-                struct __kernel_timespec ts {};
+                struct __kernel_timespec ts{};
                 ts.tv_sec = timeout.count() / 1000;
                 ts.tv_nsec = (timeout.count() % 1000) * 1000000L;
 

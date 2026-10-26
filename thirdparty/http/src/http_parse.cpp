@@ -4,22 +4,26 @@
 
 namespace {
 
-http_parse* self(llhttp_t* parser) { return static_cast<http_parse*>(parser->data); }
+    http_parse* self(llhttp_t* parser) {
+        return static_cast<http_parse*>(parser->data);
+    }
 
-char ascii_lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c; }
+    char ascii_lower(char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+    }
 
-bool field_equals(const std::string& a, const std::string& b) {
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (ascii_lower(a[i]) != ascii_lower(b[i]))
+    bool field_equals(const std::string& a, const std::string& b) {
+        if (a.size() != b.size())
             return false;
-    return true;
-}
+        for (size_t i = 0; i < a.size(); ++i)
+            if (ascii_lower(a[i]) != ascii_lower(b[i]))
+                return false;
+        return true;
+    }
 
-bool exceeds(size_t used, size_t added, size_t limit) {
-    return limit != 0 && (used > limit || added > limit - used);
-}
+    bool exceeds(size_t used, size_t added, size_t limit) {
+        return limit != 0 && (used > limit || added > limit - used);
+    }
 
 } // namespace
 
@@ -32,7 +36,9 @@ const std::string& http_parse::header(const std::string& field) const {
     return empty_string_;
 }
 
-bool http_parse::keep_alive() const { return completed_ && llhttp_should_keep_alive(&parser_) != 0; }
+bool http_parse::keep_alive() const {
+    return completed_ && llhttp_should_keep_alive(&parser_) != 0;
+}
 
 http_parse::http_parse(llhttp_type_t type) : type_(type) {
     setup_callbacks();
@@ -115,8 +121,8 @@ void http_parse::setup_callbacks() {
         return p->callback([&] {
             // 头部一完成就把状态行发布出去: 流式消费方在 body 到达前
             // 就需要知道 status_code / 版本。
-            p->http_version = std::to_string(llhttp_get_http_major(parser)) + "." +
-                              std::to_string(llhttp_get_http_minor(parser));
+            p->http_version =
+                std::to_string(llhttp_get_http_major(parser)) + "." + std::to_string(llhttp_get_http_minor(parser));
             if (llhttp_get_type(parser) == HTTP_RESPONSE)
                 p->status_code = llhttp_get_status_code(parser);
             if (p->headers_complete)
@@ -140,8 +146,8 @@ void http_parse::setup_callbacks() {
     settings_.on_message_complete = [](llhttp_t* parser) -> int {
         auto* p = self(parser);
         return p->callback([&] {
-            p->http_version = std::to_string(llhttp_get_http_major(parser)) + "." +
-                              std::to_string(llhttp_get_http_minor(parser));
+            p->http_version =
+                std::to_string(llhttp_get_http_major(parser)) + "." + std::to_string(llhttp_get_http_minor(parser));
             if (llhttp_get_type(parser) == HTTP_REQUEST)
                 p->http_method = llhttp_method_name(static_cast<llhttp_method_t>(parser->method));
             else

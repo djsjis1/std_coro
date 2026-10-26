@@ -174,7 +174,7 @@ namespace coro {
             }
 
             HANDLE iocp_;
-            bool high_resolution_ = false; // 构造期间是否成功抬高过时钟分辨率
+            bool high_resolution_ = false;    // 构造期间是否成功抬高过时钟分辨率
             std::atomic<int> pending_ops_{0}; // 挂起的异步操作数
         };
 

@@ -44,9 +44,8 @@ namespace coro {
         /// 把“令牌个数”换成定点份数, 并拒绝会溢出的输入
         /// (旧实现直接 n * 1024, 大 n 会变成负数并在后续比较里静默失效)。
         inline std::int64_t rate_scale_tokens(std::uint64_t n) {
-            constexpr std::uint64_t max_units =
-                static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) /
-                static_cast<std::uint64_t>(rate_token_scale);
+            constexpr std::uint64_t max_units = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) /
+                                                static_cast<std::uint64_t>(rate_token_scale);
             if (n > max_units)
                 throw std::invalid_argument("rate_limiter: token count is out of range");
             return static_cast<std::int64_t>(n) * rate_token_scale;
@@ -203,9 +202,7 @@ namespace coro {
         Task<> acquire_n(std::uint64_t n) const { return detail::rate_acquire(state_, detail::rate_scale_tokens(n)); }
 
         /// 非阻塞: 有就扣, 没有立即返回 false (用于降级/快速失败路径)。
-        bool try_acquire(std::uint64_t n = 1) const {
-            return state_->try_consume(detail::rate_scale_tokens(n));
-        }
+        bool try_acquire(std::uint64_t n = 1) const { return state_->try_consume(detail::rate_scale_tokens(n)); }
 
         /// 当前可用令牌数 (向下取整)。只用于观测与展示, 不要拿它做判断后再扣 ——
         /// 那之间总有竞态, 需要原子判定就用 try_acquire。

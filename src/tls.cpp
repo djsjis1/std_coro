@@ -15,8 +15,8 @@
 namespace {
 
     // SSL 的 app_data 指向会话自己的协议快照, 不借用 TlsContext 的地址。
-    int select_alpn(SSL* ssl, const unsigned char** out, unsigned char* outlen,
-                    const unsigned char* in, unsigned int inlen, void*) {
+    int select_alpn(SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* in,
+                    unsigned int inlen, void*) {
         auto* protocols = static_cast<const std::vector<std::string>*>(SSL_get_app_data(ssl));
         if (!protocols || protocols->empty())
             return SSL_TLSEXT_ERR_NOACK;
@@ -208,9 +208,8 @@ namespace coro::tls {
                 wire.push_back(static_cast<char>(protocol.size()));
                 wire += protocol;
             }
-            if (!wire.empty() && SSL_set_alpn_protos(impl_->ssl,
-                                    reinterpret_cast<const unsigned char*>(wire.data()),
-                                    static_cast<unsigned int>(wire.size())) != 0)
+            if (!wire.empty() && SSL_set_alpn_protos(impl_->ssl, reinterpret_cast<const unsigned char*>(wire.data()),
+                                                     static_cast<unsigned int>(wire.size())) != 0)
                 throw TlsError("cannot set ALPN protocols", ERR_get_error());
         } else {
             SSL_set_accept_state(impl_->ssl);
@@ -235,11 +234,13 @@ namespace coro::tls {
 #endif
     }
 
-    bool TlsStream::socket_valid() const noexcept { return impl_ && impl_->sock.valid(); }
+    bool TlsStream::socket_valid() const noexcept {
+        return impl_ && impl_->sock.valid();
+    }
 
     bool TlsStream::reusable() const noexcept {
-        return socket_valid() && impl_->handshake_done && !impl_->broken && !impl_->closing &&
-               !impl_->closed && !impl_->peer_closed && !impl_->busy;
+        return socket_valid() && impl_->handshake_done && !impl_->broken && !impl_->closing && !impl_->closed &&
+               !impl_->peer_closed && !impl_->busy;
     }
 
     Task<int> TlsStream::pull_from_socket() {
