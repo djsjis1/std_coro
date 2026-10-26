@@ -57,8 +57,8 @@ namespace coro {
             EventLoop* waiter_loop = nullptr;
             std::vector<std::exception_ptr> exceptions;        // 子任务失败集合 (事件循环线程)
             std::vector<std::shared_ptr<Task<void>>> monitors; // 用于组取消
-            bool cancel_requested = false;                     // 已有失败, 正在取消其余
-            bool parent_cancelled = false;                     // 父任务在 wait() 期间被取消
+            bool cancel_requested = false; // 已有失败, 正在取消其余
+            bool parent_cancelled = false; // 父任务在 wait() 期间被取消
 
             // 组生命周期状态机: open -> closing (已请求收尾) -> finished (子任务全结束)。
             // 与 mutex 同域读写: wait() 一旦进入 closing 就拒绝新任务与第二个 waiter,
@@ -90,8 +90,33 @@ namespace coro {
                 waiter_loop = nullptr;
             }
 
-            std::vector<std::shared_ptr<Task<void>>> record_failure(std::exception_ptr error,
-                                                                    const std::shared_ptr<Task<void>>& self) {
+            /// monitor 收尾时把自己从活跃列表摘除。
+            ///
+            /// 直接 erase 是安全的: monitor 帧的 self 参数本身就是 mon 的一个
+            /// shared_ptr 拷贝 (协程参数按值拷入帧), 在帧销毁 (co_return →
+            /// final_suspend → 帧析构) 之前它一直持有引用 —— erase 后引用
+            /// 计数 ≥1, Task 与帧都活到 monitor 自然结束; 帧析构销毁帧参数,
+            /// 届时引用归零, Task 析构是 no-op (handle_ 已被 release_handle
+            /// 置空)。取消遍历 (cancel/record_failure/on_waiter_destroyed)
+            /// 也不再看到已完成的 monitor。
+            ///
+            /// (曾考虑把摘除的 mon 缓存到 state 的 zombies 列表延迟释放 ——
+            /// 已否决: 帧参数保活使它毫无必要, 只会让长寿命组的内存随完成
+            /// 的子任务数线性增长。真正的泄漏源是"被拒 spawn 先建帧后 throw",
+            /// 已由 spawn 的前置检查根治。)
+            void retire(const Task<void>* self) {
+                std::lock_guard lock(mutex);
+                for (auto it = monitors.begin(); it != monitors.end(); ++it) {
+                    if (it->get() == self) {
+                        monitors.erase(it); // 帧的 self 参数保证 mon 活到帧销毁
+                        return;
+                    }
+                }
+            }
+
+            /// self 为裸指针: 只做身份比较, 少两次原子增减。
+            /// self 在本次调用期间由 monitor 帧的 self 参数 (shared_ptr) 保活。
+            std::vector<std::shared_ptr<Task<void>>> record_failure(std::exception_ptr error, const Task<void>* self) {
                 std::vector<std::shared_ptr<Task<void>>> to_cancel;
                 std::lock_guard lock(mutex);
                 exceptions.push_back(std::move(error));
@@ -102,7 +127,7 @@ namespace coro {
                 if (!cancel_requested) {
                     cancel_requested = true;
                     for (auto& m : monitors) {
-                        if (m && m != self && !m->is_ready())
+                        if (m && m.get() != self && !m->is_ready())
                             to_cancel.push_back(m);
                     }
                 }
@@ -236,23 +261,38 @@ namespace coro {
 
         /// 添加并立即启动一个子任务 (对标 tg.create_task)
         /// 任意 Task<T> / Task<> 均可, 返回类型不要求一致
+        ///
+        /// 拒绝语义: 组已关闭 (wait/cancel/失败) 时抛 StructuredConcurrencyError。
+        /// 检查先于任何协程帧分配 —— 旧实现先分配 monitor/任务帧再检查, 抛出
+        /// 路径上帧的 self 参数成为 mon 的唯一持有者, 与帧自身形成引用环,
+        /// GCC/ASan 下实测泄漏整组 (LSan: monitor 帧 + 任务帧 + 控制块)。
+        /// 注册之后的二次复查是纵深防御, 正常模型下不可达: spawn 是同步函数,
+        /// 两次加锁之间没有让出点, 单线程 loop 上 phase 不可能变化。它防的
+        /// 是"违反线程契约的跨线程 cancel() 恰好插进窗口" —— 此时不再抛
+        /// (帧已分配, 抛出会重蹈上面的泄漏), 而是登记后立即取消, 由 monitor
+        /// 既有的取消转发路径收尾 (计数闭环不破坏)。
         template <typename T> void spawn(Task<T> task) {
+            {
+                std::lock_guard lock(state_->mutex);
+                if (state_->phase != detail::task_group_state::open)
+                    throw StructuredConcurrencyError("TaskGroup::spawn called after wait()/cancel()/failure");
+            }
             // 原任务移入 shared_ptr (稳定地址, monitor 与它共享所有权)
             auto task_ptr = std::make_shared<Task<T>>(std::move(task));
             // monitor 协程: 包装原任务, 记录异常 / 响应组取消
             auto mon = std::make_shared<Task<void>>();
             *mon = detail::task_group_monitor(mon, task_ptr, state_);
+            bool group_closed_in_window = false;
             {
-                // 准入检查与登记必须在同一个锁域: 否则检查通过之后、push 之前
-                // 组可能已经因为失败/取消转入 closing, 新成员就漏掉了取消。
                 std::lock_guard lock(state_->mutex);
-                if (state_->phase != detail::task_group_state::open)
-                    throw StructuredConcurrencyError("TaskGroup::spawn called after wait()/cancel()/failure");
+                group_closed_in_window = state_->phase != detail::task_group_state::open;
                 state_->monitors.push_back(mon);
                 ++state_->remaining;
             }
             // 启动必须在锁外: monitor 可能同步执行到 complete(), 而它会取同一把锁。
             mon->start();
+            if (group_closed_in_window)
+                mon->cancel(); // 纵深防御路径, 见函数头注释
         }
 
         /// 等待所有子任务完成 (对标 async with 块退出)。
@@ -315,6 +355,10 @@ namespace coro {
         template <typename T>
         Task<void> task_group_monitor(std::shared_ptr<Task<void>> self, std::shared_ptr<Task<T>> task_ptr,
                                       std::shared_ptr<task_group_state> state) {
+            // self 以 shared_ptr 进帧 (协程参数拷入帧): retire() 把 mon 从
+            // 活跃列表 erase 后, 帧参数仍持有引用, 保证 monitor 运行期间
+            // mon 必然存活; 帧析构时参数析构, 引用归零, Task 析构是 no-op。
+            // (生命周期完整论证见 task_group_state::retire 注释)
             bool forward_cancel = false;
             try {
                 (void)co_await *task_ptr; // 左值: 不移动原任务
@@ -324,7 +368,7 @@ namespace coro {
                 forward_cancel = true;
             } catch (...) {
                 // 原任务真实失败: 记录 + 触发组取消
-                auto to_cancel = state->record_failure(std::current_exception(), self);
+                auto to_cancel = state->record_failure(std::current_exception(), self.get());
                 // 注意: 必须跳过自己 (record_failure 已过滤)。取消动作放在
                 // mutex 外执行, 避免 cancel 路径回调状态时形成锁反转。
                 for (auto& m : to_cancel)
@@ -345,7 +389,9 @@ namespace coro {
                 }
             }
 
-            // 全部结束: 唤醒 wait() 调用者
+            // 全部结束: 从活跃列表摘除自己 (取消遍历不再看到; 生命周期论证
+            // 见 retire), 再唤醒 wait() 调用者
+            state->retire(self.get());
             state->complete();
             co_return;
         }

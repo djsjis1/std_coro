@@ -156,7 +156,7 @@ namespace coro::tls {
         };
     };
 
-    TlsStream::TlsStream(net::TcpStream socket, const TlsContext& context, std::string hostname)
+    TlsStream::TlsStream(net::TcpStream socket, const TlsContext& context, const std::string& hostname)
         : impl_(std::make_unique<impl>()) {
         if (!context.impl_)
             throw std::invalid_argument("TlsStream requires a valid TlsContext");

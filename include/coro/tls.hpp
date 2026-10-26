@@ -114,7 +114,7 @@ namespace coro {
         /// 操作未结束时不得移动或析构 stream。
         class TlsStream {
           public:
-            TlsStream(net::TcpStream socket, const TlsContext& ctx, std::string hostname);
+            TlsStream(net::TcpStream socket, const TlsContext& ctx, const std::string& hostname);
             ~TlsStream();
 
             TlsStream(TlsStream&&) noexcept;

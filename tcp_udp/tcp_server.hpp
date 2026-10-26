@@ -65,10 +65,10 @@ namespace coro {
 
         // 服务端配置
         struct Config {
-            std::string bind_addr = "0.0.0.0";              // 绑定地址
-            unsigned short port = 0;                        // 绑定端口 (0 = 系统分配, 启动后 port() 回查实际值)
-            int backlog = SOMAXCONN;                        // listen 队列长度, 真正传给 listener
-            size_t max_concurrent_handlers = 0;             // 在途 handler 上限 (0 = 不限制)
+            std::string bind_addr = "0.0.0.0";  // 绑定地址
+            unsigned short port = 0;            // 绑定端口 (0 = 系统分配, 启动后 port() 回查实际值)
+            int backlog = SOMAXCONN;            // listen 队列长度, 真正传给 listener
+            size_t max_concurrent_handlers = 0; // 在途 handler 上限 (0 = 不限制)
             std::chrono::milliseconds shutdown_grace{1000}; // 排空在途 handler 的宽限期
             std::chrono::milliseconds cancel_grace{500};    // 请求取消后再等待的上限
         };
@@ -168,7 +168,8 @@ namespace coro {
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"。
         /// 排空状态机只有一处实现 (supervisor), 不让两条路径各自等待同一份计数。
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace, std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
+                                      std::chrono::milliseconds cancel_grace) {
             if (grace.count() < 0 || cancel_grace.count() < 0)
                 throw std::invalid_argument("shutdown grace periods must be non-negative");
             if (state_->phase_value.load() == phase::idle) {
@@ -189,7 +190,9 @@ namespace coro {
             co_return last_report_;
         }
 
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) { return shutdown(grace, config_.cancel_grace); }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
+            return shutdown(grace, config_.cancel_grace);
+        }
 
         Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
@@ -234,8 +237,8 @@ namespace coro {
         /// 不代表监听本身坏了, 继续监听才是对的。
         static bool transient_accept_error(int native) noexcept {
 #ifdef _WIN32
-            return native == WSAEINTR || native == WSAECONNRESET || native == WSAECONNABORTED || native == WSAEMFILE ||
-                   native == WSAENOBUFS || native == WSAEWOULDBLOCK;
+            return native == WSAEINTR || native == WSAECONNRESET || native == WSAECONNABORTED ||
+                   native == WSAEMFILE || native == WSAENOBUFS || native == WSAEWOULDBLOCK;
 #else
             return native == EINTR || native == ECONNABORTED || native == EMFILE || native == ENFILE ||
                    native == ENOBUFS || native == EAGAIN || native == EWOULDBLOCK;

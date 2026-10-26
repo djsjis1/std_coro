@@ -348,7 +348,7 @@ namespace coro {
                 } else {
                     path_ = path;
                     // 记录创建时的 inode: close 时路径若被替换, 不能删掉替代物
-                    struct stat sb{};
+                    struct stat sb {};
                     if (::lstat(path_.c_str(), &sb) == 0) {
                         path_dev_ = static_cast<std::uint64_t>(sb.st_dev);
                         path_ino_ = static_cast<std::uint64_t>(sb.st_ino);
@@ -379,7 +379,7 @@ namespace coro {
                 if (!path_.empty()) {
                     // 只在路径仍是本实例创建的那个 socket inode 时才删除:
                     // 路径可能已被其他进程替换成普通文件或另一个服务。
-                    struct stat sb{};
+                    struct stat sb {};
                     const bool replaced = path_dev_ != 0 && (::lstat(path_.c_str(), &sb) != 0 ||
                                                              static_cast<std::uint64_t>(sb.st_dev) != path_dev_ ||
                                                              static_cast<std::uint64_t>(sb.st_ino) != path_ino_);

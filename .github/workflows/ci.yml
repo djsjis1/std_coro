@@ -266,7 +266,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build tests
-        run: cmake --build build --target coro_tests coro_header_check
+        run: cmake --build build --target coro_tests coro_header_check web_shutdown_check
 
       - name: Run TLS and HTTP client tests
         timeout-minutes: 15
@@ -508,7 +508,7 @@ jobs:
       - name: Build (tests + header self-check)
         # 只构建 coro_tests 会漏掉公共头自检: 头文件隐式依赖 / 条件编译错误
         # 在“能跑测试”的构建里完全看不出来。
-        run: cmake --build build --target coro_tests coro_header_check
+        run: cmake --build build --target coro_tests coro_header_check web_shutdown_check
 
 
       - name: Run tests with sanitizer
@@ -593,7 +593,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
 
       - name: Build tests
-        run: cmake --build build --target coro_tests coro_header_check
+        run: cmake --build build --target coro_tests coro_header_check web_shutdown_check
 
 
       - name: Run tests

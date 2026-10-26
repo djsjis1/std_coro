@@ -609,6 +609,8 @@ namespace coro {
         namespace detail_proc {
 
             /// 写完全部输入后关闭写端 (子进程看到 EOF)
+            // cppcheck-suppress passedByValue: 协程入口 —— data 按值进帧,
+            // 跨挂起点使用调用方缓冲会悬空
             inline coro::Task<bool> feed_stdin(pipe::PipeEnd* w, std::string data) {
                 if (!w)
                     co_return true;

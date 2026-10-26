@@ -129,6 +129,8 @@ namespace coro {
             std::chrono::steady_clock::time_point last_used;
         };
 
+        // cppcheck-suppress passedByValue: 协程入口 —— endpoint 按值进帧 (DNS/
+        // 建连全程跨挂起点使用), const& 会在调用方临时析构后悬空
         Task<std::unique_ptr<Connection>> connect_to(Endpoint endpoint, std::shared_ptr<ClientTLS> context) {
             auto addresses = co_await net::resolve(endpoint.host, std::to_string(endpoint.port));
             auto connection = std::make_unique<Connection>();

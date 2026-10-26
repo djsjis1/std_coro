@@ -342,3 +342,22 @@ TEST(TaskGroupStateMachineTest, AcceptsNewTasksTracksPhase) {
     EXPECT_TRUE(open_before);
     EXPECT_FALSE(open_after);
 }
+
+// 长寿命组 + 大量立即完成的子任务: 回归 monitor 帧生命周期 (历史上
+// "被拒 spawn 先建帧后 throw" 的引用环在此类路径泄漏整组帧)。水位回到
+// spawn 前 = 全部 monitor 帧已随完成销毁, 无滞留引用。
+TEST(TaskGroupStateMachineTest, ManySpawnsReturnFrameCountToBaseline) {
+    const auto baseline = coro::EventLoop::get().active_task_count();
+    std::atomic<int> hits{0};
+    auto run = [&]() -> coro::Task<> {
+        coro::TaskGroup group;
+        for (int i = 0; i < 1000; ++i)
+            group.spawn(group_sleep_then(0, 1, &hits));
+        co_await group.wait();
+        co_return;
+    };
+    test_util::run_task([&] { return run(); });
+    EXPECT_EQ(hits.load(), 1000);
+    EXPECT_EQ(coro::EventLoop::get().active_task_count(), baseline)
+        << "组完成后 monitor 帧应全部销毁, 活跃协程数回到 spawn 前水位";
+}
