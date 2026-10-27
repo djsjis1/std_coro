@@ -78,6 +78,257 @@ namespace coro {
         // 当前线程绑定的 EventLoop (每线程一个, 对标 asyncio 的
         // "一个线程一个事件循环"模型)。
         inline thread_local EventLoop* t_current_loop = nullptr;
+
+        // ====================================================================
+        // 以下三个组件从 EventLoop 里拆出, 只负责单一职责:
+        //   ReadyQueue   —— 就绪协程 FIFO (vector + 头索引, 容量往复复用)
+        //   TimerHeap    —— 定时器最小堆 + 僵尸清理
+        //   FrameTracker —— 帧存活表 / 等待身份 epoch / 废弃句柄
+        // 线程约定: 三者自身不加锁, 由 EventLoop 的 queue_mutex_ 统一保护
+        // (唯一例外是 TimerHeap, 仅事件循环线程访问)。
+        // ====================================================================
+
+        /// 就绪队列条目: 句柄 + 代次 (防地址复用) 一起传播。
+        struct ReadyEntry {
+            std::coroutine_handle<> handle;
+            uint64_t generation;
+        };
+
+        // ---- 轻量协程 FIFO (vector + 头索引) ----
+        //
+        // 替代 std::queue<coroutine_handle<>> (底层 deque):
+        // MSVC deque 对 8 字节元素每 16 字节块只装 2 个 —— 每 2 次 push
+        // 一次堆分配; vector 摊销为每上百次 push 一次, 且配合「成员 batch
+        // + swap」后, 容量在 batch 与 ready 队列之间往复保留,
+        // 稳态零分配。
+        class ReadyQueue {
+          public:
+            void push(ReadyEntry entry) { items_.push_back(entry); }
+            bool empty() const { return head_ >= items_.size(); }
+            ReadyEntry front() const { return items_[head_]; }
+            void pop() {
+                ++head_;
+                if (head_ == items_.size()) {
+                    items_.clear(); // 整队列耗尽: 一次回收 (保留容量)
+                    head_ = 0;
+                }
+            }
+            void swap(ReadyQueue& other) noexcept {
+                items_.swap(other.items_);
+                std::swap(head_, other.head_);
+            }
+
+          private:
+            std::vector<ReadyEntry> items_;
+            size_t head_ = 0;
+        };
+
+        // ---- 定时器堆 ----
+        // 使用 std::priority_queue 实现最小堆:
+        //   operator< 返回 deadline > other.deadline 意味道
+        //   "更早的截止时间" 排在堆顶（优先级最高）。
+        //
+        // 僵尸条目问题:
+        //   协程被 cancel 强制唤醒后, 它的 timer 条目仍留在堆里,
+        //   到期时若直接 resume 已销毁的协程帧 → UB。
+        //   解决: token 是堆上的共享标志, 两个时机置 true:
+        //     1. sleep_awaiter::await_resume (正常到期路径)
+        //     2. sleep_awaiter 析构 (协程帧销毁路径, 含取消注入的异常展开;
+        //        此时 await_resume 根本不会执行, 必须靠析构置位)
+        //   drain() 跳过已标记条目。
+        struct TimerEntry {
+            std::chrono::steady_clock::time_point deadline;
+            ReadyEntry entry;
+            std::shared_ptr<std::atomic<bool>> token;  // 已取消/已消费标记 (堆上共享)
+            std::shared_ptr<std::atomic<int>> outcome; // 可选: 先到终态仲裁
+            int expire_value = 0;                      // 到期时写入 outcome 的值
+
+            bool operator<(const TimerEntry& other) const {
+                return deadline > other.deadline; // min-heap: 早的优先
+            }
+        };
+
+        /// 定时器最小堆: 只管"放 / 取已到期的", 入就绪队列仍由 EventLoop 在锁内完成。
+        class TimerHeap {
+          public:
+            void push(TimerEntry entry) { heap_.push(std::move(entry)); }
+            bool empty() const { return heap_.empty(); }
+            std::size_t size() const { return heap_.size(); }
+            std::chrono::steady_clock::time_point top_deadline() const { return heap_.top().deadline; }
+
+            /// 清僵尸 + 把已到期条目追加到 expired (调用方复用缓冲以省分配)。
+            void drain(std::chrono::steady_clock::time_point now, std::vector<ReadyEntry>& expired) {
+                compact_if_stale();
+                while (!heap_.empty() && heap_.top().token && *heap_.top().token)
+                    heap_.pop(); // 已失效: 无论是否到期都丢弃
+                while (!heap_.empty() && heap_.top().deadline <= now) {
+                    TimerEntry entry = heap_.top();
+                    heap_.pop();
+                    if (entry.token && entry.token->load())
+                        continue; // 已被消费/取消: 丢弃僵尸条目
+                    if (entry.outcome) {
+                        // 先到终态仲裁: 取消已经提交时就不再入队, 也不翻转原因
+                        int expected = 0;
+                        if (!entry.outcome->compare_exchange_strong(expected, entry.expire_value))
+                            continue;
+                    }
+                    expired.push_back(entry.entry);
+                }
+            }
+
+          private:
+            /// 定期整堆压缩: 堆顶以下的失效条目只能在到期时被丢弃, 取消风暴后
+            /// 会长期占地 (has_work 认为还有定时器), 表现为 cancel 后程序迟迟不退出。
+            /// 低频执行, 不放在热路径上。
+            void compact_if_stale() {
+                if (++compact_tick_ < 64 || heap_.size() <= 128)
+                    return;
+                compact_tick_ = 0;
+                auto copy = heap_;
+                std::vector<TimerEntry> kept;
+                kept.reserve(copy.size());
+                std::size_t stale = 0;
+                while (!copy.empty()) {
+                    auto entry = copy.top();
+                    copy.pop();
+                    if (entry.token && entry.token->load(std::memory_order_acquire))
+                        ++stale;
+                    else
+                        kept.push_back(std::move(entry));
+                }
+                if (stale * 2 > heap_.size()) {
+                    heap_ = std::priority_queue<TimerEntry>();
+                    for (auto& entry : kept)
+                        heap_.push(std::move(entry));
+                }
+            }
+
+            std::priority_queue<TimerEntry> heap_;
+            uint32_t compact_tick_ = 0; // 压缩轮次计数 (每 64 次 drain 检查一次)
+        };
+
+        /// 已启动协程的共享存活元数据。generation 防止句柄地址复用；scheduled
+        /// 是跨线程入队去重的原子标志（同一句柄不会重复入队，防 double-resume）。
+        /// unordered_map 的 node 地址在 rehash 时稳定。
+        struct FrameState {
+            explicit FrameState(uint64_t gen) : generation(gen) {}
+            uint64_t generation;
+            std::atomic<bool> scheduled{false};
+            /// 本帧当前等待的 epoch (0 = 没有登记)。
+            std::atomic<uint64_t> wait_epoch{0};
+        };
+
+        /// 帧登记簿: 存活帧表 + 等待身份 epoch + 废弃句柄集合。
+        /// 线程约定: 除 is_abandoned / cleanup_abandoned (仅事件循环线程) 外,
+        /// 其余方法都要求调用方已持有 EventLoop 的 queue_mutex_。
+        class FrameTracker {
+          public:
+            /// 登记新帧并分配代次。
+            uint64_t add(std::coroutine_handle<> h) {
+                const uint64_t generation = ++next_generation_;
+                live_frames_.try_emplace(h.address(), generation);
+                return generation;
+            }
+            void remove(std::coroutine_handle<> h) { live_frames_.erase(h.address()); }
+
+            /// 幂等入队: 帧存活且不在队列中 → 置 scheduled 并回填 entry, 返回 true。
+            bool try_reserve(std::coroutine_handle<> h, ReadyEntry& entry) {
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end() || live->second.scheduled.exchange(true, std::memory_order_acq_rel))
+                    return false;
+                entry = {h, live->second.generation};
+                return true;
+            }
+
+            /// 帧存活时回填代次; 返回 false 表示帧未登记。
+            bool generation_of(std::coroutine_handle<> h, uint64_t& out) const {
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end())
+                    return false;
+                out = live->second.generation;
+                return true;
+            }
+
+            /// 带代次的入队 (定时器到期路径): 代次不符或已在队列中 → 返回 false。
+            bool try_reserve(ReadyEntry candidate) {
+                auto live = live_frames_.find(candidate.handle.address());
+                if (live == live_frames_.end() || live->second.generation != candidate.generation ||
+                    live->second.scheduled.exchange(true, std::memory_order_acq_rel))
+                    return false;
+                return true;
+            }
+
+            /// resume 之前释放占位: 代次不符说明帧已换新, 返回 false (调用方跳过)。
+            bool release(ReadyEntry entry) {
+                auto live = live_frames_.find(entry.handle.address());
+                if (live == live_frames_.end() || live->second.generation != entry.generation)
+                    return false;
+                live->second.scheduled.store(false, std::memory_order_release);
+                return true;
+            }
+
+            uint64_t begin_wait(std::coroutine_handle<> h) {
+                const uint64_t epoch = next_wait_epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!h)
+                    return epoch;
+                auto live = live_frames_.find(h.address());
+                if (live != live_frames_.end())
+                    live->second.wait_epoch.store(epoch, std::memory_order_release);
+                return epoch;
+            }
+
+            /// 仅当帧存活且等待身份仍是 epoch 时才入队 (调用方持锁, 单次查表)。
+            bool try_reserve_if_current(std::coroutine_handle<> h, uint64_t epoch, ReadyEntry& entry) {
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end())
+                    return false; // 帧已销毁: 迟到通知丢弃
+                if (live->second.wait_epoch.load(std::memory_order_acquire) != epoch)
+                    return false; // 帧已开始另一次等待: 旧通知不得唤醒新等待
+                if (live->second.scheduled.exchange(true, std::memory_order_acq_rel))
+                    return false;
+                entry = {h, live->second.generation};
+                return true;
+            }
+
+            void end_wait(std::coroutine_handle<> h, uint64_t epoch) {
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end())
+                    return;
+                uint64_t expected = epoch;
+                live->second.wait_epoch.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+            }
+
+            bool wait_is_current(std::coroutine_handle<> h, uint64_t epoch) const {
+                auto live = live_frames_.find(h.address());
+                return live != live_frames_.end() && live->second.wait_epoch.load(std::memory_order_acquire) == epoch;
+            }
+
+            /// 帧已在就绪队列中 → 注册废弃并返回 true (调用方不要销毁帧)。
+            bool mark_abandoned(std::coroutine_handle<> h) {
+                auto live = live_frames_.find(h.address());
+                if (live == live_frames_.end() || !live->second.scheduled.load(std::memory_order_acquire))
+                    return false;
+                abandoned_handles_.insert(h.address());
+                return true;
+            }
+
+            void mark_io_abandoned(std::coroutine_handle<> h) { abandoned_handles_.insert(h.address()); }
+            bool is_abandoned(std::coroutine_handle<> h) const { return abandoned_handles_.count(h.address()) > 0; }
+            void cleanup_abandoned(std::coroutine_handle<> h) {
+                abandoned_handles_.erase(h.address());
+                h.destroy();
+            }
+
+          private:
+            // 始终启用的帧存活表，与可选调试注册表分离。FrameState::scheduled
+            // 同时承担幂等入队，取代早前的全局去重 set（省一次额外哈希查找）。
+            std::unordered_map<const void*, FrameState> live_frames_;
+            uint64_t next_generation_ = 0;
+            /// 等待 epoch 分配器 (单调递增, 跨线程取号无锁)
+            std::atomic<uint64_t> next_wait_epoch_{0};
+            // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
+            std::unordered_set<const void*> abandoned_handles_;
+        };
     } // namespace detail
 
     class EventLoop {
@@ -238,7 +489,7 @@ namespace coro {
         // 操作, 默认编译关闭; 需要调试/监控时定义 CORO_TASK_REGISTRY。
         void on_coroutine_started(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            live_frames_.try_emplace(h.address(), ++next_generation_);
+            frames_.add(h);
             ++active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             all_tasks_.insert(h.address());
@@ -246,7 +497,7 @@ namespace coro {
         }
         void on_coroutine_finished(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            live_frames_.erase(h.address());
+            frames_.remove(h);
             --active_coroutines_;
 #ifdef CORO_TASK_REGISTRY
             all_tasks_.erase(h.address());
@@ -258,11 +509,8 @@ namespace coro {
         /// 返回 true 表示已注册废弃 (帧保持存活), false 表示不在队列中 (调用方可安全销毁)。
         bool mark_abandoned(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            auto it = live_frames_.find(h.address());
-            if (it == live_frames_.end() || !it->second.scheduled.load(std::memory_order_acquire))
-                return false; // 不在就绪队列: 调用方可安全销毁帧
-            abandoned_handles_.insert(h.address());
-            return true; // 已注册废弃: 调用方不要销毁帧
+            // false = 不在就绪队列: 调用方可安全销毁帧; true = 已注册废弃
+            return frames_.mark_abandoned(h);
         }
 
         /// Task 在底层异步 I/O 挂起时析构：帧必须保留到完成包/CQE 被消费。
@@ -271,17 +519,14 @@ namespace coro {
         /// 与 Task::cancel 一样，当前要求从所属事件循环线程调用。
         void mark_io_abandoned(std::coroutine_handle<> h) {
             std::lock_guard lock(queue_mutex_);
-            abandoned_handles_.insert(h.address());
+            frames_.mark_io_abandoned(h);
         }
 
         /// 检查句柄是否已废弃 (仅事件循环线程调用)
-        bool is_abandoned(std::coroutine_handle<> h) const { return abandoned_handles_.count(h.address()) > 0; }
+        bool is_abandoned(std::coroutine_handle<> h) const { return frames_.is_abandoned(h); }
 
         /// 移除废弃标记并销毁帧 (事件循环清理路径)
-        void cleanup_abandoned(std::coroutine_handle<> h) {
-            abandoned_handles_.erase(h.address());
-            h.destroy();
-        }
+        void cleanup_abandoned(std::coroutine_handle<> h) { frames_.cleanup_abandoned(h); }
 
         bool has_active_coroutines() const { return active_coroutines_ > 0; }
 
@@ -331,100 +576,27 @@ namespace coro {
                 this, [](void* ctx, std::coroutine_handle<> h) { static_cast<EventLoop*>(ctx)->schedule(h); });
         }
 
-        // ---- 定时器堆条目 ----
-        // 使用 std::priority_queue 实现最小堆:
-        //   operator< 返回 deadline > other.deadline 意味着
-        //   "更早的截止时间" 排在堆顶（优先级最高）
-        //
-        // 僵尸条目问题:
-        //   协程被 cancel 强制唤醒后, 它的 timer 条目仍留在堆里,
-        //   到期时若直接 resume 已销毁的协程帧 → UB。
-        //   解决: token 是堆上的共享标志, 两个时机置 true:
-        //     1. sleep_awaiter::await_resume (正常到期路径)
-        //     2. sleep_awaiter 析构 (协程帧销毁路径, 含取消注入的异常展开;
-        //        此时 await_resume 根本不会执行, 必须靠析构置位)
-        //   process_timers 跳过已标记条目。
-        struct ReadyEntry {
-            std::coroutine_handle<> handle;
-            uint64_t generation;
-        };
-
-        /// 已启动协程的共享存活元数据。generation 防止句柄地址复用；scheduled
-        /// 是跨线程入队去重的原子标志（同一句柄不会重复入队，防 double-resume）。
-        /// unordered_map 的 node 地址在 rehash 时稳定。
-        struct FrameState {
-            explicit FrameState(uint64_t gen) : generation(gen) {}
-            uint64_t generation;
-            std::atomic<bool> scheduled{false};
-            /// 本帧当前等待的 epoch (0 = 没有登记)。
-            std::atomic<uint64_t> wait_epoch{0};
-        };
-
-        struct TimerEntry {
-            std::chrono::steady_clock::time_point deadline;
-            ReadyEntry entry;
-            std::shared_ptr<std::atomic<bool>> token;  // 已取消/已消费标记 (堆上共享)
-            std::shared_ptr<std::atomic<int>> outcome; // 可选: 先到终态仲裁
-            int expire_value = 0;                      // 到期时写入 outcome 的值
-
-            bool operator<(const TimerEntry& other) const {
-                return deadline > other.deadline; // min-heap: 早的优先
-            }
-        };
-
-        // ---- 轻量协程 FIFO (vector + 头索引) ----
-        //
-        // 替代 std::queue<coroutine_handle<>> (底层 deque):
-        // MSVC deque 对 8 字节元素每 16 字节块只装 2 个 —— 每 2 次 push
-        // 一次堆分配; vector 摊销为每上百次 push 一次, 且配合「成员 batch
-        // + swap」后, 容量在 batch 与 ready_queue_ 之间往复保留,
-        // 稳态零分配。
-        struct HandleQueue {
-            std::vector<ReadyEntry> items;
-            size_t head = 0;
-
-            void push(ReadyEntry entry) { items.push_back(entry); }
-            bool empty() const { return head >= items.size(); }
-            ReadyEntry front() const { return items[head]; }
-            void pop() {
-                ++head;
-                if (head == items.size()) {
-                    items.clear(); // 整队列耗尽: 一次回收 (保留容量)
-                    head = 0;
-                }
-            }
-            void swap(HandleQueue& other) noexcept {
-                items.swap(other.items);
-                std::swap(head, other.head);
-            }
-        };
+        // ---- 内部组件 (定义见本文件顶部 coro::detail) ----
+        using ReadyEntry = detail::ReadyEntry;
+        using TimerEntry = detail::TimerEntry;
 
         // ---- 成员变量 ----
 
-        HandleQueue ready_queue_;                   // 跨线程入站协程 FIFO (queue_mutex_ 保护)
-        HandleQueue batch_;                         // 本轮批量消费缓冲 (容量跨迭代复用)
+        detail::ReadyQueue ready_queue_;            // 跨线程入站协程 FIFO (queue_mutex_ 保护)
+        detail::ReadyQueue batch_;                  // 本轮批量消费缓冲 (容量跨迭代复用)
         std::vector<ReadyEntry> timer_expired_buf_; // process_timers 复用缓冲 (容量跨迭代复用)
-        mutable std::mutex queue_mutex_;            // 保护 ready_queue_/live_frames_/all_tasks_ (跨线程)
+        mutable std::mutex queue_mutex_;            // 保护 ready_queue_/batch_/frames_ (跨线程)
 
-        // 始终启用的帧存活表，与可选调试注册表分离。FrameState::scheduled
-        // 同时承担幂等入队，取代早前的全局去重 set（省一次额外哈希查找）。
-        std::unordered_map<const void*, FrameState> live_frames_;
-        uint64_t next_generation_ = 0;
-        /// 等待 epoch 分配器 (单调递增, 跨线程取号无锁)
-        std::atomic<uint64_t> next_wait_epoch_{0};
-        /// 定时器堆压缩的轮次计数 (每 64 次 process_timers 检查一次)
-        uint32_t timer_compact_tick_ = 0;
+        // 帧登记簿: 存活帧表 + 等待身份 epoch + 废弃句柄 (queue_mutex_ 保护)
+        detail::FrameTracker frames_;
 
-        // 已废弃但帧仍存活的协程句柄集合 (Task 析构时注册, 事件循环清理)。
-        // 仅事件循环线程访问 (mark_abandoned 也在事件循环线程调用)。
-        std::unordered_set<const void*> abandoned_handles_;
+        // 定时器最小堆 (仅事件循环线程)
+        detail::TimerHeap timer_heap_;
 
         // 跨线程投递的普通函数队列 (dispatch 用), queue_mutex_ 保护
         std::queue<std::function<void()>> fn_queue_;
         // 批次存于 loop, 回调抛异常后未执行项留给下一次 run, 不随局部 vector 丢失。
         std::queue<std::function<void()>> fn_batch_;
-
-        std::priority_queue<TimerEntry> timer_heap_; // 定时器最小堆 (仅事件循环线程)
 
         // 运行标志 (atomic: stop() 可从其他线程调用, 必须避免数据竞争)
         std::atomic<bool> running_ = false;
@@ -498,10 +670,10 @@ namespace coro {
                 std::lock_guard lock(queue_mutex_);
                 // 调度入口只接受已启动的存活帧；自定义协程也须配对调用
                 // on_coroutine_started/on_coroutine_finished，且在 owner loop 销毁。
-                auto live = live_frames_.find(h.address());
-                if (live == live_frames_.end() || live->second.scheduled.exchange(true, std::memory_order_acq_rel))
+                ReadyEntry entry;
+                if (!frames_.try_reserve(h, entry))
                     return;
-                ready_queue_.push({h, live->second.generation});
+                ready_queue_.push(entry);
             }
             // 同线程调度 (run() 内部) 不唤醒: 循环会自然处理就绪队列。
             // 等价 Python: loop.call_soon() 不唤醒, call_soon_threadsafe() 才写 self-pipe
@@ -511,25 +683,15 @@ namespace coro {
     }
 
     inline uint64_t EventLoop::begin_wait(std::coroutine_handle<> h) noexcept {
-        const uint64_t epoch = next_wait_epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (!h)
-            return epoch;
         std::lock_guard lock(queue_mutex_);
-        auto live = live_frames_.find(h.address());
-        if (live != live_frames_.end())
-            live->second.wait_epoch.store(epoch, std::memory_order_release);
-        return epoch;
+        return frames_.begin_wait(h);
     }
 
     inline void EventLoop::end_wait(std::coroutine_handle<> h, uint64_t epoch) noexcept {
         if (!h || epoch == 0)
             return;
         std::lock_guard lock(queue_mutex_);
-        auto live = live_frames_.find(h.address());
-        if (live == live_frames_.end())
-            return;
-        uint64_t expected = epoch;
-        live->second.wait_epoch.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+        frames_.end_wait(h, epoch);
     }
 
     inline bool EventLoop::schedule_if_current(std::coroutine_handle<> h, uint64_t epoch) {
@@ -537,14 +699,10 @@ namespace coro {
             return false;
         {
             std::lock_guard lock(queue_mutex_);
-            auto live = live_frames_.find(h.address());
-            if (live == live_frames_.end())
-                return false; // 帧已销毁: 迟到通知丢弃
-            if (live->second.wait_epoch.load(std::memory_order_acquire) != epoch)
-                return false; // 帧已开始另一次等待: 旧通知不得唤醒新等待
-            if (live->second.scheduled.exchange(true, std::memory_order_acq_rel))
-                return false;
-            ready_queue_.push({h, live->second.generation});
+            ReadyEntry entry;
+            if (!frames_.try_reserve_if_current(h, epoch, entry))
+                return false; // 帧已销毁 / 已开始另一次等待 / 已在队列中
+            ready_queue_.push(entry);
         }
         cross_thread_wake_if_asleep();
         return true;
@@ -554,92 +712,38 @@ namespace coro {
         if (!h || epoch == 0)
             return false;
         std::lock_guard lock(queue_mutex_);
-        auto live = live_frames_.find(h.address());
-        return live != live_frames_.end() && live->second.wait_epoch.load(std::memory_order_acquire) == epoch;
+        return frames_.wait_is_current(h, epoch);
     }
 
     inline void EventLoop::schedule_timer(std::coroutine_handle<> h, std::chrono::steady_clock::time_point deadline,
                                           std::shared_ptr<std::atomic<bool>> token,
                                           std::shared_ptr<std::atomic<int>> outcome, int expire_value) {
-        if (h) {
-            std::lock_guard lock(queue_mutex_);
-            auto live = live_frames_.find(h.address());
-            if (live != live_frames_.end())
-                timer_heap_.push(
-                    {deadline, {h, live->second.generation}, std::move(token), std::move(outcome), expire_value});
-        }
+        if (!h)
+            return;
+        std::lock_guard lock(queue_mutex_);
+        uint64_t generation = 0;
+        if (!frames_.generation_of(h, generation))
+            return;
+        timer_heap_.push({deadline, {h, generation}, std::move(token), std::move(outcome), expire_value});
     }
 
     inline std::chrono::steady_clock::time_point EventLoop::process_timers() {
-        // 第一步: 惰性清理僵尸条目。
-        //   协程帧销毁时 sleep_awaiter 析构会置位 token, 但条目仍留在堆里;
-        //   若不及时清理, 事件循环会被这些"已失效的 deadline"拖着空等到期
-        //   (has_work 认为还有定时器), 表现为 cancel 后程序迟迟不退出。
-        //   堆顶以下的失效条目只能在到期时被丢弃; 取消风暴后会长期占地, 因此
-        //   定期整堆压缩 (低频, 不放在热路径上)。
-        if (++timer_compact_tick_ >= 64 && timer_heap_.size() > 128) {
-            timer_compact_tick_ = 0;
-            auto copy = timer_heap_;
-            std::vector<TimerEntry> kept;
-            kept.reserve(copy.size());
-            std::size_t stale = 0;
-            while (!copy.empty()) {
-                auto entry = copy.top();
-                copy.pop();
-                if (entry.token && entry.token->load(std::memory_order_acquire))
-                    ++stale;
-                else
-                    kept.push_back(std::move(entry));
-            }
-            if (stale * 2 > timer_heap_.size()) {
-                timer_heap_ = std::priority_queue<TimerEntry>();
-                for (auto& entry : kept)
-                    timer_heap_.push(std::move(entry));
-            }
-        }
-        while (!timer_heap_.empty()) {
-            auto& top = timer_heap_.top();
-            if (top.token && *top.token) {
-                timer_heap_.pop(); // 已失效: 无论是否到期都丢弃
-                continue;
-            }
-            break; // 堆顶有效, 后面的 deadline 都更晚, 无需继续检查
-        }
-
+        // 先清僵尸再把到期条目移入就绪队列: 僵尸条目不清理会让 has_work 一直认为
+        // 还有定时器, 表现为 cancel 后程序迟迟不退出 (压缩策略见 TimerHeap)。
         auto now = std::chrono::steady_clock::now();
-
-        // 第二步: 将到期的定时器移入就绪队列。
-        // 先收集再「一次锁批量入队」—— 旧实现每个到期定时器一次锁,
-        // 10 万个同时到期的场景就是 10 万次加锁。
-        // 注意: 仍经过 FrameState::scheduled 去重 (与 schedule() 保持一致),
-        // 否则跨线程 schedule(h) 和定时器到期可能将同一句柄双入队 → double-resume UB
-        // 优化: 用成员 timer_expired_buf_ 代替局部 vector, 跨迭代复用容量 (同 batch_ 策略)
         timer_expired_buf_.clear();
-        {
-            while (!timer_heap_.empty() && timer_heap_.top().deadline <= now) {
-                auto entry = timer_heap_.top();
-                timer_heap_.pop();
-                if (entry.token && entry.token->load())
-                    continue; // 已被消费/取消: 丢弃僵尸条目
-                if (entry.outcome) {
-                    // 先到终态仲裁: 取消已经提交时就不再入队, 也不翻转原因
-                    int expected = 0;
-                    if (!entry.outcome->compare_exchange_strong(expected, entry.expire_value))
-                        continue;
-                }
-                timer_expired_buf_.push_back(entry.entry);
-            }
-            if (!timer_expired_buf_.empty()) {
-                std::lock_guard lock(queue_mutex_);
-                for (auto entry : timer_expired_buf_) {
-                    auto live = live_frames_.find(entry.handle.address());
-                    if (live != live_frames_.end() && live->second.generation == entry.generation &&
-                        !live->second.scheduled.exchange(true, std::memory_order_acq_rel))
-                        ready_queue_.push(entry);
-                }
-            }
+        timer_heap_.drain(now, timer_expired_buf_);
+        if (timer_expired_buf_.empty())
+            return now;
+
+        // 一次锁批量入队: 旧实现每个到期定时器一次加锁, 10 万个同时到期就是
+        // 10 万次加锁。仍逐个经过 FrameState::scheduled 去重 (与 schedule() 一致),
+        // 否则跨线程 schedule(h) 与定时器到期可能把同一句柄双入队 → double-resume。
+        std::lock_guard lock(queue_mutex_);
+        for (auto entry : timer_expired_buf_) {
+            if (frames_.try_reserve(entry))
+                ready_queue_.push(entry);
         }
-        // 返回本次使用的时钟: run_impl 的超时计算直接复用 (省一次系统调用)
         return now;
     }
 
@@ -742,7 +846,7 @@ namespace coro {
                     if (!empty) {
                         awake_.store(true, std::memory_order_seq_cst);
                     } else if (!timer_heap_.empty()) {
-                        auto next = timer_heap_.top().deadline;
+                        auto next = timer_heap_.top_deadline();
                         if (next > now) {
                             // 向上取整: 剩余 <1ms 时等待 1ms 而非 0ms。
                             // IOCP/io_uring 的超时都是毫秒粒度, 截断为 0 会让
@@ -792,10 +896,9 @@ namespace coro {
                         // 必须逐个进行而非整批提前擦除 —— 这是防 double-schedule
                         // 的正确性机制 (见上方注释), 不能作为纯优化合并。
                         std::lock_guard lock(queue_mutex_);
-                        auto live = live_frames_.find(h.address());
-                        if (live == live_frames_.end() || live->second.generation != entry.generation)
+                        // 代次不符说明帧已换新 (旧句柄被复用): 直接跳过。
+                        if (!frames_.release(entry))
                             continue;
-                        live->second.scheduled.store(false, std::memory_order_release);
                     }
                     if (h && !h.done()) { // 跳过已完成的协程 (防止 double-resume)
                         if (is_abandoned(h)) {
