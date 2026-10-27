@@ -121,7 +121,7 @@ coro::Task<> t8_call_later() {
     std::cout << "  OK: " << (ok ? "fired" : "MISS") << std::endl;
 }
 
-// 9. gather_all (用库函数, 命名协程函数实现)
+// 9. wait_tasks(AllCompleted) (用库函数, 命名协程函数实现)
 // 任务用命名函数按值传参，避免临时捕获闭包先于 Task 析构
 coro::Task<int> gather_task_impl(int i) {
     co_await coro::sleep(30ms);
@@ -133,11 +133,11 @@ coro::Task<> t9_gather_all() {
     for (int i = 0; i < 3; i++)
         tv.push_back(gather_task_impl(i));
 
-    auto results = co_await coro::gather_all(std::move(tv));
+    auto results = co_await coro::wait_tasks(std::move(tv), coro::WaitMode::AllCompleted);
     std::cout << "  OK: [" << results[0] << "," << results[1] << "," << results[2] << "]" << std::endl;
 }
 
-// 10. wait_any (用库函数, 命名协程函数实现)
+// 10. wait_tasks(FirstCompleted) (用库函数, 命名协程函数实现)
 coro::Task<int> wait_any_fast() {
     co_await coro::sleep(50ms);
     co_return 100;
@@ -148,7 +148,11 @@ coro::Task<int> wait_any_slow() {
 }
 
 coro::Task<> t10_wait_any() {
-    int result = co_await coro::wait_any(wait_any_fast(), wait_any_slow());
+    std::vector<coro::Task<int>> tv;
+    tv.push_back(wait_any_fast());
+    tv.push_back(wait_any_slow());
+    auto results = co_await coro::wait_tasks(std::move(tv), coro::WaitMode::FirstCompleted);
+    int result = results.front();
     std::cout << "  OK: first=" << result << " (should be 100)" << std::endl;
 }
 

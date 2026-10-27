@@ -1,4 +1,6 @@
-// test_concurrency.cpp — gather / gather_all / gather_void / wait_for / wait_any
+// test_concurrency.cpp — gather / wait_tasks(AllCompleted|FirstCompleted) / wait_for
+// 注: 旧的 gather_all/gather_void/wait_any 已标记 deprecated, 测试一律走新入口,
+// 以便 CORO_WERROR=ON 时本目标仍能编译。
 #include <gtest/gtest.h>
 
 #include <coro/coro.hpp>
@@ -39,7 +41,7 @@ namespace {
         std::vector<coro::Task<int>> tv;
         for (int i = 0; i < 4; ++i)
             tv.push_back(make_num(i));
-        *out = co_await coro::gather_all(std::move(tv));
+        *out = co_await coro::wait_tasks(std::move(tv), coro::WaitMode::AllCompleted);
     }
 
     coro::Task<int> fail_after_ms(int ms) {
@@ -72,13 +74,13 @@ namespace {
     coro::Task<> gather_void_ok(int* sum) {
         auto a = coro::spawn(tiny());
         auto b = coro::spawn(tiny());
-        co_await coro::gather_void(tiny());
+        (void)co_await coro::gather(tiny());
         co_await std::move(a);
         co_await std::move(b);
         *sum = 3;
     }
 
-    // gather_void 异常传播 (本轮修复的回归测试)
+    // void 任务异常传播 (原 gather_void 回归测试, 现已改用 gather)
     coro::Task<> fail_void_after_ms(int ms) {
         co_await coro::sleep(std::chrono::milliseconds(ms));
         throw std::runtime_error("void sub failed");
@@ -87,14 +89,14 @@ namespace {
 
     coro::Task<> gather_void_exception(bool* caught) {
         try {
-            co_await coro::gather_void(tiny(), fail_void_after_ms(10));
+            (void)co_await coro::gather(tiny(), fail_void_after_ms(10));
         } catch (const std::runtime_error&) {
             *caught = true;
         }
     }
 
     coro::Task<> gather_void_empty(bool* returned) {
-        co_await coro::gather_void();
+        (void)co_await coro::gather();
         *returned = true;
     }
 
@@ -174,12 +176,22 @@ namespace {
         co_return v;
     }
 
-    coro::Task<> wait_any_fast(int* result) {
-        *result = co_await coro::wait_any(fast_num(100, 20), fast_num(200, 100));
+    /// 两路竞速 (FirstCompleted) 的薄包装: 代替已弃用的 wait_any
+    coro::Task<int> first_of_two(coro::Task<int> a, coro::Task<int> b) {
+        std::vector<coro::Task<int>> tasks;
+        tasks.reserve(2);
+        tasks.push_back(std::move(a));
+        tasks.push_back(std::move(b));
+        auto results = co_await coro::wait_tasks(std::move(tasks), coro::WaitMode::FirstCompleted);
+        co_return std::move(results.front());
     }
 
-    coro::Task<> cancel_wait_any(bool* caught) {
-        auto pending = coro::spawn(coro::wait_any(fast_num(1, 80), fast_num(2, 100)));
+    coro::Task<> first_completed_fast(int* result) {
+        *result = co_await first_of_two(fast_num(100, 20), fast_num(200, 100));
+    }
+
+    coro::Task<> cancel_first_completed(bool* caught) {
+        auto pending = coro::spawn(first_of_two(fast_num(1, 80), fast_num(2, 100)));
         co_await coro::sleep(10ms);
         pending.cancel();
         try {
@@ -289,14 +301,14 @@ TEST(ConcurrencyTest, WaitForPropagatesCallerCancellation) {
     EXPECT_TRUE(cancelled);
 }
 
-TEST(ConcurrencyTest, WaitAnyFirstWins) {
+TEST(ConcurrencyTest, FirstCompletedFastWins) {
     int result = 0;
-    test_util::run_task([&] { return wait_any_fast(&result); });
+    test_util::run_task([&] { return first_completed_fast(&result); });
     EXPECT_EQ(result, 100); // 快者胜
 }
 
-TEST(ConcurrencyTest, WaitAnyCancellationKeepsMonitorsSafe) {
+TEST(ConcurrencyTest, FirstCompletedCancellationKeepsMonitorsSafe) {
     bool caught = false;
-    test_util::run_task([&] { return cancel_wait_any(&caught); });
+    test_util::run_task([&] { return cancel_first_completed(&caught); });
     EXPECT_TRUE(caught);
 }

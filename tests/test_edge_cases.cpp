@@ -94,10 +94,10 @@ namespace {
         *result = v;
     }
 
-    // ── gather_all 空集 ──
+    // ── wait_tasks(AllCompleted) 空集 ──
     coro::Task<> gather_empty(std::vector<int>* out) {
         std::vector<coro::Task<int>> empty;
-        *out = co_await coro::gather_all(std::move(empty));
+        *out = co_await coro::wait_tasks(std::move(empty), coro::WaitMode::AllCompleted);
     }
 
     // ── wait_for 零超时: 立即超时 ──

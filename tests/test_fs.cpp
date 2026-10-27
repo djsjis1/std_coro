@@ -8,16 +8,36 @@
 #include "test_util.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace {
 
+    /// 读环境变量; 不存在返回空串。
+    /// Windows 走 _dupenv_s: 直接用 getenv 会在 MSVC /W4 下报 C4996,
+    /// 开 CORO_WERROR 时直接变成编译错误。
+    std::string env_value(const char* name) {
+#ifdef _WIN32
+        char* buffer = nullptr;
+        size_t size = 0;
+        if (_dupenv_s(&buffer, &size, name) != 0 || buffer == nullptr)
+            return {};
+        std::string value(buffer);
+        std::free(buffer);
+        return value;
+#else
+        const char* value = std::getenv(name);
+        return value != nullptr ? std::string(value) : std::string{};
+#endif
+    }
+
     // ── 测试用临时文件路径 (各用例名字唯一, 结束时清理) ──
     std::string tmp_path(const char* name) {
-        const char* tmp = std::getenv("TEMP"); // Windows
-        if (!tmp)
-            tmp = std::getenv("TMPDIR"); // Linux
-        std::string dir = (tmp ? tmp : ".");
+        std::string dir = env_value("TEMP");   // Windows
+        if (dir.empty())
+            dir = env_value("TMPDIR");         // Linux
+        if (dir.empty())
+            dir = ".";
         return dir + "/" + name + ".tmp";
     }
 

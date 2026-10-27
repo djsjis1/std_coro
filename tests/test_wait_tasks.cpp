@@ -150,7 +150,7 @@ namespace {
         std::vector<coro::Task<NonDefault>> gathered;
         gathered.push_back(non_default_value(3));
         gathered.push_back(non_default_value(4));
-        auto gather_results = co_await coro::gather_all(std::move(gathered));
+        auto gather_results = co_await coro::wait_tasks(std::move(gathered), coro::WaitMode::AllCompleted);
         *gather_sum = gather_results[0].value + gather_results[1].value;
 
         std::vector<coro::Task<NonDefault>> waited;
@@ -159,8 +159,11 @@ namespace {
         auto wait_results = co_await coro::wait_tasks(std::move(waited), coro::WaitMode::AllCompleted);
         *wait_sum = wait_results[0].value + wait_results[1].value;
 
-        auto first = co_await coro::wait_any(non_default_value(7), non_default_value(8));
-        *any_value = first.value;
+        std::vector<coro::Task<NonDefault>> first_completed;
+        first_completed.push_back(non_default_value(7));
+        first_completed.push_back(non_default_value(8));
+        auto any_results = co_await coro::wait_tasks(std::move(first_completed), coro::WaitMode::FirstCompleted);
+        *any_value = any_results.front().value;
     }
 
 } // namespace
