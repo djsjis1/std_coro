@@ -436,6 +436,20 @@ TaskGroup 的组取消在此基础上多两步：
 - 五个原语都实现 `on_waiter_destroyed`，配合 cancel_check_awaiter
   的析构钩子做僵尸等待者摘除（见第 5 节）。
 
+### queue.hpp 与 channel.hpp 为什么保留两套
+
+两者都是“生产者-消费者队列”，但**取消契约不同**，合并会破掉其中一边：
+
+- `channel`（Go 语义）：等待者一被唤醒就把值搬给对方（promote-on-wake）。
+  被取消的发送者如果值已被搬进缓冲，值会**留在队列里**（不丢消息，但已入队）。
+- `Queue`（asyncio 语义）：采用“预留名额”而非提前搬值。被取消的发送者
+  **值从未入队**，名额转给下一个等待者；这是
+  `QueueReservationTest.*` 守护的行为，也是 `task_done/join` 收尾语义的基础。
+
+结论：`Queue` 保留自己的预留机制（不是 channel 的薄封装），新代码需要
+Go channel / `select` 多路仲裁时用 `channel`，需要 asyncio.Queue 语义时用 `Queue`。
+两边共同的“已交付值不静默消失”保证由 `channel_return_value` 在接收方取消时兜底。
+
 ### future.hpp
 
 ```

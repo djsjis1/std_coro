@@ -23,6 +23,13 @@
 //   - put: 队列满时挂起生产者, 直到有空间
 //   - get: 队列空时挂起消费者, 直到有数据
 //   - 可选 maxsize (默认无限)
+//   - task_done/join: 等待全部任务处理完再收尾
+//
+// 与 channel.hpp 的分工 (两者都是生产-消费队列, 但取消契约不同, 不要当同义词用):
+//   需要 Go channel 语义 / select 多路仲裁 / 端点分发 → coro::channel
+//   需要 asyncio.Queue 语义 (task_done/join, 被取消的 put **值不入队**) → 本类
+//   本类用"预留名额"而非提前搬值, 因此不能简单改写成 channel 的薄封装;
+//   完整对比见 docs/architecture.md 的 queue.hpp 与 channel.hpp 一节。
 //
 // 线程契约: loop-local。等待队列里存的是 awaiter 帧内指针, 它们只在
 // 创建队列的 EventLoop 线程上被读写与唤醒, 因此不需要 wait-epoch; 跨线程
