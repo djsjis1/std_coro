@@ -301,6 +301,9 @@ if (auto v = co_await rx.recv()) use(*v);   // 先排空存量, 之后返回 nul
 - **取消安全**：挂起的发送者被取消时，其值随等待节点一起消失（既不残留也不误交给后来者），
   占用的名额归还。这一点由析构兜底保证——任务被取消时 `CancelledError` 由框架的取消检查
   包装器抛出，**不会经过本 awaiter 的 `await_resume`**。
+- **已交付不丢失**：接收方被唤醒（值已搬进它的节点）但在 `await_resume` 之前被取消时，
+  值会由析构**交还给下一个等待者或缓冲头部**，不会随节点析构静默消失；
+  `CancelledReceiverReturnsDeliveredValue` 用例守护该行为。
 - 支持 move-only 元素：值只在"入队/成功交接"处移动。
 
 与 `coro::Queue` 的分工（刻意不合并）：`Queue` 面向 `task_done/join` 的任务完成计数
