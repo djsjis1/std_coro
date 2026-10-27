@@ -64,6 +64,18 @@
 namespace coro {
     namespace net {
 
+        namespace detail_net {
+            /// 点分十进制 IPv4 → in_addr。失败返回 false。
+            /// 不用 inet_addr: 它把"非法输入"与 255.255.255.255 混为同一个
+            /// INADDR_NONE 返回值, 且已被 Winsock 标为弃用 (MSVC /W4 报 C4996,
+            /// 开 CORO_WERROR 就直接编不过)。
+            inline bool parse_ipv4(const char* ip, in_addr& out) noexcept {
+                if (ip == nullptr)
+                    return false;
+                return ::inet_pton(AF_INET, ip, &out) == 1; // Windows/Linux 同名同签名
+            }
+        } // namespace detail_net
+
 #ifdef _WIN32
 
         // ==================================================================
@@ -307,6 +319,11 @@ namespace coro {
             /// 创建 socket 并异步连接到 ip:port (零配置: 自动关联 IOCP)
             static connect_awaiter connect(const char* ip, unsigned short port) {
                 connect_awaiter aw;
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed)) {
+                    aw.op.error = (int)WSAEINVAL; // 非法地址: 不把 INADDR_NONE 当目标
+                    return aw;
+                }
                 if (!ensure_winsock()) { // 必须先初始化 Winsock
                     aw.op.error = (int)WSAEINVAL;
                     return aw;
@@ -315,7 +332,7 @@ namespace coro {
                 aw.sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 aw.addr.sin_family = AF_INET;
                 aw.addr.sin_port = htons(port);
-                aw.addr.sin_addr.s_addr = inet_addr(ip);
+                aw.addr.sin_addr = parsed;
                 if (aw.sock != INVALID_SOCKET) {
                     // ConnectEx 要求 socket 先绑定本地地址 (否则报 WSAEINVAL)
                     sockaddr_in local{};
@@ -471,6 +488,9 @@ namespace coro {
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 if (!ensure_winsock()) // 必须先初始化 Winsock
                     return false;
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed))
+                    return false;
                 close();
                 accept_ex_ = nullptr;
 
@@ -481,7 +501,7 @@ namespace coro {
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
-                addr.sin_addr.s_addr = inet_addr(ip);
+                addr.sin_addr = parsed;
 
                 // Windows 上 SO_REUSEADDR 允许端口劫持: 已有服务监听时新 socket
                 // 仍可能 bind 成功, 客户端请求被不可预测地分流。使用独占绑定，
@@ -683,6 +703,9 @@ namespace coro {
             bool bind_listen(const char* ip, unsigned short port) {
                 if (!ensure_winsock())
                     return false;
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed))
+                    return false;
                 close();
                 sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (sock_ == INVALID_SOCKET)
@@ -691,7 +714,7 @@ namespace coro {
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
-                addr.sin_addr.s_addr = inet_addr(ip);
+                addr.sin_addr = parsed;
 
                 if (bind(sock_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
                     close();
@@ -1044,6 +1067,10 @@ namespace coro {
 
                 void await_suspend(std::coroutine_handle<> h) {
                     op.continuation = h;
+                    if (op.result < 0) { // 参数校验已失败 (如非法 IP): 不再提交 syscall
+                        EventLoop::get().schedule(h);
+                        return;
+                    }
                     if (auto* u = detail::current_uring()) {
                         io_uring_sqe* sqe = io_uring_get_sqe(u->handle());
                         if (!sqe) {
@@ -1064,7 +1091,8 @@ namespace coro {
 
                 TcpStream await_resume() {
                     if (const int err = detail::uring_op_error(op)) {
-                        ::close(fd);
+                        if (fd >= 0)
+                            ::close(fd);
                         fd = -1;
                         io::set_error(err);
                         return TcpStream{}; // 连接失败, valid()==false
@@ -1076,10 +1104,15 @@ namespace coro {
             /// 创建 socket 并异步连接到 ip:port (零配置)
             static connect_awaiter connect(const char* ip, unsigned short port) {
                 connect_awaiter aw;
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed)) {
+                    aw.op.result = -EINVAL; // 非法地址: await_suspend 不再提交 syscall
+                    return aw;
+                }
                 aw.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 aw.addr.sin_family = AF_INET;
                 aw.addr.sin_port = htons(port);
-                aw.addr.sin_addr.s_addr = inet_addr(ip);
+                aw.addr.sin_addr = parsed;
                 return aw;
             }
 
@@ -1143,6 +1176,9 @@ namespace coro {
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed))
+                    return false;
                 fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (fd_ < 0)
                     return false;
@@ -1157,7 +1193,7 @@ namespace coro {
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
-                addr.sin_addr.s_addr = inet_addr(ip);
+                addr.sin_addr = parsed;
 
                 if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
                     close();
@@ -1285,6 +1321,9 @@ namespace coro {
 
             bool bind_listen(const char* ip, unsigned short port) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
+                in_addr parsed{};
+                if (!detail_net::parse_ipv4(ip, parsed))
+                    return false;
                 fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
                 if (fd_ < 0)
                     return false;
@@ -1298,7 +1337,7 @@ namespace coro {
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(port);
-                addr.sin_addr.s_addr = inet_addr(ip);
+                addr.sin_addr = parsed;
 
                 if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
                     close();
