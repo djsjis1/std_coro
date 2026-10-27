@@ -212,6 +212,33 @@ namespace {
         co_return;
     }
 
+    // 取消已交付的接收者: 值必须回到通道, 不能随节点析构消失
+    coro::Task<int> recv_value_or_minus_one(coro::channel<int>::receiver rx) {
+        auto value = co_await rx.recv();
+        co_return value.value_or(-1);
+    }
+
+    coro::Task<> cancelled_receiver_returns_value(int* next_got) {
+        auto ch = coro::channel<int>::unbounded();
+        auto tx = ch.make_sender();
+        auto rx = ch.make_receiver();
+
+        auto dying = coro::spawn(recv_value_or_minus_one(rx));
+        auto survivor = coro::spawn(recv_value_or_minus_one(rx));
+        co_await coro::yield(); // 两个接收者都挂起在候选队列里
+
+        EXPECT_TRUE(tx.try_send(7)); // 直接交付给第一个接收者
+        dying.cancel();              // 它在恢复前被取消: await_resume 不会执行
+        try {
+            (void)co_await dying;
+        } catch (const coro::CancelledError&) {
+        }
+
+        *next_got = co_await coro::wait_for(std::move(survivor), 100ms);
+        tx.close();
+        co_return;
+    }
+
 } // namespace
 
 TEST(ChannelTest, BoundedKeepsFifo) {
@@ -278,6 +305,12 @@ TEST(ChannelTest, ReceiverRetiresAfterDelivery) {
     EXPECT_EQ(first, 1) << "第一次交付的值被后续发送覆盖了 (接收节点未退役)";
     EXPECT_EQ(second_send_ok, 1) << "第二次发送不该再命中已完成交付的接收节点";
     EXPECT_EQ(second, 2) << "第二次发送的值丢失或错位";
+}
+
+TEST(ChannelTest, CancelledReceiverReturnsDeliveredValue) {
+    int next_got = 0;
+    test_util::run_task([&] { return cancelled_receiver_returns_value(&next_got); });
+    EXPECT_EQ(next_got, 7) << "已交付的值在接收方取消后丢失了 (对端以为发送成功)";
 }
 
 #endif // CORO_HAS_CONCURRENCY_EXT

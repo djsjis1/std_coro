@@ -165,6 +165,18 @@ namespace coro {
             return true;
         }
 
+        /// 已交付出去的值又回到通道 (接收方在恢复前被取消)。
+        /// 不能静默丢消息: 先交给下一个等待者 (FIFO 语义不变), 否则放回缓冲头部
+        /// —— 它本来就是这个通道里最早的值。缓冲已满时仍丢弃 (不破坏容量契约)。
+        template <typename T> inline bool channel_return_value(channel_state<T>& st, T value) {
+            if (channel_deliver(st, value))
+                return true;
+            if (!channel_has_room(st))
+                return false;
+            st.buffer.push_front(std::move(value));
+            return true;
+        }
+
         /// 缓冲腾出位置后, 按 FIFO 把挂着的发送者搬进缓冲 (不插队, 保证公平)
         template <typename T> inline void channel_promote_senders(channel_state<T>& st) {
             while (!st.senders.empty() && channel_has_room(st)) {
@@ -637,16 +649,30 @@ namespace coro {
             }
 
             std::optional<T> await_resume() {
-                if (node)
-                    return node->delivered ? std::move(node->value) : std::nullopt;
-                return std::move(inline_value);
+                if (!node)
+                    return std::move(inline_value);
+                if (!node->delivered)
+                    return std::nullopt;
+                // 取值后立即清空节点: optional 的移动构造会让源保持 engaged,
+                // 不 reset 的话析构时会把已交出去的值又"归还"给通道一次。
+                std::optional<T> value = std::move(node->value);
+                node->value.reset();
+                return value;
             }
 
             /// 与发送侧同理: 取消绕过 await_resume, 必须由析构摘链, 否则发送方
             /// 会往一个已经不存在的接收节点上交接。
             ~channel_recv_awaiter() {
-                if (st && node && !node->delivered)
+                if (!st || !node)
+                    return;
+                if (!node->delivered) {
                     channel_drop_receiver(*st, node);
+                    return;
+                }
+                // 值已经交到本节点、协程却在 await_resume 之前被取消:
+                // 把值还给通道, 否则它随节点析构静默消失 (发送方以为已送达)。
+                if (node->value)
+                    channel_return_value(*st, std::move(*node->value));
             }
         };
 
