@@ -490,7 +490,7 @@ jobs:
       # detect_leaks=1: 不能全局关掉泄漏检查再看绿色。若确有带来源的上游噪声,
       # 用 LSAN_OPTIONS=suppressions=ci/lsan.supp 做局部抑制, 不要整类关闭。
       ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
-      TSAN_OPTIONS: "abort_on_error=1:suppressions=ci/tsan.supp"
+      TSAN_OPTIONS: "abort_on_error=1:suppressions=${{ github.workspace }}/ci/tsan.supp"
       UBSAN_OPTIONS: "print_stacktrace=1:abort_on_error=1"
     steps:
       - uses: actions/checkout@v4

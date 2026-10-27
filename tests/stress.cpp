@@ -1244,8 +1244,8 @@ namespace {
             s.expected = 0; // 只报错误数; 完成量受内核/负载影响, 不作合同
             s.actual = errs.load();
             s.ops = conns;
-            s.note = "accepted " + fmt_num(accepted.load()) + "/" + fmt_num(conns) + ", 错误数: " +
-                     fmt_num(errs.load());
+            s.note =
+                "accepted " + fmt_num(accepted.load()) + "/" + fmt_num(conns) + ", 错误数: " + fmt_num(errs.load());
             if (errs.load() != 0)
                 s.fail("并发 accept 出现错误: " + fmt_num(errs.load()));
             s.finish();
@@ -1943,7 +1943,7 @@ namespace {
     };
 
     const Group k_groups[] = {
-        {"core", run_core},       {"sync", run_sync},       {"channel", run_channel},
+        {"core", run_core},       {"sync", run_sync}, {"channel", run_channel},
 #ifdef CORO_STRESS_HAVE_NATIVE_IO
         {"io", run_fsio},
 #endif
