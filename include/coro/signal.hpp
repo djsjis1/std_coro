@@ -432,10 +432,13 @@ namespace coro {
                     stopped.store(true, std::memory_order_release);
                     if (reader_thread.joinable())
                         reader_thread.join();
-                    if (rfd.load(std::memory_order_relaxed) >= 0)
-                        ::close(rfd.load(std::memory_order_relaxed));
-                    if (wfd.load(std::memory_order_relaxed) >= 0)
-                        ::close(wfd.load(std::memory_order_relaxed));
+                    // 各读一次存局部: 避免"先 load 判断、再 load 使用"的双读。
+                    const int reader_fd = rfd.load(std::memory_order_relaxed);
+                    if (reader_fd >= 0)
+                        ::close(reader_fd);
+                    const int writer_fd = wfd.load(std::memory_order_relaxed);
+                    if (writer_fd >= 0)
+                        ::close(writer_fd);
                 }
 
                 /// 建立 self-pipe + reader 线程 (不装任何 sigaction;
@@ -455,7 +458,7 @@ namespace coro {
                 /// 重复安装同一 handler 无副作用, 无需去重集合。
                 void ensure_installed(int sig) {
                     ensure_initialized();
-                    struct sigaction sa {};
+                    struct sigaction sa{};
                     sa.sa_handler = &global_signal_state::signal_handler;
                     // SA_RESTART: 处理器是进程级的 —— 没有 RESTART 时, 任何
                     // 线程收到允许的信号都会让该线程当前的阻塞系统调用以
@@ -469,7 +472,7 @@ namespace coro {
 
                 /// 恢复默认处置 (disallow 且无等待者时)
                 void restore_default(int sig) {
-                    struct sigaction sa {};
+                    struct sigaction sa{};
                     sa.sa_handler = SIG_DFL;
                     sigemptyset(&sa.sa_mask);
                     sigaction(sig, &sa, nullptr);

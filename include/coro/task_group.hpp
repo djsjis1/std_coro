@@ -120,28 +120,33 @@ namespace coro {
             }
 
             void complete() {
+                // 表在锁内 swap 为空, 元素析构推迟到锁外: 大组完成时不必在
+                // 临界区里逐个析构 N 个 shared_ptr (原子减 + 可能的 ~Task)。
+                std::vector<std::shared_ptr<Task<void>>> retired;
                 std::coroutine_handle<> h;
                 EventLoop* loop = nullptr;
-                std::lock_guard lock(mutex);
-                if (--remaining == 0) {
-                    // 组完成: 一次性清空 monitor 表并释放容量。
-                    // 安全性: remaining==0 ⟺ 所有 monitor 都已执行过本函数,
-                    // 它们要么早已随帧结束销毁, 要么 (当前这个) 仍由自己帧的
-                    // self 参数持有 —— 清表不销毁任何运行中的帧, Task 析构
-                    // 因 handle_ 已被 release_handle 置空而是 no-op。
-                    // 已完成者留在表中本就无害 (取消遍历以 !is_ready() 过滤),
-                    // 这里清空纯粹是释放内存 + 让组结束后的遍历变空转。
-                    monitors.clear();
-                    std::vector<std::shared_ptr<Task<void>>>().swap(monitors);
-                    if (waiter) {
-                        h = waiter;
-                        loop = waiter_loop;
-                        waiter = nullptr;
-                        waiter_loop = nullptr;
+                {
+                    std::lock_guard lock(mutex);
+                    if (--remaining == 0) {
+                        // 组完成: 一次性把 monitor 表换出并释放容量。
+                        // 安全性: remaining==0 ⟺ 所有 monitor 都已执行过本函数,
+                        // 它们要么早已随帧结束销毁, 要么 (当前这个) 仍由自己帧的
+                        // self 参数持有 —— 换出表不销毁任何运行中的帧, Task 析构
+                        // 因 handle_ 已被 release_handle 置空而是 no-op。
+                        // 已完成者留在表中本就无害 (取消遍历以 !is_ready() 过滤),
+                        // 这里换出纯粹是释放内存 + 让组结束后的遍历变空转。
+                        retired.swap(monitors);
+                        if (waiter) {
+                            h = waiter;
+                            loop = waiter_loop;
+                            waiter = nullptr;
+                            waiter_loop = nullptr;
+                        }
                     }
+                    // 唤醒保持在锁内: 与旧实现的次序一致, 不引入新的时序窗口。
+                    if (h && loop)
+                        loop->schedule(h);
                 }
-                if (h && loop)
-                    loop->schedule(h);
             }
 
             size_t pending() const noexcept {
