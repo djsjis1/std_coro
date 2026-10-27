@@ -307,19 +307,18 @@ namespace coro {
         EventLoop() : event_source_(make_default_event_source()) { install_event_source(); }
 
         static std::shared_ptr<EventSource> make_default_event_source() {
+            // 平台头 (iocp_event_source / uring_event_source) 各自提供工厂函数:
+            // 核心只面向 EventSource 接口, 不再在此处写 net:: 具体类型。
+            // 工厂返回 nullptr 表示原生后端不可用 (如受限令牌下 IOCP 创建失败)。
 #ifdef _WIN32
-            // Windows: 默认 IOCP (等价 Python ProactorEventLoop)
-            auto iocp = std::make_shared<net::IocpEventSource>();
-            if (iocp->valid())
-                return iocp;
+            if (auto source = make_iocp_event_source())
+                return source;
 #elif defined(__linux__) && defined(CORO_URING_ENABLED)
-            // Linux: io_uring 可用时走 Proactor；初始化失败回退到 CV,
-            // 让核心协程/定时器仍可运行，IO awaiter 会返回 ENOTSUP。
-            auto uring = std::make_shared<net::UringEventSource>();
-            if (uring->valid())
-                return uring;
+            if (auto source = make_uring_event_source())
+                return source;
 #endif
-            // 其他平台或原生事件源初始化失败: 使用 condition_variable。
+            // 其他平台或原生事件源初始化失败: 使用 condition_variable，
+            // 核心协程/定时器仍可运行，IO awaiter 会返回 ENOTSUP。
             return std::make_shared<CVEventSource>();
         }
 

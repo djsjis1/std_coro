@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <memory>
 
 // ============================================================================
 // coro::net::IocpEventSource — Windows IOCP 等待原语 (平台默认事件源)
@@ -181,4 +182,16 @@ namespace coro {
 #endif // _WIN32
 
     } // namespace net
+
+#ifdef _WIN32
+    /// 平台默认事件源工厂: 让 EventLoop 面向 EventSource 接口而不用写
+    /// net:: 下的具体类型 (解耦: 网关层不反向索引网络命名空间)。
+    /// 返回 nullptr 表示 IOCP 不可用, 调用方回退到 CVEventSource。
+    inline std::shared_ptr<EventSource> make_iocp_event_source() {
+        auto source = std::make_shared<net::IocpEventSource>();
+        if (source->valid())
+            return source;
+        return nullptr;
+    }
+#endif
 } // namespace coro

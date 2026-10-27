@@ -14,6 +14,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -326,4 +327,16 @@ namespace coro {
 #endif // CORO_URING_ENABLED
 
     } // namespace net
+
+#ifdef CORO_URING_ENABLED
+    /// 平台默认事件源工厂: 让 EventLoop 面向 EventSource 接口而不用写
+    /// net:: 下的具体类型 (解耦: 核心不反向索引网络命名空间)。
+    /// 返回 nullptr 表示 io_uring 不可用, 调用方回退到 CVEventSource。
+    inline std::shared_ptr<EventSource> make_uring_event_source() {
+        auto source = std::make_shared<net::UringEventSource>();
+        if (source->valid())
+            return source;
+        return nullptr;
+    }
+#endif
 } // namespace coro
