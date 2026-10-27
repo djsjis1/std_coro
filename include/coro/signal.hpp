@@ -407,8 +407,13 @@ namespace coro {
 
             // ── 全局信号基础设施 (进程级单例) ──
             struct global_signal_state {
-                int rfd = -1; ///< reader 端 (非阻塞)
-                int wfd = -1; ///< handler 端 (非阻塞)
+                // 原子: wfd 会被任意收到信号的线程的 handler 读取, 初始化写在
+                // call_once 内 —— 与"初始化后才启动的线程"有 happens-before,
+                // 但与"初始化前就已启动、随后才第一次收到信号"的线程没有
+                // (TSan 实测报 race)。信号处理器内只能做无锁操作, 用 relaxed
+                // 原子读即可: 值要么是 -1 (no-op), 要么是已发布的 fd。
+                std::atomic<int> rfd{-1}; ///< reader 端 (非阻塞)
+                std::atomic<int> wfd{-1}; ///< handler 端 (非阻塞)
                 std::thread reader_thread;
                 std::atomic<bool> stopped{false};
                 std::mutex managers_mtx;
@@ -427,10 +432,10 @@ namespace coro {
                     stopped.store(true, std::memory_order_release);
                     if (reader_thread.joinable())
                         reader_thread.join();
-                    if (rfd >= 0)
-                        ::close(rfd);
-                    if (wfd >= 0)
-                        ::close(wfd);
+                    if (rfd.load(std::memory_order_relaxed) >= 0)
+                        ::close(rfd.load(std::memory_order_relaxed));
+                    if (wfd.load(std::memory_order_relaxed) >= 0)
+                        ::close(wfd.load(std::memory_order_relaxed));
                 }
 
                 /// 建立 self-pipe + reader 线程 (不装任何 sigaction;
@@ -440,8 +445,8 @@ namespace coro {
                         int fds[2] = {-1, -1};
                         if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0)
                             return; // 拿不到管道: 后续 write 分支自然 no-op, 不崩溃
-                        rfd = fds[0];
-                        wfd = fds[1];
+                        rfd.store(fds[0], std::memory_order_relaxed);
+                        wfd.store(fds[1], std::memory_order_relaxed);
                         reader_thread = std::thread([this] { reader_loop(); });
                     });
                 }
@@ -472,10 +477,11 @@ namespace coro {
 
                 /// 投递一条记录。信号上下文与普通上下文共用; 失败走合并位图。
                 void post(int sig) noexcept {
-                    if (wfd < 0)
+                    const int fd = wfd.load(std::memory_order_relaxed);
+                    if (fd < 0)
                         return;
                     const unsigned char rec = static_cast<unsigned char>(sig & 0x7F);
-                    if (::write(wfd, &rec, 1) != 1)
+                    if (::write(fd, &rec, 1) != 1)
                         mark_pending(sig);
                 }
 
@@ -565,12 +571,13 @@ namespace coro {
 
             // reader_loop 定义 (需要 manager 完整类型)
             inline void global_signal_state::reader_loop() {
+                const int read_fd = rfd.load(std::memory_order_relaxed);
                 while (!stopped.load(std::memory_order_acquire)) {
-                    struct pollfd pfd = {.fd = rfd, .events = POLLIN};
+                    struct pollfd pfd = {.fd = read_fd, .events = POLLIN};
                     const int pr = ::poll(&pfd, 1, 200);
                     if (pr > 0 && (pfd.revents & POLLIN)) {
                         unsigned char rec = 0;
-                        while (::read(rfd, &rec, 1) == 1)
+                        while (::read(read_fd, &rec, 1) == 1)
                             dispatch(rec); // 逐字节: 每个字节就是一条独立记录
                     }
                     // 管道满期间被合并的信号在这里补发

@@ -168,8 +168,7 @@ namespace coro {
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"。
         /// 排空状态机只有一处实现 (supervisor), 不让两条路径各自等待同一份计数。
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
-                                      std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace, std::chrono::milliseconds cancel_grace) {
             if (grace.count() < 0 || cancel_grace.count() < 0)
                 throw std::invalid_argument("shutdown grace periods must be non-negative");
             if (state_->phase_value.load() == phase::idle) {
@@ -190,9 +189,7 @@ namespace coro {
             co_return last_report_;
         }
 
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
-            return shutdown(grace, config_.cancel_grace);
-        }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) { return shutdown(grace, config_.cancel_grace); }
 
         Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
@@ -237,8 +234,8 @@ namespace coro {
         /// 不代表监听本身坏了, 继续监听才是对的。
         static bool transient_accept_error(int native) noexcept {
 #ifdef _WIN32
-            return native == WSAEINTR || native == WSAECONNRESET || native == WSAECONNABORTED ||
-                   native == WSAEMFILE || native == WSAENOBUFS || native == WSAEWOULDBLOCK;
+            return native == WSAEINTR || native == WSAECONNRESET || native == WSAECONNABORTED || native == WSAEMFILE ||
+                   native == WSAENOBUFS || native == WSAEWOULDBLOCK;
 #else
             return native == EINTR || native == ECONNABORTED || native == EMFILE || native == ENFILE ||
                    native == ENOBUFS || native == EAGAIN || native == EWOULDBLOCK;

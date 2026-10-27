@@ -57,6 +57,10 @@ namespace coro {
             EventLoop* waiter_loop = nullptr;
             std::vector<std::exception_ptr> exceptions;        // 子任务失败集合 (事件循环线程)
             std::vector<std::shared_ptr<Task<void>>> monitors; // 用于组取消
+            // 已完成的 monitor 留在表里无害: 所有取消遍历 (record_failure/
+            // cancel/on_cancel_requested/on_waiter_destroyed) 都以 !is_ready()
+            // 过滤; 列表在组完成时由 complete() 一次性清空释放 (O(N) 总开销,
+            // 逐个摘除是 O(N²))。
             bool cancel_requested = false; // 已有失败, 正在取消其余
             bool parent_cancelled = false; // 父任务在 wait() 期间被取消
 
@@ -90,30 +94,6 @@ namespace coro {
                 waiter_loop = nullptr;
             }
 
-            /// monitor 收尾时把自己从活跃列表摘除。
-            ///
-            /// 直接 erase 是安全的: monitor 帧的 self 参数本身就是 mon 的一个
-            /// shared_ptr 拷贝 (协程参数按值拷入帧), 在帧销毁 (co_return →
-            /// final_suspend → 帧析构) 之前它一直持有引用 —— erase 后引用
-            /// 计数 ≥1, Task 与帧都活到 monitor 自然结束; 帧析构销毁帧参数,
-            /// 届时引用归零, Task 析构是 no-op (handle_ 已被 release_handle
-            /// 置空)。取消遍历 (cancel/record_failure/on_waiter_destroyed)
-            /// 也不再看到已完成的 monitor。
-            ///
-            /// (曾考虑把摘除的 mon 缓存到 state 的 zombies 列表延迟释放 ——
-            /// 已否决: 帧参数保活使它毫无必要, 只会让长寿命组的内存随完成
-            /// 的子任务数线性增长。真正的泄漏源是"被拒 spawn 先建帧后 throw",
-            /// 已由 spawn 的前置检查根治。)
-            void retire(const Task<void>* self) {
-                std::lock_guard lock(mutex);
-                for (auto it = monitors.begin(); it != monitors.end(); ++it) {
-                    if (it->get() == self) {
-                        monitors.erase(it); // 帧的 self 参数保证 mon 活到帧销毁
-                        return;
-                    }
-                }
-            }
-
             /// self 为裸指针: 只做身份比较, 少两次原子增减。
             /// self 在本次调用期间由 monitor 帧的 self 参数 (shared_ptr) 保活。
             std::vector<std::shared_ptr<Task<void>>> record_failure(std::exception_ptr error, const Task<void>* self) {
@@ -143,13 +123,25 @@ namespace coro {
                 std::coroutine_handle<> h;
                 EventLoop* loop = nullptr;
                 std::lock_guard lock(mutex);
-                if (--remaining == 0 && waiter) {
-                    h = waiter;
-                    loop = waiter_loop;
-                    waiter = nullptr;
-                    waiter_loop = nullptr;
-                    loop->schedule(h);
+                if (--remaining == 0) {
+                    // 组完成: 一次性清空 monitor 表并释放容量。
+                    // 安全性: remaining==0 ⟺ 所有 monitor 都已执行过本函数,
+                    // 它们要么早已随帧结束销毁, 要么 (当前这个) 仍由自己帧的
+                    // self 参数持有 —— 清表不销毁任何运行中的帧, Task 析构
+                    // 因 handle_ 已被 release_handle 置空而是 no-op。
+                    // 已完成者留在表中本就无害 (取消遍历以 !is_ready() 过滤),
+                    // 这里清空纯粹是释放内存 + 让组结束后的遍历变空转。
+                    monitors.clear();
+                    std::vector<std::shared_ptr<Task<void>>>().swap(monitors);
+                    if (waiter) {
+                        h = waiter;
+                        loop = waiter_loop;
+                        waiter = nullptr;
+                        waiter_loop = nullptr;
+                    }
                 }
+                if (h && loop)
+                    loop->schedule(h);
             }
 
             size_t pending() const noexcept {
@@ -355,10 +347,9 @@ namespace coro {
         template <typename T>
         Task<void> task_group_monitor(std::shared_ptr<Task<void>> self, std::shared_ptr<Task<T>> task_ptr,
                                       std::shared_ptr<task_group_state> state) {
-            // self 以 shared_ptr 进帧 (协程参数拷入帧): retire() 把 mon 从
-            // 活跃列表 erase 后, 帧参数仍持有引用, 保证 monitor 运行期间
-            // mon 必然存活; 帧析构时参数析构, 引用归零, Task 析构是 no-op。
-            // (生命周期完整论证见 task_group_state::retire 注释)
+            // self 以 shared_ptr 进帧 (协程参数拷入帧): 它是 monitor 运行期间
+            // mon 的保底持有者 —— 组完成时 complete() 清空 monitors 表、或
+            // 任何取消遍历发生时, 本帧都因这个参数而存活到自然结束。
             bool forward_cancel = false;
             try {
                 (void)co_await *task_ptr; // 左值: 不移动原任务
@@ -389,9 +380,8 @@ namespace coro {
                 }
             }
 
-            // 全部结束: 从活跃列表摘除自己 (取消遍历不再看到; 生命周期论证
-            // 见 retire), 再唤醒 wait() 调用者
-            state->retire(self.get());
+            // 全部结束: 最后一个完成的 monitor 在 complete() 里清空 monitor
+            // 表 (组生命周期论证见 task_group_state::complete), 并唤醒 wait()
             state->complete();
             co_return;
         }

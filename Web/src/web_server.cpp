@@ -77,9 +77,10 @@ bool web_server::listen(const char* ip, unsigned short port) {
 
 void web_server::stop() {
     running_.store(false, std::memory_order_release); // 通知 serve() 且阻止新连接注册
-    listener_.close();                                // 关键: 仅设 flag 不够, 因为 accept 正阻塞在 IOCP 上等待新连接.
+    // 关键: 仅设 flag 不够, 因为 accept 正阻塞在 IOCP 上等待新连接.
     // 关闭监听 socket 后, 挂起的 AcceptEx 会立即以错误完成包返回,
     // 这样 accept_noattach() 才会解除挂起, serve() 循环才能检查到 running_==false 并退出
+    listener_.close();
 
     // 保留 shared_ptr 快照后再解锁并 shutdown，避免持锁调用系统 API，
     // 也保证 worker 同时完成连接、从集合移除时对象仍然存活。

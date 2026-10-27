@@ -1,0 +1,4 @@
+# web_shutdown_check: 多个测试线程同时 raise 同一信号时, 各线程的信号处理器
+# 会并发向 self-pipe 写入。单字节 write 对 PIPE_BUF 是 POSIX 原子的, 内核
+# 保证不交错; TSan 不建模管道原子性, 故按符号抑制 (仅此一处, 不整类关闭)。
+race:coro::signal::detail_signal::global_signal_state::post

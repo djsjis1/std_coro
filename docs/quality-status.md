@@ -98,6 +98,16 @@ Linux inotify 递归实现会初始遍历子目录，维护 wd 到相对路径�
 并跟踪新建、移入和重命名的子目录；发布前仍需在 Linux 目标内核上做高频变更与
 `IN_Q_OVERFLOW` 压力验证。
 
+**Linux 同 fd 多挂起 accept 未验证**: 压测的场景 32（32 个 accept 同时挂起）
+仅在 Windows 运行 —— Linux/io_uring（ubuntu-24.04, 内核 6.8 CI 实测）下
+同 fd 多挂起 accept 只完成每个 acceptor 的首个（期望 1000 实际 32，零错误），
+内核语义与场景期望不符，因此该场景对 Linux 关闭。**Windows/IOCP 同样不可
+依赖**：在前序场景遗留大量 TIME_WAIT/句柄时，多挂起 AcceptEx 也会间歇性
+只完成每个 acceptor 的首个（约 1/3 复现，零错误），因此场景 32 已降级为
+观测性场景（只报错误数，完成量不作合同）。accept 功能的可靠覆盖是串行
+重提交场景（场景 9/10）；"多个挂起 accept"这一服务器模型前提在两个平台
+上都需要单独设计用例确认后再下结论。
+
 Web 示例的 `stop()` 会关闭监听并对全部活动连接执行双向 shutdown，唤醒挂起的
 accept/read/write；`wait_all()` 随后等待连接协程在各自 worker 上安全释放句柄。
 

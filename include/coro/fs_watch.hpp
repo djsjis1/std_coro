@@ -332,8 +332,9 @@ namespace coro {
             return watch_owned(std::string(path), recursive);
         }
 
-        // cppcheck-suppress passedByValue: 协程入口 —— path 必须按值进协程帧,
-        // 调用点的临时 string 在首次恢复前就析构 (const& 反而制造悬空)
+        // 协程入口: path 必须按值进协程帧, 调用点的临时 string 在首次恢复前
+        // 就析构 (const& 反而制造悬空)
+        // cppcheck-suppress passedByValue
         inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive) {
             std::wstring w;
             {
@@ -748,8 +749,9 @@ namespace coro {
             return watch_owned(std::string(path), recursive);
         }
 
-        // cppcheck-suppress passedByValue: 协程入口 —— path 必须按值进协程帧,
-        // 调用点的临时 string 在首次恢复前就析构 (const& 反而制造悬空)
+        // 协程入口: path 必须按值进协程帧, 调用点的临时 string 在首次恢复前
+        // 就析构 (const& 反而制造悬空)
+        // cppcheck-suppress passedByValue
         inline Task<DirectoryWatcher> watch_owned(std::string path, bool recursive) {
             int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
             if (fd < 0) {

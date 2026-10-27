@@ -173,8 +173,7 @@ namespace coro {
         }
 
         /// 可 await 的优雅关闭: 触发停止接入, 然后等 supervisor 走完"排空 → 到点取消"
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace,
-                                      std::chrono::milliseconds cancel_grace) {
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace, std::chrono::milliseconds cancel_grace) {
             if (grace.count() < 0 || cancel_grace.count() < 0)
                 throw std::invalid_argument("shutdown grace periods must be non-negative");
             if (state_->phase_value.load() == phase::idle) {
@@ -195,9 +194,7 @@ namespace coro {
             co_return last_report_;
         }
 
-        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) {
-            return shutdown(grace, config_.cancel_grace);
-        }
+        Task<ShutdownReport> shutdown(std::chrono::milliseconds grace) { return shutdown(grace, config_.cancel_grace); }
 
         Task<ShutdownReport> shutdown() { return shutdown(config_.shutdown_grace, config_.cancel_grace); }
 
@@ -273,8 +270,7 @@ namespace coro {
             std::shared_ptr<state> st;
             size_t bytes;
             byte_reservation(std::shared_ptr<state> owner, size_t n) : st(std::move(owner)), bytes(n) {}
-            byte_reservation(byte_reservation&& other) noexcept
-                : st(std::move(other.st)), bytes(other.bytes) {}
+            byte_reservation(byte_reservation&& other) noexcept : st(std::move(other.st)), bytes(other.bytes) {}
             byte_reservation(const byte_reservation&) = delete;
             ~byte_reservation() {
                 if (st)
