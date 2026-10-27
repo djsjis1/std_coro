@@ -33,9 +33,10 @@ namespace {
 
     // ── 测试用临时文件路径 (各用例名字唯一, 结束时清理) ──
     std::string tmp_path(const char* name) {
-        std::string dir = env_value("TEMP");   // Windows
+        // Windows 用 TEMP, Linux 用 TMPDIR; 都没有就退到当前目录
+        std::string dir = env_value("TEMP");
         if (dir.empty())
-            dir = env_value("TMPDIR");         // Linux
+            dir = env_value("TMPDIR");
         if (dir.empty())
             dir = ".";
         return dir + "/" + name + ".tmp";
