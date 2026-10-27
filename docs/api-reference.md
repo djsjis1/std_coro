@@ -448,7 +448,7 @@ auto sock = co_await coro::net::connect(eps[0]);               // 端点直接�
 - **v1 只返回 IPv4**：`net.hpp` 目前只构造 `sockaddr_in`，返回 v6 地址等于交给调用方一个
   连不上的东西；等 `net.hpp` 支持 `sockaddr_in6` 再放开。
 - 不做结果缓存与 happy-eyeballs 排序（属连接池 / HTTP Client 层策略），不做反向解析。
-- 系统解析失败抛 `coro::net::DnsResolutionError`，保留旧 detail 名字的兼容别名；
+- 系统解析失败抛 `coro::net::DnsResolutionError`，保留旧 detail 名字的兼容别名；该异常继承 `coro::Error`，可用 `catch (const coro::Error&)` 统一兜底（定义已收口到 `exceptions.hpp`）。
   Windows 上解析会先初始化 Winsock，不要求调用者先创建 socket。
 - 测试刻意用**非法服务名**触发失败而非"未知主机"：本机存在把任意域名（含 RFC 6761 保留的
   `.invalid`）解析到 198.18.0.8 的拦截器，用主机名断言会变成分环境偶发。

@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <string>
+#include <string_view>
 #include <utility>
 
 // ============================================================================
@@ -40,6 +42,16 @@
 namespace coro {
 #ifdef _WIN32
     namespace detail {
+        /// UTF-8 → UTF-16 (Windows API 需要宽字符路径/命令行)。
+        /// fs/process 各自维护过一份同名实现, 收口到此以免两份转换逻辑漂移。
+        inline std::wstring utf8_to_wide(std::string_view s) {
+            int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+            std::wstring w((size_t)(n > 0 ? n : 0), L'\0');
+            if (n > 0)
+                MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+            return w;
+        }
+
         /// 当前事件循环的 IOCP 事件源 (memo 化类型化访问器)。
         /// EventLoop 本体不再声明平台类型 (解耦: 核心不知道平台细节), 类型
         /// 解析收口在 IO 底座: 热路径 = 1 次 TLS 读 + 2 次标量比较, 与旧的

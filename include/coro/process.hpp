@@ -94,14 +94,6 @@ namespace coro {
                 r += '"';
                 return r;
             }
-
-            inline std::wstring utf8_to_wide(std::string_view s) {
-                int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-                std::wstring w((size_t)(n > 0 ? n : 0), L'\0');
-                if (n > 0)
-                    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-                return w;
-            }
         } // namespace detail_proc
 
         class Process {
@@ -290,7 +282,7 @@ namespace coro {
                     cmdline += ' ';
                 cmdline += detail_proc::quote_arg(args[i]);
             }
-            std::wstring wcmd = detail_proc::utf8_to_wide(cmdline);
+            std::wstring wcmd = ::coro::detail::utf8_to_wide(cmdline);
             // CreateProcessW 要求可写缓冲
             std::vector<wchar_t> cmd_buf(wcmd.begin(), wcmd.end());
             cmd_buf.push_back(L'\0');

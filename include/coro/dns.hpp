@@ -53,13 +53,10 @@
 
 namespace coro {
     namespace net {
-        /// DNS 解析失败: 携带 getaddrinfo 的返回码, 调用方要能区分"查不到"与"网络故障"。
-        class DnsResolutionError : public std::runtime_error {
-          public:
-            DnsResolutionError(const std::string& host, int code, const char* detail)
-                : std::runtime_error("resolve \"" + host + "\" failed: " + detail), code(code) {}
-            int code; ///< getaddrinfo 返回码 (EAI_NONAME/EAI_AGAIN/...)
-        };
+        /// DNS 解析失败异常定义在 exceptions.hpp (库异常唯一定义点), 这里只做
+        /// 命名空间转继: 既有 `coro::net::DnsResolutionError` / `coro::detail::DnsResolutionError`
+        /// 写法全部继续有效, 但不再另建一条继承链绕过 coro::Error。
+        using ::coro::DnsResolutionError;
     } // namespace net
 
     namespace detail {

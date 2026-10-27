@@ -11,8 +11,9 @@
 //
 // 收口约定:
 //   - 本头是库异常的唯一事实源, 不依赖任何其他 coro 头 (分层第 0 层);
-//     CancelledError/TimeoutError (原 task.hpp) 与 ClosedChannelError
-//     (原 channel.hpp) 已迁入此处。
+//     CancelledError/TimeoutError (原 task.hpp)、ClosedChannelError
+//     (原 channel.hpp) 与 DnsResolutionError (原 dns.hpp) 已迁入此处。
+//     迁移后在原头里只保留 using 声明维持源码兼容, 不再另立继承链。
 //   - 所有库异常继承公共根 coro::Error : std::runtime_error, 调用方可用
 //     catch (const coro::Error&) 兜底库内错误, 不必逐个列举、也不会误捕
 //     业务代码抛出的裸 std::runtime_error 之外的类型。
@@ -41,6 +42,25 @@ namespace coro {
       public:
         explicit Error(const std::string& message) : std::runtime_error(message) {}
         explicit Error(const char* message) : std::runtime_error(message) {}
+    };
+
+    // ============================================================================
+    // DnsResolutionError — 主机名解析失败 (对标 Python socket.gaierror)
+    // ============================================================================
+    //
+    //   携带 getaddrinfo 的返回码, 调用方要能区分"查不到"(EAI_NONAME) 与
+    //   "网络/配置故障"(EAI_AGAIN 等)。继承 coro::Error: 调用方的
+    //   catch (const coro::Error&) 兜底不会漏掉解析失败。
+    //
+    //   用法:
+    //     try { auto eps = co_await coro::net::resolve("x"); }
+    //     catch (const coro::DnsResolutionError& e) { errno = e.code; }
+    // ============================================================================
+    class DnsResolutionError : public Error {
+      public:
+        DnsResolutionError(const std::string& host, int code, const char* detail)
+            : Error("resolve \"" + host + "\" failed: " + detail), code(code) {}
+        int code; ///< getaddrinfo 返回码 (EAI_NONAME/EAI_AGAIN/...)
     };
 
     // ============================================================================

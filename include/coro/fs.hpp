@@ -87,17 +87,6 @@ namespace coro {
         // Windows 实现 — IOCP 文件 IO
         // ==================================================================
 
-        namespace detail_fs {
-            /// UTF-8 → UTF-16 (Windows API 需要宽字符路径)
-            inline std::wstring utf8_to_wide(std::string_view s) {
-                int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-                std::wstring w((size_t)(n > 0 ? n : 0), L'\0');
-                if (n > 0)
-                    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-                return w;
-            }
-        } // namespace detail_fs
-
         class File {
           public:
             File() = default;
@@ -309,7 +298,7 @@ namespace coro {
             else
                 creation = OPEN_EXISTING; // "r" 语义
 
-            HANDLE h = CreateFileW(detail_fs::utf8_to_wide(path).c_str(), access,
+            HANDLE h = CreateFileW(::coro::detail::utf8_to_wide(path).c_str(), access,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, creation,
                                    FILE_FLAG_OVERLAPPED, nullptr);
             if (h == INVALID_HANDLE_VALUE)
@@ -322,7 +311,7 @@ namespace coro {
         inline stat_info stat(std::string_view path) {
             stat_info st;
             WIN32_FILE_ATTRIBUTE_DATA fa;
-            if (!GetFileAttributesExW(detail_fs::utf8_to_wide(path).c_str(), GetFileExInfoStandard, &fa)) {
+            if (!GetFileAttributesExW(::coro::detail::utf8_to_wide(path).c_str(), GetFileExInfoStandard, &fa)) {
                 io::set_error((int)GetLastError());
                 return st; // exists = false
             }
