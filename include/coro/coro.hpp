@@ -4,6 +4,16 @@
 // coro - C++20 coroutine event loop framework (like Python asyncio)
 // ============================================================================
 //
+// 本头是**核心子集**伞头: 协程/调度/定时/同步/并发组合器。
+// 它不包含带平台依赖或 CMake 开关的模块 —— 全量聚合会让 core-only 构建
+// (CORO_ENABLE_NATIVE_IO=OFF) 也被拉进原生 I/O 头。其余模块按需单独 include:
+//
+//   net / dns / fs / fs_watch / pipe / process / unix   → 原生 I/O (CORO_ENABLE_NATIVE_IO)
+//   channel / select / stream / pool / rate_limit / timer / signal / context
+//                                                       → 平台无关, 按需引入
+//   task_registry                                       → 任务登记与关停
+//   http / http_client / tls                            → 需对应 CMake 开关
+//
 // Quick start:
 //   #include <coro/coro.hpp>
 //
