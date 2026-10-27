@@ -606,8 +606,11 @@ current_uring()`（每线程每事件源一次 dynamic_cast，热路径一次指
 | 文件 | 主题 |
 |---|---|
 | task.hpp | Task / promise / cancel |
-| net.hpp | TCP/UDP（IOCP/io_uring） |
-| wait.hpp | wait_for / wait_any / wait_tasks / gather_all |
+| net.hpp | TCP/UDP 入口（选择平台实现） |
+| net_iocp.hpp | TCP/UDP 的 Windows IOCP 实现 |
+| net_uring.hpp | TCP/UDP 的 Linux io_uring 实现 |
+| net_common.hpp | 两个平台实现共用的平台无关件 |
+| wait.hpp | wait_for / wait_tasks（wait_any、gather_all 为弃用适配） |
 | event_loop.hpp | 循环核心 |
 | fs.hpp | 文件 IO |
 | fs_watch.hpp | 目录监视 |
