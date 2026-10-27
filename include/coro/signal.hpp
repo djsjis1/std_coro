@@ -458,7 +458,7 @@ namespace coro {
                 /// 重复安装同一 handler 无副作用, 无需去重集合。
                 void ensure_installed(int sig) {
                     ensure_initialized();
-                    struct sigaction sa{};
+                    struct sigaction sa {};
                     sa.sa_handler = &global_signal_state::signal_handler;
                     // SA_RESTART: 处理器是进程级的 —— 没有 RESTART 时, 任何
                     // 线程收到允许的信号都会让该线程当前的阻塞系统调用以
@@ -472,7 +472,7 @@ namespace coro {
 
                 /// 恢复默认处置 (disallow 且无等待者时)
                 void restore_default(int sig) {
-                    struct sigaction sa{};
+                    struct sigaction sa {};
                     sa.sa_handler = SIG_DFL;
                     sigemptyset(&sa.sa_mask);
                     sigaction(sig, &sa, nullptr);
