@@ -100,6 +100,24 @@ namespace coro {
 
         class UnixListener;
 
+        /// connect 阶段的 fd 所有权: 协程在 poll 挂起点被取消时会直接展开栈帧,
+        /// fd 若只是局部变量就泄漏 (每次取消少一个描述符, 长期运行必然耗尽)。
+        /// 成功交出所有权前进出一律由本守卫负责。
+        struct pending_fd {
+            int fd;
+            explicit pending_fd(int value) noexcept : fd(value) {}
+            pending_fd(const pending_fd&) = delete;
+            pending_fd& operator=(const pending_fd&) = delete;
+            ~pending_fd() { reset(); }
+            void reset() noexcept {
+                if (fd >= 0) {
+                    ::close(fd);
+                    fd = -1;
+                }
+            }
+            int release() noexcept { return std::exchange(fd, -1); }
+        };
+
         /// Unix 流式连接端
         class UnixStream {
             friend class UnixListener;
@@ -256,27 +274,29 @@ namespace coro {
                 int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
                 if (fd < 0)
                     co_return UnixStream{};
+                pending_fd guard{fd};
                 const socklen_t alen = unix_address_length(addr);
                 if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), alen) != 0) {
                     if (errno != EINPROGRESS) {
                         const int saved = errno;
-                        ::close(fd);
+                        guard.reset();
                         errno = saved;
                         co_return UnixStream{};
                     }
-                    // 连接进行中: 挂起等待可写 (poll_awaiter 自带取消钩子)
+                    // 连接进行中: 挂起等待可写 (poll_awaiter 自带取消钩子)。
+                    // 取消会从挂起点抛出 CancelledError, 栈帧展开时由 guard 关 fd。
                     const uint32_t revents = co_await coro::io::poll(fd, POLLOUT);
                     int so_error = 0;
                     socklen_t optlen = sizeof(so_error);
                     if (revents == 0 || ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &optlen) != 0 ||
                         so_error != 0) {
                         const int saved = so_error != 0 ? so_error : (revents == 0 ? errno : EIO);
-                        ::close(fd);
+                        guard.reset();
                         errno = saved;
                         co_return UnixStream{};
                     }
                 }
-                co_return UnixStream{fd};
+                co_return UnixStream{guard.release()};
             }
 
           private:

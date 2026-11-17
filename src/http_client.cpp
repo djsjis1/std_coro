@@ -619,6 +619,10 @@ namespace coro {
         // 从而丢失 keep-alive 判定所需的 F_CONTENT_LENGTH/F_CHUNKED。暂停模式下
         // 我们在暂停处自己停手, flags 保留, parser.keep_alive() 才是可信的。
         s->parser.pause_after_message(true);
+        // HEAD 响应按合同没有响应体 (只有头部里的 Content-Length)。不把这一点告诉
+        // 解析器, llhttp 会继续等一段永远不会到来的 body, stream() 于是在头部之后
+        // 卡到超时 —— request() 走 read_response 时已按 request.method 设过同一个开关。
+        s->parser.response_to_head(request.method == "HEAD");
         s->parser.headers_complete = [raw = s.get()] { raw->headers_ready = true; };
         s->parser.body = [raw = s.get()](const char* at, std::size_t len) {
             raw->body_bytes += len;

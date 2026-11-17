@@ -239,6 +239,33 @@ namespace {
         co_return;
     }
 
+    // rendezvous 通道没有缓冲位置可退回: 归还的值同样不能丢
+    coro::Task<> cancelled_receiver_on_rendezvous(int* next_got, int* sender_ok) {
+        auto ch = coro::channel<int>::rendezvous();
+        auto tx = ch.make_sender();
+        auto rx = ch.make_receiver();
+
+        auto dying = coro::spawn(recv_value_or_minus_one(rx));
+        co_await coro::yield(); // 接收者挂起在候选队列里
+
+        *sender_ok = tx.try_send(7) ? 1 : 0; // 直接交付给已挂起的接收者
+        // 它在恢复前被取消: await_resume 不会执行
+        dying.cancel();
+
+        try {
+            (void)co_await dying;
+        } catch (const coro::CancelledError&) {
+        }
+
+        try {
+            *next_got = co_await coro::wait_for(recv_value_or_minus_one(rx), 100ms);
+        } catch (const coro::TimeoutError&) {
+            *next_got = -1; // 值丢了: 容量 0 没有可退回的缓冲位置
+        }
+        tx.close();
+        co_return;
+    }
+
 } // namespace
 
 TEST(ChannelTest, BoundedKeepsFifo) {
@@ -311,6 +338,13 @@ TEST(ChannelTest, CancelledReceiverReturnsDeliveredValue) {
     int next_got = 0;
     test_util::run_task([&] { return cancelled_receiver_returns_value(&next_got); });
     EXPECT_EQ(next_got, 7) << "已交付的值在接收方取消后丢失了 (对端以为发送成功)";
+}
+
+TEST(ChannelTest, CancelledReceiverOnRendezvousKeepsValue) {
+    int next_got = 0, sender_ok = 0;
+    test_util::run_task([&] { return cancelled_receiver_on_rendezvous(&next_got, &sender_ok); });
+    EXPECT_EQ(sender_ok, 1);
+    EXPECT_EQ(next_got, 7) << "rendezvous 通道上已交付的值在接收方取消后丢失了";
 }
 
 #endif // CORO_HAS_CONCURRENCY_EXT

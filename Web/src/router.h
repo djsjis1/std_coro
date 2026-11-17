@@ -270,8 +270,17 @@ class router {
             // 返回 0 表示从位置 0 开始匹配成功
             // 必须按完整路径段匹配; 否则 mount="/static" 会错误匹配
             // "/static-secret" 并把它映射到静态目录根。
-            const bool mount_match =
-                path == mpath || (path.size() > mpath.size() && path.rfind(mpath, 0) == 0 && path[mpath.size()] == '/');
+            // 根挂载 "/" 需单独处理: 上面的公式要求 path[mpath.size()] == '/',
+            // 对 mpath="/" 等于要求 path[1] 是 '/', 于是除 "/" 本身外全部不匹配 ——
+            // 根挂载形同虚设。根前缀就是整个命名空间, 任何以 '/' 开头的路径都命中。
+            bool mount_match = false;
+            if (mpath == "/") {
+                mount_match = !path.empty() && path.front() == '/';
+            } else if (path == mpath) {
+                mount_match = true;
+            } else if (path.size() > mpath.size() && path.rfind(mpath, 0) == 0) {
+                mount_match = path[mpath.size()] == '/';
+            }
             if (!mount_match)
                 continue; // 不匹配这个挂载点, 试下一个
 

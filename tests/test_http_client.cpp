@@ -413,6 +413,25 @@ namespace {
         co_await join_peer(server);
     }
 
+    // stream() 的 HEAD 响应: 头部之后没有响应体, 不能按 Content-Length 等一段永远不来的 body
+    coro::Task<> stream_head_scenario(peer* p, stream_probe* out) {
+        coro::HttpClient client;
+        auto server = coro::spawn(script_once(p, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"));
+        try {
+            coro::HttpRequest request;
+            request.method = "HEAD";
+            request.url = p->url();
+            auto stream = co_await coro::wait_for(client.stream(std::move(request)), 2000ms);
+            out->status = stream.status();
+            auto chunk = co_await stream.read_chunk();
+            out->eof = !chunk.has_value();
+            co_await stream.aclose();
+        } catch (const std::exception& e) {
+            out->error = e.what();
+        }
+        co_await join_peer(server);
+    }
+
     // ── 随机脏数据输入 (C05 fuzz-lite): 只要求“不挂死、不崩溃、可观察失败”──
     coro::Task<> script_garbage(peer* p, unsigned seed) {
         auto conn = co_await p->listener.accept();
@@ -526,6 +545,16 @@ TEST(HttpClientTest, HeadResponseHasNoBody) {
     ASSERT_TRUE(result.ok()) << result.error;
     EXPECT_EQ(result.status, 200);
     EXPECT_TRUE(result.body.empty()) << "HEAD 响应按合同不读响应体";
+}
+
+TEST(HttpClientTest, StreamHeadResponseHasNoBody) {
+    peer p;
+    ASSERT_TRUE(p.start());
+    stream_probe probe;
+    test_util::run_task([&]() -> coro::Task<> { co_await stream_head_scenario(&p, &probe); });
+    ASSERT_TRUE(probe.error.empty()) << probe.error;
+    EXPECT_EQ(probe.status, 200);
+    EXPECT_TRUE(probe.eof) << "HEAD 响应不该有响应体";
 }
 
 TEST(HttpClientTest, EmptyBodyResponse) {

@@ -6,6 +6,7 @@
 #include <coro/task_registry.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -240,6 +241,7 @@ namespace coro {
             std::atomic<size_t> bytes_dropped{0};
             std::atomic<size_t> truncated{0}; // 读满整个缓冲: 可能被截断 (见下方判定说明)
             std::atomic<size_t> pending_bytes{0};
+            std::atomic<size_t> recv_errors{0}; // recvfrom 瞬态错误次数 (不终止服务)
             std::atomic<int64_t> grace_ms{1000};
             std::atomic<int64_t> cancel_grace_ms{500};
             error_handler_t on_error;
@@ -294,8 +296,23 @@ namespace coro {
                 sockaddr_in sender{}; // 内核填入发送方 IP 与端口
                 int n = co_await socket_.recvfrom(recv_buf_.data(), recv_buf_.size(), &sender);
                 if (n < 0) {
-                    if (st->phase_value.load() == phase::running)
-                        report_error("recvfrom failed");
+                    if (st->phase_value.load() != phase::running)
+                        break;
+                    // recvfrom 的错误并非都是致命的: 先前的 sendto 打到无人监听的对端时,
+                    // 内核会把 ICMP 端口不可达挂到本 socket 的下一次收包上 (Windows 报
+                    // WSAECONNRESET/10054, Linux 报 ECONNREFUSED/EINTR)。任意一个客户端
+                    // 消失就让整个 UDP 服务停摆, 是这类服务最常见的事故形态。errno 已由
+                    // awaiter 按平台归一 (io::set_error), 所以只放行这些可恢复码。
+                    const int ec = errno;
+                    const bool transient = ec == ECONNRESET || ec == ECONNREFUSED || ec == EINTR || ec == EAGAIN ||
+                                           ec == EWOULDBLOCK || ec == ENOBUFS;
+                    if (transient) {
+                        // 只上报首次: 端口不可达可能持续回冲, 逐条回调会把错误日志淹掉。
+                        if (st->recv_errors.fetch_add(1) == 0)
+                            report_error("recvfrom transient error (continuing): " + std::to_string(ec));
+                        continue;
+                    }
+                    report_error("recvfrom failed");
                     break;
                 }
                 if (st->phase_value.load() != phase::running)

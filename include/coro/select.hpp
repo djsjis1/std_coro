@@ -172,7 +172,9 @@ namespace coro {
                     if (snode)
                         tx.disarm_for_select(snode);
                 } else if (rnode) {
-                    rx.disarm_for_select(rnode);
+                    // 已交付但还没被取走的值必须归还通道: select 被取消时协程栈直接
+                    // 展开, 不归还的话值随节点析构消失, 而发送方以为已经送达。
+                    rx.release_armed(rnode);
                 }
             }
 
@@ -280,6 +282,9 @@ namespace coro {
                             // 发送已提交 (值已离开本分支)
                         } else if (branch.rnode && branch.rnode->delivered) {
                             r.value = std::move(branch.rnode->value);
+                            // 取走后立即复位: optional 移动后源仍 engaged, 不复位会让
+                            // 收尾的 disarm() 把已交出去的值再归还给通道一次。
+                            branch.rnode->value.reset();
                         } else {
                             r.value = std::move(branch.inbound);
                         }

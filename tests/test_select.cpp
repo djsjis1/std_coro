@@ -86,6 +86,37 @@ namespace {
         co_return later.has_value() && *later == 5;
     }
 
+    coro::Task<int> recv_or_minus_one(coro::channel<int>::receiver rx) {
+        auto value = co_await rx.recv();
+        co_return value.value_or(-1);
+    }
+
+    /// select 自身被取消 (已交付但未恢复): 值必须归还通道
+    coro::Task<> cancelled_select_returns_value(int* next_got, int* send_ok) {
+        auto ch = coro::channel<int>::bounded(1);
+        auto tx = ch.make_sender();
+        auto rx = ch.make_receiver();
+
+        auto selecting = coro::spawn(coro::select(coro::recv_of(rx), coro::after(500ms)));
+        co_await coro::yield(); // select 已挂起, 接收分支登记完成
+
+        *send_ok = tx.try_send(9) ? 1 : 0; // 直接交付给 select 的接收分支
+        selecting.cancel();                // 恢复前取消 select 本身: 栈帧展开走 disarm
+
+        try {
+            (void)co_await std::move(selecting);
+        } catch (const coro::CancelledError&) {
+        }
+
+        try {
+            *next_got = co_await coro::wait_for(recv_or_minus_one(rx), 100ms);
+        } catch (const coro::TimeoutError&) {
+            *next_got = -1; // 值丢了: 后续接收者永远等不到
+        }
+        tx.close();
+        co_return;
+    }
+
 } // namespace
 
 TEST(SelectTest, ReadyBranchWinsImmediately) {
@@ -117,6 +148,13 @@ TEST(SelectTest, DefaultBranchDoesNotBlock) {
         *out = co_await default_branch_never_blocks(ch.make_receiver());
     }(&defaulted));
     EXPECT_TRUE(defaulted);
+}
+
+TEST(SelectTest, CancelledSelectReturnsDeliveredValue) {
+    int result[2] = {0, 0}; // [0] = next_got, [1] = send_ok
+    coro::run([](int* out) -> coro::Task<> { co_await cancelled_select_returns_value(&out[0], &out[1]); }(result));
+    EXPECT_EQ(result[1], 1);
+    EXPECT_EQ(result[0], 9) << "select 取消后已交付的值丢失了 (发送方以为已送达)";
 }
 
 TEST(SelectTest, SuspendedSelectGetsDelivered) {

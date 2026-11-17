@@ -167,14 +167,17 @@ namespace coro {
 
         /// 已交付出去的值又回到通道 (接收方在恢复前被取消)。
         /// 不能静默丢消息: 先交给下一个等待者 (FIFO 语义不变), 否则放回缓冲头部
-        /// —— 它本来就是这个通道里最早的值。缓冲已满时仍丢弃 (不破坏容量契约)。
-        template <typename T> inline bool channel_return_value(channel_state<T>& st, T value) {
+        /// —— 它本来就是这个通道里最早的值。
+        ///
+        /// **任何情形下都不丢弃**: 值已经离开发送方 (发送方认为已送达), 静默消失
+        /// 就是丢消息。rendezvous (容量 0) 根本没有可放的位置, 所以允许缓冲临时多
+        /// 存一格: channel_has_room() 用 '<' 比较, 多出的这一格会让后续 send 照常
+        /// 排队, 直到有人取走它 —— 容量约束的实际效果仍然成立, 只是把"无处安放的
+        /// 值"寄存在缓冲头部 (原实现此处 return false, 等于把值丢掉)。
+        template <typename T> inline void channel_return_value(channel_state<T>& st, T value) {
             if (channel_deliver(st, value))
-                return true;
-            if (!channel_has_room(st))
-                return false;
+                return;
             st.buffer.push_front(std::move(value));
-            return true;
         }
 
         /// 缓冲腾出位置后, 按 FIFO 把挂着的发送者搬进缓冲 (不插队, 保证公平)
@@ -499,6 +502,19 @@ namespace coro {
                 detail::channel_drop_receiver(*state_, node);
             }
 
+            /// 撤销登记, 并归还"已交付但尚未取走"的值 (select 被取消的路径)。
+            /// 与 channel_recv_awaiter 析构同一条合同: 已交付的值不得随节点析构消失。
+            /// **必须先摘链再归还**: 节点还在候选队列里时归还的值会被 channel_deliver
+            /// 重新交给这个即将销毁的节点, 等于原地丢掉一次。
+            void release_armed(const std::shared_ptr<detail::channel_receiver_waiter<T>>& node) const {
+                detail::channel_drop_receiver(*state_, node);
+                if (!node || !node->delivered || !node->value)
+                    return;
+                std::optional<T> value = std::move(node->value);
+                node->value.reset(); // 移动后源仍 engaged, 不复位会二次归还
+                detail::channel_return_value(*state_, std::move(*value));
+            }
+
             std::shared_ptr<detail::channel_state<T>> state_;
         };
 
@@ -651,8 +667,18 @@ namespace coro {
             std::optional<T> await_resume() {
                 if (!node)
                     return std::move(inline_value);
-                if (!node->delivered)
-                    return std::nullopt;
+                if (!node->delivered) {
+                    // 被唤醒去看 EOF, 但此刻缓冲里可能已经有值 (放行挂起的发送者时
+                    // promote 进了缓冲, 或归还路径把值放回缓冲头)。直接报 EOF 就是
+                    // 假 EOF: 值还在通道里, 调用方却以为流已结束。
+                    if (st->buffer.empty())
+                        return std::nullopt;
+                    channel_drop_receiver(*st, node);
+                    std::optional<T> value = std::move(st->buffer.front());
+                    st->buffer.pop_front();
+                    channel_promote_senders(*st);
+                    return value;
+                }
                 // 取值后立即清空节点: optional 的移动构造会让源保持 engaged,
                 // 不 reset 的话析构时会把已交出去的值又"归还"给通道一次。
                 std::optional<T> value = std::move(node->value);

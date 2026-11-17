@@ -25,6 +25,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -475,6 +477,30 @@ TEST(WebLayerTest, FrozenRouterRejectsRegistration) {
     EXPECT_THROW(r.post("/z", echo_handler), std::logic_error);
     EXPECT_THROW(r.add("PUT", "/w", echo_handler), std::logic_error);
     EXPECT_THROW(r.static_dir("/s", "/tmp"), std::logic_error);
+}
+
+// ── 根挂载 "/" 必须命中所有路径, 而不是只剩 "/" 自身 ──
+TEST(WebLayerTest, RootStaticMountServesNestedPaths) {
+    const auto dir = std::filesystem::temp_directory_path() / "coro_root_mount_test";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir / "hello.txt", std::ios::binary);
+        out << "root-mount";
+    }
+    int status = 0;
+    std::string body;
+    auto scenario = [&]() -> coro::Task<> {
+        router r;
+        r.static_dir("/", dir.string());
+        auto req = make_req("GET", "/hello.txt");
+        auto resp = co_await r.route(req);
+        status = resp.status;
+        body = resp.body;
+    };
+    test_util::run_task(scenario);
+    std::filesystem::remove_all(dir);
+    EXPECT_EQ(status, 200) << "根挂载 \"/\" 未匹配 /hello.txt";
+    EXPECT_EQ(body, "root-mount");
 }
 
 // ── 冻结后的 router 可被多线程只读并发使用 ──

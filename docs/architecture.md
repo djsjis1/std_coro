@@ -448,7 +448,10 @@ TaskGroup 的组取消在此基础上多两步：
 
 结论：`Queue` 保留自己的预留机制（不是 channel 的薄封装），新代码需要
 Go channel / `select` 多路仲裁时用 `channel`，需要 asyncio.Queue 语义时用 `Queue`。
-两边共同的“已交付值不静默消失”保证由 `channel_return_value` 在接收方取消时兜底。
+两边共同的“已交付值不静默消失”保证由 `channel_return_value` 在接收方取消时兜底；
+`select` 的分支节点被取消时经 `receiver::release_armed` 走同一条归还路径。容量 0 的
+`rendezvous` 没有可退回的位置，归还的值因此寄存在缓冲头部（临时多存一格，后续 `send`
+由 `channel_has_room()` 的 `<` 比较自然排队），不会再静默丢弃。
 
 ### future.hpp
 

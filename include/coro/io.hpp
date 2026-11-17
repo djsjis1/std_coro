@@ -247,6 +247,11 @@ namespace coro {
                 return;
             }
             io_uring_prep_cancel(sqe, op, 0);
+            // 取消请求自己也会带回一个 CQE: 必须显式置空 user_data。SQE 槽位是复用的,
+            // 不清零时这个完成包会带着上一笔操作的 user_data 回来, 被 process_cqe 当成
+            // 那个 op 的完成包再恢复一次协程 (双重恢复 / 访问已释放帧)。
+            // 与 UringEventSource::cancel_fd_ops 里的处理保持一致。
+            io_uring_sqe_set_data(sqe, nullptr);
             const int ret = io_uring_submit(u->handle());
             if (ret < 0)
                 io::set_error(-ret);
