@@ -65,12 +65,12 @@ namespace coro {
 
             ~TcpStream() { close(); }
 
-            TcpStream(TcpStream&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+            TcpStream(TcpStream&& other) noexcept : fd_(other.fd_.exchange(-1)) {}
 
             TcpStream& operator=(TcpStream&& other) noexcept {
                 if (this != &other) {
                     close();
-                    fd_ = std::exchange(other.fd_, -1);
+                    fd_.store(other.fd_.exchange(-1));
                 }
                 return *this;
             }
@@ -115,8 +115,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
-                        op.fd = stream->fd_; // close 前可按 fd 批量取消
-                        io_uring_prep_recv(sqe, stream->fd_, buf, len, 0);
+                        const int fd = stream->native();
+                        op.fd = fd; // close 前可按 fd 批量取消
+                        io_uring_prep_recv(sqe, fd, buf, len, 0);
                         detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
@@ -171,8 +172,9 @@ namespace coro {
                             EventLoop::get().schedule(h);
                             return;
                         }
-                        op.fd = stream->fd_; // close 前可按 fd 批量取消
-                        io_uring_prep_send(sqe, stream->fd_, buf, len, 0);
+                        const int fd = stream->native();
+                        op.fd = fd; // close 前可按 fd 批量取消
+                        io_uring_prep_send(sqe, fd, buf, len, 0);
                         detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
@@ -285,28 +287,35 @@ namespace coro {
             bool reattach() { return true; }
 
             void close() {
-                if (fd_ >= 0) {
-                    // 与 TcpListener/UdpSocket 同一合同: 挂起的 recv/send SQE
-                    // 持有文件引用, 仅 close 不会让它们完成 (事件循环会永久等待);
-                    // 先按 fd 提交取消, 再 shutdown 解除收发, 最后释放描述符。
-                    if (auto* u = detail::current_uring())
-                        u->cancel_fd_ops(fd_);
-                    ::shutdown(fd_, SHUT_RDWR);
-                    ::close(fd_);
-                    fd_ = -1;
-                }
+                const int fd = fd_.exchange(-1);
+                if (fd < 0)
+                    return;
+                // 与 TcpListener/UdpSocket 同一合同: 挂起的 recv/send SQE
+                // 持有文件引用, 仅 close 不会让它们完成 (事件循环会永久等待);
+                // 先按 fd 提交取消, 再 shutdown 解除收发, 最后释放描述符。
+                if (auto* u = detail::current_uring())
+                    u->cancel_fd_ops(fd);
+                ::shutdown(fd, SHUT_RDWR);
+                ::close(fd);
             }
 
             /// 中止收发但不关闭 fd；用于跨线程唤醒挂起 I/O，避免 fd 复用竞态。
             void shutdown() noexcept {
-                if (fd_ >= 0)
-                    ::shutdown(fd_, SHUT_RDWR);
+                const int fd = native();
+                if (fd >= 0)
+                    ::shutdown(fd, SHUT_RDWR);
             }
 
-            bool valid() const { return fd_ >= 0; }
+            /// fd 的原子快照。跨线程调用方 (shutdown / stop 路径) 必须用它,
+            /// 不要直接读成员 —— 直接读在 TSan 下就是数据竞争。
+            int native() const noexcept { return fd_.load(std::memory_order_acquire); }
+
+            bool valid() const { return native() >= 0; }
 
           private:
-            int fd_ = -1;
+            /// atomic 而非裸 int: shutdown() 允许从其他线程调用 (多线程服务器的
+            /// stop 路径) 并与 worker 线程上的 read/write/close 并发。
+            std::atomic<int> fd_{-1};
         };
 
         // ==================================================================
@@ -318,12 +327,12 @@ namespace coro {
 
             ~TcpListener() { close(); }
 
-            TcpListener(TcpListener&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+            TcpListener(TcpListener&& other) noexcept : fd_(other.fd_.exchange(-1)) {}
 
             TcpListener& operator=(TcpListener&& other) noexcept {
                 if (this != &other) {
                     close();
-                    fd_ = std::exchange(other.fd_, -1);
+                    fd_.store(other.fd_.exchange(-1));
                 }
                 return *this;
             }
@@ -333,22 +342,27 @@ namespace coro {
 
             /// 绑定并监听 (同步, 一次性; 零配置)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const { return local_port_of(fd_); }
+            unsigned short local_port() const { return local_port_of(native()); }
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
                 in_addr parsed{};
                 if (!detail_net::parse_ipv4(ip, parsed))
                     return false;
-                fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-                if (fd_ < 0)
+                const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                fd_.store(fd);
+                if (fd < 0)
                     return false;
+                // close() 可能来自其他线程 (服务器 stop), 必须记住拥有者 ring:
+                // 跨线程调用时 current_uring() 拿到的是调用线程的 ring 或 nullptr,
+                // 指向错误的 ring 提取消等于没取消。
+                owner_uring_.store(detail::current_uring(), std::memory_order_release);
 
                 // 允许端口复用: 防止 TIME_WAIT 状态导致 bind 失败
                 int opt = 1;
-                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
-                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+                ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
 
                 sockaddr_in addr{};
@@ -356,11 +370,11 @@ namespace coro {
                 addr.sin_port = htons(port);
                 addr.sin_addr = parsed;
 
-                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                if (::bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
                     close();
                     return false;
                 }
-                if (::listen(fd_, backlog) < 0) {
+                if (::listen(fd, backlog) < 0) {
                     close();
                     return false;
                 }
@@ -410,8 +424,9 @@ namespace coro {
                         }
                         // accept 出的 fd 也要原子设 CLOEXEC: 事后 fcntl 会留下
                         // “fork 已发生、CLOEXEC 未设”的窗口, 子进程会继承不该有的 socket。
-                        op.fd = listener->fd_; // close 前可按 fd 批量取消
-                        io_uring_prep_accept(sqe, listener->fd_, nullptr, nullptr, SOCK_CLOEXEC);
+                        const int fd = listener->native();
+                        op.fd = fd; // close 前可按 fd 批量取消
+                        io_uring_prep_accept(sqe, fd, nullptr, nullptr, SOCK_CLOEXEC);
                         detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
@@ -438,19 +453,23 @@ namespace coro {
 
             /// 同步关闭监听 (服务器停止用)，唤醒挂起的 accept 并返回无效流。
             void close() {
-                if (fd_ >= 0) {
-                    // io_uring 的 accept 持有文件引用，仅 close 不会使其完成。
-                    // 先按 fd 提交取消，再 shutdown 解除监听，避免服务停止时永久挂起。
-                    if (auto* u = detail::current_uring())
-                        u->cancel_fd_ops(fd_);
-                    ::shutdown(fd_, SHUT_RDWR);
-                    ::close(fd_);
-                    fd_ = -1;
-                }
+                const int fd = fd_.exchange(-1);
+                if (fd < 0)
+                    return;
+                // io_uring 的 accept 持有文件引用，仅 close 不会使其完成。
+                // 先按 fd 提交取消，再 shutdown 解除监听，避免服务停止时永久挂起。
+                if (auto* u = owner_uring_.load(std::memory_order_acquire))
+                    u->cancel_fd_ops(fd);
+                ::shutdown(fd, SHUT_RDWR);
+                ::close(fd);
             }
 
+            /// fd 的原子快照 (close() 可能来自其他线程)
+            int native() const noexcept { return fd_.load(std::memory_order_acquire); }
+
           private:
-            int fd_ = -1;
+            std::atomic<int> fd_{-1};
+            std::atomic<UringEventSource*> owner_uring_{nullptr};
         };
 
         // ==================================================================
@@ -463,12 +482,12 @@ namespace coro {
 
             ~UdpSocket() { close(); }
 
-            UdpSocket(UdpSocket&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+            UdpSocket(UdpSocket&& other) noexcept : fd_(other.fd_.exchange(-1)) {}
 
             UdpSocket& operator=(UdpSocket&& other) noexcept {
                 if (this != &other) {
                     close();
-                    fd_ = std::exchange(other.fd_, -1);
+                    fd_.store(other.fd_.exchange(-1));
                 }
                 return *this;
             }
@@ -478,21 +497,22 @@ namespace coro {
 
             /// 绑定本地地址 (同步, 一次性)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const { return local_port_of(fd_); }
+            unsigned short local_port() const { return local_port_of(native()); }
 
             bool bind_listen(const char* ip, unsigned short port) {
                 close(); // 幂等: 释放旧 fd, 失败后重试不泄漏描述符
                 in_addr parsed{};
                 if (!detail_net::parse_ipv4(ip, parsed))
                     return false;
-                fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-                if (fd_ < 0)
+                const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+                fd_.store(fd);
+                if (fd < 0)
                     return false;
 
                 int opt = 1;
-                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
-                ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+                ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
 
                 sockaddr_in addr{};
@@ -500,7 +520,7 @@ namespace coro {
                 addr.sin_port = htons(port);
                 addr.sin_addr = parsed;
 
-                if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                if (::bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
                     close();
                     return false;
                 }
@@ -553,8 +573,9 @@ namespace coro {
                         msg_.msg_namelen = from_len;
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
-                        op.fd = socket->fd_; // close 前可按 fd 批量取消
-                        io_uring_prep_recvmsg(sqe, socket->fd_, &msg_, 0);
+                        const int fd = socket->native();
+                        op.fd = fd; // close 前可按 fd 批量取消
+                        io_uring_prep_recvmsg(sqe, fd, &msg_, 0);
                         detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
@@ -622,8 +643,9 @@ namespace coro {
                         msg_.msg_namelen = sizeof(dest);
                         msg_.msg_iov = &iov_;
                         msg_.msg_iovlen = 1;
-                        op.fd = socket->fd_; // close 前可按 fd 批量取消
-                        io_uring_prep_sendmsg(sqe, socket->fd_, &msg_, 0);
+                        const int fd = socket->native();
+                        op.fd = fd; // close 前可按 fd 批量取消
+                        io_uring_prep_sendmsg(sqe, fd, &msg_, 0);
                         detail::uring_submit(u, sqe, &op);
                         uring_ = u;
                         u->track_op(&op);
@@ -647,28 +669,34 @@ namespace coro {
             }
 
             void close() {
-                if (fd_ >= 0) {
-                    // io_uring 上挂起的 recvmsg/sendmsg 持有文件引用, 仅 close 不会让它们
-                    // 完成: 服务端关停时事件循环会永久等待。未连接 UDP socket 的
-                    // shutdown 会失败 (ENOTCONN), 必须按 fd 提交取消才能唤醒挂起的收发。
-                    if (auto* u = detail::current_uring())
-                        u->cancel_fd_ops(fd_);
-                    ::shutdown(fd_, SHUT_RDWR);
-                    ::close(fd_);
-                    fd_ = -1;
-                }
+                const int fd = fd_.exchange(-1);
+                if (fd < 0)
+                    return;
+                // io_uring 上挂起的 recvmsg/sendmsg 持有文件引用, 仅 close 不会让它们
+                // 完成: 服务端关停时事件循环会永久等待。未连接 UDP socket 的
+                // shutdown 会失败 (ENOTCONN), 必须按 fd 提交取消才能唤醒挂起的收发。
+                if (auto* u = detail::current_uring())
+                    u->cancel_fd_ops(fd);
+                ::shutdown(fd, SHUT_RDWR);
+                ::close(fd);
             }
 
             /// 中止收发但保留描述符: 供其他线程唤醒挂起的 recvfrom, 避免 fd 复用竞态。
             void shutdown() noexcept {
-                if (fd_ >= 0)
-                    ::shutdown(fd_, SHUT_RDWR);
+                const int fd = native();
+                if (fd >= 0)
+                    ::shutdown(fd, SHUT_RDWR);
             }
 
-            bool valid() const { return fd_ >= 0; }
+            /// fd 的原子快照 (shutdown/close 可由其他线程调用)
+            int native() const noexcept { return fd_.load(std::memory_order_acquire); }
+
+            bool valid() const { return native() >= 0; }
 
           private:
-            int fd_ = -1;
+            /// atomic 而非裸 int: UdpServer::stop_request() 可能在别的线程
+            /// close 它, 与事件循环线程上的 recvfrom/sendto 读并发。
+            std::atomic<int> fd_{-1};
         };
 
 #endif // CORO_URING_ENABLED

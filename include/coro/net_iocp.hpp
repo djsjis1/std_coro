@@ -88,18 +88,18 @@ namespace coro {
             /// worker 线程后由 reattach() 在目标线程首次关联
             /// (CreateIoCompletionPort 不支持对已关联句柄转移关联)。
             explicit TcpStream(SOCKET s, bool attach_iocp = true) : sock_(s) {
-                if (sock_ != INVALID_SOCKET && attach_iocp && !associate_current_iocp(sock_))
+                if (s != INVALID_SOCKET && attach_iocp && !associate_current_iocp(s))
                     close();
             }
 
             ~TcpStream() { close(); }
 
-            TcpStream(TcpStream&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
+            TcpStream(TcpStream&& other) noexcept : sock_(other.sock_.exchange(INVALID_SOCKET)) {}
 
             TcpStream& operator=(TcpStream&& other) noexcept {
                 if (this != &other) {
                     close();
-                    sock_ = std::exchange(other.sock_, INVALID_SOCKET);
+                    sock_.store(other.sock_.exchange(INVALID_SOCKET));
                 }
                 return *this;
             }
@@ -124,8 +124,9 @@ namespace coro {
                 /// 保证 OVERLAPPED 在协程帧销毁前被完成包消费 (安全)。
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<read_awaiter*>(self);
-                    if (aw->stream && aw->stream->valid())
-                        CancelIoEx(reinterpret_cast<HANDLE>(aw->stream->sock_), &aw->op.ov);
+                    const SOCKET h = aw->stream ? aw->stream->native() : INVALID_SOCKET;
+                    if (h != INVALID_SOCKET)
+                        CancelIoEx(reinterpret_cast<HANDLE>(h), &aw->op.ov);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -137,7 +138,7 @@ namespace coro {
                     wsa_buf.buf = buf;
                     DWORD flags = 0;
                     DWORD received = 0;
-                    int rc = WSARecv(stream->sock_, &wsa_buf, 1, &received, &flags, &op.ov, nullptr);
+                    int rc = WSARecv(stream->native(), &wsa_buf, 1, &received, &flags, &op.ov, nullptr);
                     if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                         // 立即失败: 不会有 IOCP 通知, 手动恢复
                         op.error = WSAGetLastError();
@@ -326,8 +327,9 @@ namespace coro {
                 /// 取消挂起的写 (同 read_awaiter::cancel_op)
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<write_awaiter*>(self);
-                    if (aw->stream && aw->stream->valid())
-                        CancelIoEx(reinterpret_cast<HANDLE>(aw->stream->sock_), &aw->op.ov);
+                    const SOCKET h = aw->stream ? aw->stream->native() : INVALID_SOCKET;
+                    if (h != INVALID_SOCKET)
+                        CancelIoEx(reinterpret_cast<HANDLE>(h), &aw->op.ov);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -338,7 +340,7 @@ namespace coro {
                     wsa_buf.len = (ULONG)len;
                     wsa_buf.buf = const_cast<char*>(buf);
                     DWORD sent = 0;
-                    int rc = WSASend(stream->sock_, &wsa_buf, 1, &sent, 0, &op.ov, nullptr);
+                    int rc = WSASend(stream->native(), &wsa_buf, 1, &sent, 0, &op.ov, nullptr);
                     if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                         // 立即失败: 不会有 IOCP 通知, 手动恢复
                         op.error = WSAGetLastError();
@@ -366,42 +368,53 @@ namespace coro {
             /// 迁移到 worker 线程后在工厂内调用本方法完成首次关联,
             /// I/O 完成包才会投递到 worker 的完成端口。
             bool reattach() {
-                if (sock_ == INVALID_SOCKET)
+                const SOCKET h = native();
+                if (h == INVALID_SOCKET)
                     return false;
-                if (associate_current_iocp(sock_))
+                if (associate_current_iocp(h))
                     return true;
                 close();
                 return false;
             }
 
             void close() {
-                if (sock_ != INVALID_SOCKET) {
-                    // 与 TcpListener::close / UdpSocket 同一合同: 挂起的重叠
-                    // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
-                    // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
-                    // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    closesocket(sock_);
-                    sock_ = INVALID_SOCKET;
-                }
+                // 先摘走句柄再关: 其他线程的 shutdown() 之后只会看到 INVALID_SOCKET,
+                // 不会再对已关闭 (可能已被系统复用) 的句柄动手。
+                const SOCKET h = sock_.exchange(INVALID_SOCKET);
+                if (h == INVALID_SOCKET)
+                    return;
+                // 与 TcpListener::close / UdpSocket 同一合同: 挂起的重叠
+                // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
+                // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
+                // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
+                CancelIoEx(reinterpret_cast<HANDLE>(h), nullptr);
+                closesocket(h);
             }
 
             /// 中止收发但保留句柄所有权。可由其他线程调用，用于唤醒挂起的
             /// read/write；真正 closesocket 仍由拥有 TcpStream 的线程执行。
             void shutdown() noexcept {
-                if (sock_ != INVALID_SOCKET) {
-                    // shutdown() 本身不保证唤醒已提交的重叠 WSARecv/WSASend；
-                    // CancelIoEx(nullptr) 会让该句柄的所有挂起操作通过 IOCP
-                    // 以 ERROR_OPERATION_ABORTED 完成，awaiter 因而能安全收尾。
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    ::shutdown(sock_, SD_BOTH);
-                }
+                const SOCKET h = native();
+                if (h == INVALID_SOCKET)
+                    return;
+                // shutdown() 本身不保证唤醒已提交的重叠 WSARecv/WSASend；
+                // CancelIoEx(nullptr) 会让该句柄的所有挂起操作通过 IOCP
+                // 以 ERROR_OPERATION_ABORTED 完成，awaiter 因而能安全收尾。
+                CancelIoEx(reinterpret_cast<HANDLE>(h), nullptr);
+                ::shutdown(h, SD_BOTH);
             }
 
-            bool valid() const { return sock_ != INVALID_SOCKET; }
+            /// 句柄的原子快照。跨线程调用方 (shutdown / stop 路径) 必须用它,
+            /// 不要直接读成员 —— 直接读在 TSan 下就是数据竞争。
+            SOCKET native() const noexcept { return sock_.load(std::memory_order_acquire); }
+
+            bool valid() const { return native() != INVALID_SOCKET; }
 
           private:
-            SOCKET sock_ = INVALID_SOCKET;
+            /// atomic 而非裸 SOCKET: shutdown() 允许从其他线程调用 (多线程服务器的
+            /// stop 路径) 并与 worker 线程上的 read/write/close 并发。裸字段在这里
+            /// 既会被 TSan 判为数据竞争, 也存在"读到刚被关闭的句柄"的窗口。
+            std::atomic<SOCKET> sock_{INVALID_SOCKET};
         };
 
         // ==================================================================
@@ -411,19 +424,16 @@ namespace coro {
           public:
             TcpListener() = default;
 
-            ~TcpListener() {
-                if (sock_ != INVALID_SOCKET)
-                    closesocket(sock_);
-            }
+            ~TcpListener() { close(); }
 
             TcpListener(TcpListener&& other) noexcept
-                : sock_(std::exchange(other.sock_, INVALID_SOCKET)),
+                : sock_(other.sock_.exchange(INVALID_SOCKET)),
                   accept_ex_(std::exchange(other.accept_ex_, nullptr)) {}
 
             TcpListener& operator=(TcpListener&& other) noexcept {
                 if (this != &other) {
                     close(); // CancelIoEx + closesocket: 与析构同一合同
-                    sock_ = std::exchange(other.sock_, INVALID_SOCKET);
+                    sock_.store(other.sock_.exchange(INVALID_SOCKET));
                     accept_ex_ = std::exchange(other.accept_ex_, nullptr);
                 }
                 return *this;
@@ -434,7 +444,7 @@ namespace coro {
 
             /// 绑定并监听 (同步, 一次性; 零配置: 自动关联 IOCP)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const { return local_port_of(sock_); }
+            unsigned short local_port() const { return local_port_of(native()); }
 
             bool bind_listen(const char* ip, unsigned short port, int backlog = SOMAXCONN) {
                 if (!ensure_winsock()) // 必须先初始化 Winsock
@@ -445,8 +455,9 @@ namespace coro {
                 close();
                 accept_ex_ = nullptr;
 
-                sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                if (sock_ == INVALID_SOCKET)
+                const SOCKET h = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                sock_.store(h);
+                if (h == INVALID_SOCKET)
                     return false;
 
                 sockaddr_in addr{};
@@ -458,34 +469,32 @@ namespace coro {
                 // 仍可能 bind 成功, 客户端请求被不可预测地分流。使用独占绑定，
                 // 让端口冲突稳定地返回失败。
                 BOOL exclusive = TRUE;
-                if (setsockopt(sock_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+                if (setsockopt(h, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
                                sizeof(exclusive)) == SOCKET_ERROR) {
                     close();
                     return false;
                 }
 
-                if (bind(sock_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-                    closesocket(sock_);
-                    sock_ = INVALID_SOCKET;
+                if (bind(h, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+                    close();
                     return false;
                 }
-                if (listen(sock_, backlog) == SOCKET_ERROR) {
-                    closesocket(sock_);
-                    sock_ = INVALID_SOCKET;
+                if (listen(h, backlog) == SOCKET_ERROR) {
+                    close();
                     return false;
                 }
 
                 // 获取 AcceptEx 函数指针 (需要 WSAIoctl)
                 GUID guid = WSAID_ACCEPTEX;
                 DWORD bytes = 0;
-                if (WSAIoctl(sock_, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &accept_ex_,
+                if (WSAIoctl(h, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &accept_ex_,
                              sizeof(accept_ex_), &bytes, nullptr, nullptr) == SOCKET_ERROR ||
                     !accept_ex_) {
                     close();
                     return false;
                 }
 
-                if (!associate_current_iocp(sock_)) {
+                if (!associate_current_iocp(h)) {
                     close();
                     return false;
                 }
@@ -525,8 +534,9 @@ namespace coro {
                 /// 取消挂起的 accept (同 read_awaiter::cancel_op)
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<accept_awaiter*>(self);
-                    if (aw->listener->sock_ != INVALID_SOCKET)
-                        CancelIoEx(reinterpret_cast<HANDLE>(aw->listener->sock_), &aw->op.ov);
+                    const SOCKET h = aw->listener ? aw->listener->native() : INVALID_SOCKET;
+                    if (h != INVALID_SOCKET)
+                        CancelIoEx(reinterpret_cast<HANDLE>(h), &aw->op.ov);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -544,7 +554,7 @@ namespace coro {
                         return;
                     }
                     DWORD received = 0;
-                    BOOL rc = listener->accept_ex_(listener->sock_, accepted, addr_buf, 0, ADDR_LEN, ADDR_LEN,
+                    BOOL rc = listener->accept_ex_(listener->native(), accepted, addr_buf, 0, ADDR_LEN, ADDR_LEN,
                                                    &received, &op.ov);
                     if (rc) {
                         // 同步成功也由 IOCP 完成包统一恢复 (见 ConnectEx 注释)。
@@ -572,8 +582,9 @@ namespace coro {
                     }
                     // AcceptEx 完成后必须设置 SO_UPDATE_ACCEPT_CONTEXT
                     // 否则新 socket 无法正常进行 I/O 操作; 设置失败说明连接不可用
-                    if (setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&listener->sock_,
-                                   sizeof(listener->sock_)) == SOCKET_ERROR) {
+                    const SOCKET listener_sock = listener->native();
+                    if (setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&listener_sock,
+                                   sizeof(listener_sock)) == SOCKET_ERROR) {
                         const int error = WSAGetLastError();
                         closesocket(accepted);
                         accepted = INVALID_SOCKET;
@@ -606,17 +617,24 @@ namespace coro {
             /// CancelIoEx, 这里跟进可把行为从"依赖未保证的副作用"变成明确合同。
             /// 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
             void close() {
-                if (sock_ != INVALID_SOCKET) {
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    closesocket(sock_);
-                    sock_ = INVALID_SOCKET;
-                }
+                // 与 TcpStream::close 同一合同: 先摘走句柄, 其他线程则只会看到
+                // INVALID_SOCKET, 不会对已关闭的句柄做操作。
+                const SOCKET h = sock_.exchange(INVALID_SOCKET);
+                if (h == INVALID_SOCKET)
+                    return;
+                CancelIoEx(reinterpret_cast<HANDLE>(h), nullptr);
+                closesocket(h);
             }
 
-            bool valid() const { return sock_ != INVALID_SOCKET; }
+            /// 句柄的原子快照 (close() 可能来自其他线程, 与自己并发)
+            SOCKET native() const noexcept { return sock_.load(std::memory_order_acquire); }
+
+            bool valid() const { return native() != INVALID_SOCKET; }
 
           private:
-            SOCKET sock_ = INVALID_SOCKET;
+            /// atomic: web_server::stop() 会在其他线程调 close(), 与 accept 所在
+            /// 事件循环线程的 native() 读并发 (TSan 下的真实数据竞争)。
+            std::atomic<SOCKET> sock_{INVALID_SOCKET};
             LPFN_ACCEPTEX accept_ex_ = nullptr; // AcceptEx 函数指针
         };
 
@@ -628,18 +646,18 @@ namespace coro {
             UdpSocket() = default;
 
             explicit UdpSocket(SOCKET s) : sock_(s) {
-                if (sock_ != INVALID_SOCKET && !associate_current_iocp(sock_))
+                if (s != INVALID_SOCKET && !associate_current_iocp(s))
                     close();
             }
 
             ~UdpSocket() { close(); }
 
-            UdpSocket(UdpSocket&& other) noexcept : sock_(std::exchange(other.sock_, INVALID_SOCKET)) {}
+            UdpSocket(UdpSocket&& other) noexcept : sock_(other.sock_.exchange(INVALID_SOCKET)) {}
 
             UdpSocket& operator=(UdpSocket&& other) noexcept {
                 if (this != &other) {
                     close();
-                    sock_ = std::exchange(other.sock_, INVALID_SOCKET);
+                    sock_.store(other.sock_.exchange(INVALID_SOCKET));
                 }
                 return *this;
             }
@@ -649,7 +667,7 @@ namespace coro {
 
             /// 绑定本地地址 (同步, 一次性)
             /// 实际绑定的端口: 支持先 bind 到 0, 再回查系统分配的真实端口
-            unsigned short local_port() const { return local_port_of(sock_); }
+            unsigned short local_port() const { return local_port_of(native()); }
 
             bool bind_listen(const char* ip, unsigned short port) {
                 if (!ensure_winsock())
@@ -658,8 +676,9 @@ namespace coro {
                 if (!detail_net::parse_ipv4(ip, parsed))
                     return false;
                 close();
-                sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                if (sock_ == INVALID_SOCKET)
+                const SOCKET h = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                sock_.store(h);
+                if (h == INVALID_SOCKET)
                     return false;
 
                 sockaddr_in addr{};
@@ -667,12 +686,12 @@ namespace coro {
                 addr.sin_port = htons(port);
                 addr.sin_addr = parsed;
 
-                if (bind(sock_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+                if (bind(h, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
                     close();
                     return false;
                 }
 
-                if (!associate_current_iocp(sock_)) {
+                if (!associate_current_iocp(h)) {
                     close();
                     return false;
                 }
@@ -695,8 +714,9 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<recvfrom_awaiter*>(self);
-                    if (aw->socket && aw->socket->valid())
-                        CancelIoEx(reinterpret_cast<HANDLE>(aw->socket->sock_), &aw->op.ov);
+                    const SOCKET h = aw->socket ? aw->socket->native() : INVALID_SOCKET;
+                    if (h != INVALID_SOCKET)
+                        CancelIoEx(reinterpret_cast<HANDLE>(h), &aw->op.ov);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -709,7 +729,7 @@ namespace coro {
                     from_len = sizeof(sockaddr_in);
                     DWORD flags = 0;
                     DWORD received = 0;
-                    int rc = WSARecvFrom(socket->sock_, &wsa_buf, 1, &received, &flags, (sockaddr*)&from_addr,
+                    int rc = WSARecvFrom(socket->native(), &wsa_buf, 1, &received, &flags, (sockaddr*)&from_addr,
                                          &from_len, &op.ov, nullptr);
                     if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                         op.error = WSAGetLastError();
@@ -749,8 +769,9 @@ namespace coro {
 
                 static void cancel_op(void* self) {
                     auto* aw = static_cast<sendto_awaiter*>(self);
-                    if (aw->socket && aw->socket->valid())
-                        CancelIoEx(reinterpret_cast<HANDLE>(aw->socket->sock_), &aw->op.ov);
+                    const SOCKET h = aw->socket ? aw->socket->native() : INVALID_SOCKET;
+                    if (h != INVALID_SOCKET)
+                        CancelIoEx(reinterpret_cast<HANDLE>(h), &aw->op.ov);
                 }
 
                 void await_suspend(std::coroutine_handle<> h) {
@@ -761,7 +782,7 @@ namespace coro {
                     wsa_buf.len = (ULONG)len;
                     wsa_buf.buf = const_cast<char*>(buf);
                     DWORD sent = 0;
-                    int rc = WSASendTo(socket->sock_, &wsa_buf, 1, &sent, 0, (sockaddr*)&dest, sizeof(dest), &op.ov,
+                    int rc = WSASendTo(socket->native(), &wsa_buf, 1, &sent, 0, (sockaddr*)&dest, sizeof(dest), &op.ov,
                                        nullptr);
                     if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                         op.error = WSAGetLastError();
@@ -786,34 +807,42 @@ namespace coro {
             }
 
             void close() {
-                if (valid()) {
-                    // 与 TcpListener::close / TcpStream 同一合同: 挂起的重叠
-                    // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
-                    // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
-                    // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    closesocket(sock_);
-                    sock_ = INVALID_SOCKET;
-                }
+                // 与 TcpStream::close 同一合同: 先摘走句柄, 其他线程则只会看到
+                // INVALID_SOCKET, 不会对已关闭的句柄做操作。
+                const SOCKET h = sock_.exchange(INVALID_SOCKET);
+                if (h == INVALID_SOCKET)
+                    return;
+                // 与 TcpListener::close / TcpStream 同一合同: 挂起的重叠
+                // I/O 先显式取消 (仅 closesocket 不承诺完成包投递),
+                // 保证 OVERLAPPED 先于协程帧销毁被事件循环消费。
+                // 无挂起操作时 CancelIoEx 仅返回 FALSE, 无副作用。
+                CancelIoEx(reinterpret_cast<HANDLE>(h), nullptr);
+                closesocket(h);
             }
 
             /// 中止收发但保留句柄所有权。可由其他线程调用, 用于唤醒挂起的
             /// recvfrom/sendto; 真正 closesocket 仍由拥有 UdpSocket 的线程执行。
             /// (与 Linux 侧 UdpSocket::shutdown 及 TcpStream::shutdown 对齐)
             void shutdown() noexcept {
-                if (sock_ != INVALID_SOCKET) {
-                    // ::shutdown 本身不保证唤醒已提交的重叠 WSARecvFrom/WSASendTo;
-                    // CancelIoEx(nullptr) 让该句柄的全部挂起操作经 IOCP 以
-                    // ERROR_OPERATION_ABORTED 完成, 等待者才能安全收尾。
-                    CancelIoEx(reinterpret_cast<HANDLE>(sock_), nullptr);
-                    ::shutdown(sock_, SD_BOTH);
-                }
+                const SOCKET h = native();
+                if (h == INVALID_SOCKET)
+                    return;
+                // ::shutdown 本身不保证唤醒已提交的重叠 WSARecvFrom/WSASendTo;
+                // CancelIoEx(nullptr) 让该句柄的全部挂起操作经 IOCP 以
+                // ERROR_OPERATION_ABORTED 完成, 等待者才能安全收尾。
+                CancelIoEx(reinterpret_cast<HANDLE>(h), nullptr);
+                ::shutdown(h, SD_BOTH);
             }
 
-            bool valid() const { return sock_ != INVALID_SOCKET; }
+            /// 句柄的原子快照 (shutdown/close 可由其他线程调用)
+            SOCKET native() const noexcept { return sock_.load(std::memory_order_acquire); }
+
+            bool valid() const { return native() != INVALID_SOCKET; }
 
           private:
-            SOCKET sock_ = INVALID_SOCKET;
+            /// atomic 而非裸 SOCKET: UdpServer::stop_request() 可能在别的线程
+            /// close 它, 与事件循环线程上的 recvfrom/sendto 读并发。
+            std::atomic<SOCKET> sock_{INVALID_SOCKET};
         };
 
 #endif // _WIN32
