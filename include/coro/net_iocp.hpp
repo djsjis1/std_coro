@@ -427,8 +427,7 @@ namespace coro {
             ~TcpListener() { close(); }
 
             TcpListener(TcpListener&& other) noexcept
-                : sock_(other.sock_.exchange(INVALID_SOCKET)),
-                  accept_ex_(std::exchange(other.accept_ex_, nullptr)) {}
+                : sock_(other.sock_.exchange(INVALID_SOCKET)), accept_ex_(std::exchange(other.accept_ex_, nullptr)) {}
 
             TcpListener& operator=(TcpListener&& other) noexcept {
                 if (this != &other) {
